@@ -280,7 +280,7 @@ func (w webStore) UseTicket(ctx context.Context, qrPayload string) (web.Ticket, 
 
 func (w webStore) FindReservationByTicket(ctx context.Context, ticketID int64) (web.Reservation, web.Seat, error) {
 	r, s, err := w.s.FindReservationByTicket(ctx, ticketID)
-	return web.Reservation{BuyerName: r.BuyerName},
+	return web.Reservation{BuyerName: r.BuyerName, ConfirmedAt: r.ConfirmedAt},
 		web.Seat{ID: s.ID, Row: s.Row, Col: s.Col},
 		err
 }

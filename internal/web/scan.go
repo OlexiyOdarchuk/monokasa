@@ -21,7 +21,8 @@ type Seat struct {
 
 // Reservation is the subset of reservation info shown next to a scanned ticket.
 type Reservation struct {
-	BuyerName string
+	BuyerName   string
+	ConfirmedAt *time.Time
 }
 
 // Ticket is the subset of ticket info the scanner needs.
@@ -89,11 +90,12 @@ type checkRequest struct {
 }
 
 type checkResponse struct {
-	Status string `json:"status"` // ok | used | invalid
-	Detail string `json:"detail,omitempty"`
-	Buyer  string `json:"buyer,omitempty"`
-	Seat   string `json:"seat,omitempty"`
-	UsedAt string `json:"usedAt,omitempty"`
+	Status   string `json:"status"` // ok | used | invalid
+	Detail   string `json:"detail,omitempty"`
+	Buyer    string `json:"buyer,omitempty"`
+	Seat     string `json:"seat,omitempty"`
+	BookedAt string `json:"bookedAt,omitempty"`
+	UsedAt   string `json:"usedAt,omitempty"`
 }
 
 func (s *Scanner) handleCheck(w http.ResponseWriter, r *http.Request) {
@@ -128,10 +130,11 @@ func (s *Scanner) handleCheck(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, ErrTicketUsed):
 		res, seat, _ := s.store.FindReservationByTicket(ctx, t.ID)
 		writeJSON(w, http.StatusOK, checkResponse{
-			Status: "used",
-			Buyer:  res.BuyerName,
-			Seat:   seatLabel(seat),
-			UsedAt: formatDateTime(*t.UsedAt),
+			Status:   "used",
+			Buyer:    res.BuyerName,
+			Seat:     seatLabel(seat),
+			BookedAt: bookedAt(res.ConfirmedAt),
+			UsedAt:   formatDateTime(*t.UsedAt),
 		})
 		return
 	case errors.Is(err, ErrTicketNotFound):
@@ -143,10 +146,18 @@ func (s *Scanner) handleCheck(w http.ResponseWriter, r *http.Request) {
 	}
 	res, seat, _ := s.store.FindReservationByTicket(ctx, t.ID)
 	writeJSON(w, http.StatusOK, checkResponse{
-		Status: "ok",
-		Buyer:  res.BuyerName,
-		Seat:   seatLabel(seat),
+		Status:   "ok",
+		Buyer:    res.BuyerName,
+		Seat:     seatLabel(seat),
+		BookedAt: bookedAt(res.ConfirmedAt),
 	})
+}
+
+func bookedAt(t *time.Time) string {
+	if t == nil {
+		return ""
+	}
+	return formatDateTime(*t)
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

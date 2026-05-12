@@ -10,7 +10,9 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	tele "gopkg.in/telebot.v3"
 )
@@ -102,6 +104,16 @@ type Bot struct {
 	jarLink   string
 	hold      time.Duration
 	adminTGID int64
+
+	// pending tracks users who clicked a seat and are about to type their
+	// name. Keyed by Telegram user ID; value is pendingPick. Cleared on
+	// successful reservation or natural expiry (no GC, lookup checks Until).
+	pending sync.Map
+}
+
+type pendingPick struct {
+	Row, Col int
+	Until    time.Time
 }
 
 type Options struct {
@@ -234,6 +246,11 @@ func (b *Bot) handleCallback(c tele.Context) error {
 	return c.Respond(&tele.CallbackResponse{Text: "unknown action"})
 }
 
+// pendingTTL bounds how long a user has to type their name after picking a
+// seat. Long enough for someone to switch apps and come back; short enough
+// that an abandoned pick doesn't reserve mind-share.
+const pendingTTL = 10 * time.Minute
+
 func (b *Bot) callbackSeat(c tele.Context, cb *tele.Callback) error {
 	data := strings.TrimPrefix(cb.Data, "\fseat|")
 	parts := strings.SplitN(data, ":", 2)
@@ -249,36 +266,24 @@ func (b *Bot) callbackSeat(c tele.Context, cb *tele.Callback) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
+	// Pre-check the seat is free so we don't ask for a name on a taken seat.
+	// We re-check on Reserve to close the (small) race window.
 	seat, err := b.store.FindFreeSeat(ctx, b.show.ID, row, col)
 	if err != nil {
 		return c.Respond(&tele.CallbackResponse{Text: friendly(err)})
 	}
 
-	code, err := b.coder.NewCode()
-	if err != nil {
-		return c.Respond(&tele.CallbackResponse{Text: "internal error"})
-	}
-	buyer := buyerName(cb.Sender)
-	r, err := b.store.Reserve(ctx, seat, cb.Sender.ID, cb.Message.Chat.ID, buyer, code, b.hold)
-	if err != nil {
-		return c.Respond(&tele.CallbackResponse{Text: friendly(err)})
-	}
-
-	_ = c.Respond(&tele.CallbackResponse{Text: "Місце притримано"})
-	payURL := jarPrefillURL(b.jarLink, seat.PriceKopecks, r.Code)
-
-	cancelBtn := tele.InlineButton{Unique: "cancel", Text: "✖ Скасувати бронь", Data: r.Code}
-	markup := &tele.ReplyMarkup{InlineKeyboard: [][]tele.InlineButton{{cancelBtn}}}
+	b.pending.Store(cb.Sender.ID, pendingPick{
+		Row: row, Col: col,
+		Until: time.Now().Add(pendingTTL),
+	})
+	_ = c.Respond(&tele.CallbackResponse{Text: "Введи ім'я"})
 
 	_, err = b.tb.Send(cb.Sender, fmt.Sprintf(
-		"Місце забронювано: ряд %d, місце %d.\n\n"+
-			"💳 Оплата (сума й коментар вже вписані):\n%s\n\n"+
-			"Код у коментарі — `%s` (моно зробить це поле read-only).\n"+
-			"Бронювання дійсне до %s. Після оплати бот сам пришле PDF.",
-		seat.Row, seat.Col, payURL, r.Code, formatClock(r.ExpiresAt)),
-		tele.ModeMarkdown,
-		&tele.SendOptions{DisableWebPagePreview: true},
-		markup)
+		"Місце ряд %d · %d вибрано.\n"+
+			"Введи ім'я та прізвище — вони будуть надруковані на квитку:",
+		seat.Row, seat.Col),
+		&tele.ReplyMarkup{ForceReply: true, Selective: true})
 	return err
 }
 
@@ -358,22 +363,74 @@ func (b *Bot) handleStats(c tele.Context) error {
 		st.Total, st.Sold, st.Held, st.Free, hryvnia(st.RevenueKopecks)), tele.ModeMarkdown)
 }
 
-func (b *Bot) handleText(c tele.Context) error { return nil }
+func (b *Bot) handleText(c tele.Context) error {
+	sender := c.Sender()
+	if sender == nil {
+		return nil
+	}
+	raw, ok := b.pending.Load(sender.ID)
+	if !ok {
+		return nil // user typed text but isn't in name-input mode
+	}
+	pick := raw.(pendingPick)
+	if time.Now().After(pick.Until) {
+		b.pending.Delete(sender.ID)
+		return c.Send("Час очікування імені вийшов. Натисни /seats і вибери місце ще раз.")
+	}
 
-func buyerName(u *tele.User) string {
-	if u == nil {
-		return ""
+	name, err := normalizeName(c.Text())
+	if err != nil {
+		return c.Send(err.Error() + "\nСпробуй ще раз:")
 	}
-	if u.FirstName != "" && u.LastName != "" {
-		return u.FirstName + " " + u.LastName
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	seat, err := b.store.FindFreeSeat(ctx, b.show.ID, pick.Row, pick.Col)
+	if err != nil {
+		b.pending.Delete(sender.ID)
+		return c.Send(friendly(err))
 	}
-	if u.FirstName != "" {
-		return u.FirstName
+	code, err := b.coder.NewCode()
+	if err != nil {
+		return c.Send("Внутрішня помилка, спробуй пізніше")
 	}
-	if u.Username != "" {
-		return "@" + u.Username
+	r, err := b.store.Reserve(ctx, seat, sender.ID, c.Chat().ID, name, code, b.hold)
+	if err != nil {
+		b.pending.Delete(sender.ID)
+		return c.Send(friendly(err))
 	}
-	return ""
+	b.pending.Delete(sender.ID)
+
+	payURL := jarPrefillURL(b.jarLink, seat.PriceKopecks, r.Code)
+	cancelBtn := tele.InlineButton{Unique: "cancel", Text: "✖ Скасувати бронь", Data: r.Code}
+	markup := &tele.ReplyMarkup{InlineKeyboard: [][]tele.InlineButton{{cancelBtn}}}
+
+	return c.Send(fmt.Sprintf(
+		"Місце забронювано: ряд %d, місце %d.\n"+
+			"На квитку буде: *%s*\n\n"+
+			"💳 Оплата (сума й коментар вже вписані):\n%s\n\n"+
+			"Код у коментарі — `%s` (моно зробить це поле read-only).\n"+
+			"Бронювання дійсне до %s. Після оплати бот сам пришле PDF.",
+		seat.Row, seat.Col, name, payURL, r.Code, formatClock(r.ExpiresAt)),
+		tele.ModeMarkdown,
+		&tele.SendOptions{DisableWebPagePreview: true},
+		markup)
+}
+
+// normalizeName trims, collapses spaces and enforces a 2–100 rune length.
+// Letters, digits, spaces, apostrophes, hyphens and dots are accepted —
+// enough for Ukrainian double-barrelled names like "Анна-Марія О'Брайен".
+func normalizeName(in string) (string, error) {
+	n := strings.Join(strings.Fields(in), " ")
+	rc := utf8.RuneCountInString(n)
+	if rc < 2 {
+		return "", fmt.Errorf("ім'я має бути щонайменше 2 символи")
+	}
+	if rc > 100 {
+		return "", fmt.Errorf("ім'я задовге (макс. 100 символів)")
+	}
+	return n, nil
 }
 
 // jarPrefillURL appends ?a=<amount>&t=<comment>. Short keys are what mono's

@@ -102,11 +102,15 @@ const pageHTML = `<!doctype html>
       const seat = data.seat || '';
       const person = data.buyer ? (data.buyer + (seat ? ' · ' + seat : '')) : seat;
       if (data.status === 'ok') {
-        setStatus('ok', '✓ ПРОХОДЬ', person, '');
+        setStatus('ok', '✓ ПРОХОДЬ', person, data.bookedAt ? ('куплено: ' + data.bookedAt) : '');
         chord([880, 1320], 140, 'sine');
         vibrate(80);
       } else if (data.status === 'used') {
-        setStatus('used', '⏱ Вже використано', person, data.usedAt || '');
+        const sub = [
+          data.bookedAt ? 'куплено: ' + data.bookedAt : '',
+          data.usedAt ? 'пройшов: ' + data.usedAt : '',
+        ].filter(Boolean).join(' · ');
+        setStatus('used', '⏱ Вже використано', person, sub);
         beep(440, 220, 'square');
         vibrate([60, 80, 60]);
       } else {
