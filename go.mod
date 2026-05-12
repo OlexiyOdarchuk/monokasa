@@ -25,4 +25,4 @@ require (
 	modernc.org/memory v1.11.0 // indirect
 )
 
-replace github.com/vtopc/go-monobank => github.com/OlexiyOdarchuk/go-monobank v0.22.1-0.20260512231232-dd0ae2e3aac9
+replace github.com/vtopc/go-monobank => github.com/OlexiyOdarchuk/go-monobank v0.22.1-0.20260512232000-d06ce92e91ec
