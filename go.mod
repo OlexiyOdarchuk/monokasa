@@ -2,8 +2,6 @@ module github.com/OlexiyOdarchuk/mono-tix
 
 go 1.26.3
 
-replace github.com/vtopc/go-monobank => github.com/OlexiyOdarchuk/go-monobank v0.22.1-0.20260512210850-9599528f5b5c
-
 require (
 	github.com/joho/godotenv v1.5.1
 	github.com/jung-kurt/gofpdf v1.16.2
@@ -26,3 +24,5 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
+
+replace github.com/vtopc/go-monobank => github.com/OlexiyOdarchuk/go-monobank v0.22.1-0.20260512224841-21bfa58795db

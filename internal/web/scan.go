@@ -10,21 +10,52 @@ import (
 	"net/http"
 	"strings"
 	"time"
-
-	"github.com/OlexiyOdarchuk/mono-tix/internal/store"
-	"github.com/OlexiyOdarchuk/mono-tix/internal/timefmt"
-	"github.com/OlexiyOdarchuk/mono-tix/internal/token"
 )
+
+// Seat is the subset of seat info shown next to a scanned ticket.
+type Seat struct {
+	ID  int64
+	Row int
+	Col int
+}
+
+// Reservation is the subset of reservation info shown next to a scanned ticket.
+type Reservation struct {
+	BuyerName string
+}
+
+// Ticket is the subset of ticket info the scanner needs.
+type Ticket struct {
+	ID     int64
+	UsedAt *time.Time
+}
+
+// Domain errors the scanner expects the Store to return.
+var (
+	ErrTicketNotFound = errors.New("ticket not found")
+	ErrTicketUsed     = errors.New("ticket already used")
+)
+
+// Store is the persistence behavior the scanner needs.
+type Store interface {
+	UseTicket(ctx context.Context, qrPayload string) (Ticket, error)
+	FindReservationByTicket(ctx context.Context, ticketID int64) (Reservation, Seat, error)
+}
+
+// Coder verifies a QR payload signature.
+type Coder interface {
+	VerifyQRPayload(payload string) (reservationID, seatID int64, err error)
+}
 
 // Scanner is the QR-scanner web app: GET /scan serves the HTML, POST
 // /scan/check validates a payload and marks the ticket as used.
 type Scanner struct {
-	store *store.Store
-	coder *token.Coder
+	store Store
+	coder Coder
 	token string // shared auth token; empty disables auth
 }
 
-func NewScanner(s *store.Store, c *token.Coder, authToken string) *Scanner {
+func NewScanner(s Store, c Coder, authToken string) *Scanner {
 	return &Scanner{store: s, coder: c, token: authToken}
 }
 
@@ -94,16 +125,16 @@ func (s *Scanner) handleCheck(w http.ResponseWriter, r *http.Request) {
 
 	t, err := s.store.UseTicket(ctx, payload)
 	switch {
-	case errors.Is(err, store.ErrTicketUsed):
+	case errors.Is(err, ErrTicketUsed):
 		res, seat, _ := s.store.FindReservationByTicket(ctx, t.ID)
 		writeJSON(w, http.StatusOK, checkResponse{
 			Status: "used",
 			Buyer:  res.BuyerName,
 			Seat:   seatLabel(seat),
-			UsedAt: timefmt.DateTime(*t.UsedAt),
+			UsedAt: formatDateTime(*t.UsedAt),
 		})
 		return
-	case errors.Is(err, store.ErrTicketNotFound):
+	case errors.Is(err, ErrTicketNotFound):
 		writeJSON(w, http.StatusOK, checkResponse{Status: "invalid", Detail: "ticket not found"})
 		return
 	case err != nil:
@@ -124,9 +155,19 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func seatLabel(s store.Seat) string {
+func seatLabel(s Seat) string {
 	if s.ID == 0 {
 		return ""
 	}
 	return fmt.Sprintf("Ряд %d · місце %d", s.Row, s.Col)
+}
+
+var ukMonthsGenitive = [...]string{
+	"січня", "лютого", "березня", "квітня", "травня", "червня",
+	"липня", "серпня", "вересня", "жовтня", "листопада", "грудня",
+}
+
+func formatDateTime(t time.Time) string {
+	return fmt.Sprintf("%d %s %d · %s",
+		t.Day(), ukMonthsGenitive[t.Month()-1], t.Year(), t.Format("15:04"))
 }

@@ -13,17 +13,92 @@ import (
 	"time"
 
 	tele "gopkg.in/telebot.v3"
-
-	"github.com/OlexiyOdarchuk/mono-tix/internal/store"
-	"github.com/OlexiyOdarchuk/mono-tix/internal/timefmt"
-	"github.com/OlexiyOdarchuk/mono-tix/internal/token"
 )
+
+// Show is the subset of show info the bot needs.
+type Show struct {
+	ID       int64
+	Title    string
+	Venue    string
+	StartsAt time.Time
+}
+
+// Seat is the subset of seat info the bot needs.
+type Seat struct {
+	ID           int64
+	ShowID       int64
+	Row, Col     int
+	PriceKopecks int64
+}
+
+// Reservation mirrors a stored reservation row.
+type Reservation struct {
+	ID          int64
+	SeatID      int64
+	TGUserID    int64
+	TGChatID    int64
+	BuyerName   string
+	Code        string
+	CreatedAt   time.Time
+	ExpiresAt   time.Time
+	ConfirmedAt *time.Time
+}
+
+// MyItem couples a reservation with its seat for /my output.
+type MyItem struct {
+	Reservation Reservation
+	Seat        Seat
+}
+
+// Stats is an admin snapshot of the only show.
+type Stats struct {
+	Total          int
+	Sold           int
+	Held           int
+	Free           int
+	RevenueKopecks int64
+}
+
+// SeatStatus is one of "free", "held", "sold".
+type SeatStatus string
+
+const (
+	SeatFree SeatStatus = "free"
+	SeatHeld SeatStatus = "held"
+	SeatSold SeatStatus = "sold"
+)
+
+// Domain errors the bot expects the Store to return.
+var (
+	ErrSeatTaken      = errors.New("seat is already reserved or sold")
+	ErrSeatNotFound   = errors.New("seat does not exist for this show")
+	ErrCodeNotFound   = errors.New("reservation code not found")
+	ErrAlreadyPaid    = errors.New("reservation already confirmed")
+	ErrAlreadyClosed  = errors.New("reservation already closed")
+	ErrNotYourBooking = errors.New("reservation belongs to another user")
+)
+
+// Store is the persistence behavior the bot needs.
+type Store interface {
+	Seats(ctx context.Context, showID int64) ([]Seat, error)
+	SeatStatuses(ctx context.Context, showID int64) (map[int64]SeatStatus, error)
+	FindFreeSeat(ctx context.Context, showID int64, row, col int) (Seat, error)
+	Reserve(ctx context.Context, seat Seat, tgUserID, tgChatID int64, buyerName, code string, hold time.Duration) (Reservation, error)
+	CancelReservation(ctx context.Context, code string, tgUserID int64) (Reservation, Seat, error)
+	MyReservations(ctx context.Context, tgUserID int64) ([]MyItem, error)
+	Stats(ctx context.Context, showID int64) (Stats, error)
+}
+
+// Coder issues short reservation codes.
+type Coder interface {
+	NewCode() (string, error)
+}
 
 type Bot struct {
 	tb        *tele.Bot
-	store     *store.Store
-	coder     *token.Coder
-	show      store.Show
+	store     Store
+	coder     Coder
+	show      Show
 	jarLink   string
 	hold      time.Duration
 	adminTGID int64
@@ -31,9 +106,9 @@ type Bot struct {
 
 type Options struct {
 	Token     string
-	Store     *store.Store
-	Coder     *token.Coder
-	Show      store.Show
+	Store     Store
+	Coder     Coder
+	Show      Show
 	JarLink   string
 	Hold      time.Duration
 	AdminTGID int64
@@ -59,7 +134,7 @@ func (b *Bot) Start() { b.tb.Start() }
 func (b *Bot) Stop()  { b.tb.Stop() }
 
 // SendTicket pushes a generated PDF back to the buyer's chat.
-func (b *Bot) SendTicket(chatID int64, seat store.Seat, pdf []byte) error {
+func (b *Bot) SendTicket(chatID int64, seat Seat, pdf []byte) error {
 	doc := &tele.Document{
 		File:     tele.FromReader(bytes.NewReader(pdf)),
 		FileName: fmt.Sprintf("ticket-%d-%d.pdf", seat.Row, seat.Col),
@@ -70,10 +145,10 @@ func (b *Bot) SendTicket(chatID int64, seat store.Seat, pdf []byte) error {
 }
 
 // NotifyShowSoon pings a buyer about the upcoming show.
-func (b *Bot) NotifyShowSoon(chatID int64, seat store.Seat, when time.Time) error {
+func (b *Bot) NotifyShowSoon(chatID int64, seat Seat, when time.Time) error {
 	_, err := b.tb.Send(tele.ChatID(chatID), fmt.Sprintf(
 		"Привіт! Нагадую: %s — вже сьогодні о %s.\nТвоє місце: ряд %d · %d.\nЧекаємо!",
-		b.show.Title, timefmt.Clock(when), seat.Row, seat.Col))
+		b.show.Title, formatClock(when), seat.Row, seat.Col))
 	return err
 }
 
@@ -93,7 +168,7 @@ func (b *Bot) handleStart(c tele.Context) error {
 			"  /seats — мапа місць\n"+
 			"  /my — мої бронювання\n\n"+
 			"Щоб купити: натисни /seats → обери вільне місце.",
-		b.show.Title, b.show.Venue, timefmt.DateTime(b.show.StartsAt)))
+		b.show.Title, b.show.Venue, formatDateTime(b.show.StartsAt)))
 }
 
 func (b *Bot) handleSeats(c tele.Context) error {
@@ -109,7 +184,7 @@ func (b *Bot) handleSeats(c tele.Context) error {
 		return c.Send("storage error: " + err.Error())
 	}
 
-	rows := make(map[int][]store.Seat)
+	rows := make(map[int][]Seat)
 	maxRow := 0
 	for _, s := range seats {
 		rows[s.Row] = append(rows[s.Row], s)
@@ -125,9 +200,9 @@ func (b *Bot) handleSeats(c tele.Context) error {
 		for _, s := range rows[r] {
 			label := fmt.Sprintf("%d", s.Col)
 			switch status[s.ID] {
-			case store.SeatSold:
+			case SeatSold:
 				label = "✖"
-			case store.SeatHeld:
+			case SeatHeld:
 				label = "…"
 			}
 			kbRow = append(kbRow, tele.InlineButton{
@@ -200,7 +275,7 @@ func (b *Bot) callbackSeat(c tele.Context, cb *tele.Callback) error {
 			"💳 Оплата (сума й коментар вже вписані):\n%s\n\n"+
 			"Код у коментарі — `%s` (моно зробить це поле read-only).\n"+
 			"Бронювання дійсне до %s. Після оплати бот сам пришле PDF.",
-		seat.Row, seat.Col, payURL, r.Code, timefmt.Clock(r.ExpiresAt)),
+		seat.Row, seat.Col, payURL, r.Code, formatClock(r.ExpiresAt)),
 		tele.ModeMarkdown,
 		&tele.SendOptions{DisableWebPagePreview: true},
 		markup)
@@ -215,11 +290,11 @@ func (b *Bot) callbackCancel(c tele.Context, cb *tele.Callback) error {
 	_, seat, err := b.store.CancelReservation(ctx, code, cb.Sender.ID)
 	if err != nil {
 		switch {
-		case errors.Is(err, store.ErrCodeNotFound), errors.Is(err, store.ErrAlreadyClosed):
+		case errors.Is(err, ErrCodeNotFound), errors.Is(err, ErrAlreadyClosed):
 			return c.Respond(&tele.CallbackResponse{Text: "Цю бронь вже закрито"})
-		case errors.Is(err, store.ErrAlreadyPaid):
+		case errors.Is(err, ErrAlreadyPaid):
 			return c.Respond(&tele.CallbackResponse{Text: "Вже оплачено — повернення тільки руками"})
-		case errors.Is(err, store.ErrNotYourBooking):
+		case errors.Is(err, ErrNotYourBooking):
 			return c.Respond(&tele.CallbackResponse{Text: "Це не твоя бронь"})
 		default:
 			return c.Respond(&tele.CallbackResponse{Text: "Помилка"})
@@ -249,10 +324,10 @@ func (b *Bot) handleMy(c tele.Context) error {
 		switch {
 		case it.Reservation.ConfirmedAt != nil:
 			fmt.Fprintf(&out, "✅ Ряд %d місце %d — оплачено (%s)\n",
-				it.Seat.Row, it.Seat.Col, timefmt.DateTime(*it.Reservation.ConfirmedAt))
+				it.Seat.Row, it.Seat.Col, formatDateTime(*it.Reservation.ConfirmedAt))
 		case it.Reservation.ExpiresAt.After(time.Now()):
 			fmt.Fprintf(&out, "⏳ Ряд %d місце %d — чекає оплати до %s\n   код: `%s`\n",
-				it.Seat.Row, it.Seat.Col, timefmt.Clock(it.Reservation.ExpiresAt), it.Reservation.Code)
+				it.Seat.Row, it.Seat.Col, formatClock(it.Reservation.ExpiresAt), it.Reservation.Code)
 		default:
 			fmt.Fprintf(&out, "✖ Ряд %d місце %d — бронь протермінувалась\n", it.Seat.Row, it.Seat.Col)
 		}
@@ -279,7 +354,7 @@ func (b *Bot) handleStats(c tele.Context) error {
 			"в очікуванні оплати: *%d*\n"+
 			"вільно: *%d*\n\n"+
 			"виторг: *%s*",
-		b.show.Title, b.show.Venue, timefmt.DateTime(b.show.StartsAt),
+		b.show.Title, b.show.Venue, formatDateTime(b.show.StartsAt),
 		st.Total, st.Sold, st.Held, st.Free, hryvnia(st.RevenueKopecks)), tele.ModeMarkdown)
 }
 
@@ -323,9 +398,9 @@ func jarPrefillURL(base string, kopecks int64, comment string) string {
 
 func friendly(err error) string {
 	switch {
-	case errors.Is(err, store.ErrSeatTaken):
+	case errors.Is(err, ErrSeatTaken):
 		return "Це місце вже зайняте"
-	case errors.Is(err, store.ErrSeatNotFound):
+	case errors.Is(err, ErrSeatNotFound):
 		return "Такого місця нема"
 	default:
 		return "Помилка"
@@ -335,3 +410,15 @@ func friendly(err error) string {
 func hryvnia(kopecks int64) string {
 	return fmt.Sprintf("%d.%02d UAH", kopecks/100, kopecks%100)
 }
+
+var ukMonthsGenitive = [...]string{
+	"січня", "лютого", "березня", "квітня", "травня", "червня",
+	"липня", "серпня", "вересня", "жовтня", "листопада", "грудня",
+}
+
+func formatDateTime(t time.Time) string {
+	return fmt.Sprintf("%d %s %d · %s",
+		t.Day(), ukMonthsGenitive[t.Month()-1], t.Year(), t.Format("15:04"))
+}
+
+func formatClock(t time.Time) string { return t.Format("15:04") }

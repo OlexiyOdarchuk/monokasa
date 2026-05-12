@@ -17,6 +17,7 @@ import (
 	"github.com/OlexiyOdarchuk/mono-tix/internal/config"
 	"github.com/OlexiyOdarchuk/mono-tix/internal/pay"
 	"github.com/OlexiyOdarchuk/mono-tix/internal/store"
+	"github.com/OlexiyOdarchuk/mono-tix/internal/ticket"
 	"github.com/OlexiyOdarchuk/mono-tix/internal/timefmt"
 	"github.com/OlexiyOdarchuk/mono-tix/internal/token"
 	"github.com/OlexiyOdarchuk/mono-tix/internal/web"
@@ -57,9 +58,9 @@ func main() {
 
 	tg, err := bot.New(bot.Options{
 		Token:     cfg.TGToken,
-		Store:     st,
+		Store:     botStore{st},
 		Coder:     coder,
-		Show:      show,
+		Show:      bot.Show(show),
 		JarLink:   cfg.JarLink,
 		Hold:      cfg.HoldDuration,
 		AdminTGID: cfg.AdminTGID,
@@ -73,7 +74,12 @@ func main() {
 
 	monoClient := monobank.NewClient(nil)
 	processor := &pay.Processor{
-		Store: st, Coder: coder, Bot: tg, Show: show, PriceKopecks: cfg.PriceKopecks,
+		Store:        payStore{st},
+		Coder:        coder,
+		Notifier:     payNotifier{tg},
+		Renderer:     payRenderer,
+		Show:         pay.Show{Title: show.Title, Venue: show.Venue, StartsAt: show.StartsAt},
+		PriceKopecks: cfg.PriceKopecks,
 	}
 	hook, err := monobank.NewWebhookHandler(ctx, monobank.WebhookHandlerOptions{
 		Keys:    monoClient,
@@ -86,7 +92,7 @@ func main() {
 	}
 	log.Printf("mono webhook ready, keyId=%s", hook.KeyID())
 
-	scanner := web.NewScanner(st, coder, cfg.ScannerToken)
+	scanner := web.NewScanner(webStore{st}, coder, cfg.ScannerToken)
 
 	mux := http.NewServeMux()
 	mux.Handle("/webhook", hook)
@@ -147,7 +153,7 @@ func runReminderLoop(ctx context.Context, st *store.Store, tg *bot.Bot, show sto
 			return
 		}
 		for _, it := range items {
-			if err := tg.NotifyShowSoon(it.Reservation.TGChatID, it.Seat, show.StartsAt); err != nil {
+			if err := tg.NotifyShowSoon(it.Reservation.TGChatID, bot.Seat(it.Seat), show.StartsAt); err != nil {
 				log.Printf("remind chat=%d: %v", it.Reservation.TGChatID, err)
 				continue
 			}
@@ -165,4 +171,162 @@ func runReminderLoop(ctx context.Context, st *store.Store, tg *bot.Bot, show sto
 			check()
 		}
 	}
+}
+
+// --- bot adapter ---
+
+// botStore wraps *store.Store to satisfy bot.Store: store types and bot types
+// are field-compatible, so a single struct conversion does the translation.
+type botStore struct{ s *store.Store }
+
+func (b botStore) Seats(ctx context.Context, showID int64) ([]bot.Seat, error) {
+	seats, err := b.s.Seats(ctx, showID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]bot.Seat, len(seats))
+	for i, s := range seats {
+		out[i] = bot.Seat(s)
+	}
+	return out, nil
+}
+
+func (b botStore) SeatStatuses(ctx context.Context, showID int64) (map[int64]bot.SeatStatus, error) {
+	in, err := b.s.SeatStatuses(ctx, showID)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[int64]bot.SeatStatus, len(in))
+	for id, st := range in {
+		out[id] = bot.SeatStatus(st)
+	}
+	return out, nil
+}
+
+func (b botStore) FindFreeSeat(ctx context.Context, showID int64, row, col int) (bot.Seat, error) {
+	s, err := b.s.FindFreeSeat(ctx, showID, row, col)
+	return bot.Seat(s), translateStoreErr(err)
+}
+
+func (b botStore) Reserve(
+	ctx context.Context, seat bot.Seat, tgUserID, tgChatID int64,
+	buyerName, code string, hold time.Duration,
+) (bot.Reservation, error) {
+	r, err := b.s.Reserve(ctx, store.Seat(seat), tgUserID, tgChatID, buyerName, code, hold)
+	return bot.Reservation(r), translateStoreErr(err)
+}
+
+func (b botStore) CancelReservation(ctx context.Context, code string, tgUserID int64) (bot.Reservation, bot.Seat, error) {
+	r, s, err := b.s.CancelReservation(ctx, code, tgUserID)
+	return bot.Reservation(r), bot.Seat(s), translateStoreErr(err)
+}
+
+func (b botStore) MyReservations(ctx context.Context, tgUserID int64) ([]bot.MyItem, error) {
+	items, err := b.s.MyReservations(ctx, tgUserID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]bot.MyItem, len(items))
+	for i, it := range items {
+		out[i] = bot.MyItem{Reservation: bot.Reservation(it.Reservation), Seat: bot.Seat(it.Seat)}
+	}
+	return out, nil
+}
+
+func (b botStore) Stats(ctx context.Context, showID int64) (bot.Stats, error) {
+	s, err := b.s.Stats(ctx, showID)
+	return bot.Stats(s), err
+}
+
+func translateStoreErr(err error) error {
+	switch err {
+	case nil:
+		return nil
+	case store.ErrSeatTaken:
+		return bot.ErrSeatTaken
+	case store.ErrSeatNotFound:
+		return bot.ErrSeatNotFound
+	case store.ErrCodeNotFound:
+		return bot.ErrCodeNotFound
+	case store.ErrAlreadyPaid:
+		return bot.ErrAlreadyPaid
+	case store.ErrAlreadyClosed:
+		return bot.ErrAlreadyClosed
+	case store.ErrNotYourBooking:
+		return bot.ErrNotYourBooking
+	default:
+		return err
+	}
+}
+
+// --- web adapter ---
+
+type webStore struct{ s *store.Store }
+
+func (w webStore) UseTicket(ctx context.Context, qrPayload string) (web.Ticket, error) {
+	t, err := w.s.UseTicket(ctx, qrPayload)
+	out := web.Ticket{ID: t.ID, UsedAt: t.UsedAt}
+	switch err {
+	case nil:
+		return out, nil
+	case store.ErrTicketNotFound:
+		return out, web.ErrTicketNotFound
+	case store.ErrTicketUsed:
+		return out, web.ErrTicketUsed
+	default:
+		return out, err
+	}
+}
+
+func (w webStore) FindReservationByTicket(ctx context.Context, ticketID int64) (web.Reservation, web.Seat, error) {
+	r, s, err := w.s.FindReservationByTicket(ctx, ticketID)
+	return web.Reservation{BuyerName: r.BuyerName},
+		web.Seat{ID: s.ID, Row: s.Row, Col: s.Col},
+		err
+}
+
+// --- pay adapter ---
+
+type payStore struct{ s *store.Store }
+
+func (p payStore) FindReservationByCode(ctx context.Context, code string) (pay.Reservation, pay.Seat, error) {
+	r, s, err := p.s.FindReservationByCode(ctx, code)
+	out := pay.Reservation{
+		ID:          r.ID,
+		TGChatID:    r.TGChatID,
+		BuyerName:   r.BuyerName,
+		ConfirmedAt: r.ConfirmedAt,
+	}
+	seat := pay.Seat{ID: s.ID, Row: s.Row, Col: s.Col, PriceKopecks: s.PriceKopecks}
+	switch err {
+	case nil:
+		return out, seat, nil
+	case store.ErrCodeNotFound:
+		return out, seat, pay.ErrCodeNotFound
+	case store.ErrAlreadyClosed:
+		return out, seat, pay.ErrAlreadyClosed
+	default:
+		return out, seat, err
+	}
+}
+
+func (p payStore) Confirm(ctx context.Context, reservationID int64, qrPayload string) error {
+	_, err := p.s.Confirm(ctx, reservationID, qrPayload)
+	return err
+}
+
+type payNotifier struct{ b *bot.Bot }
+
+func (p payNotifier) SendTicket(chatID int64, seat pay.Seat, pdf []byte) error {
+	return p.b.SendTicket(chatID, bot.Seat{
+		ID: seat.ID, Row: seat.Row, Col: seat.Col, PriceKopecks: seat.PriceKopecks,
+	}, pdf)
+}
+
+func payRenderer(show pay.Show, seat pay.Seat, buyerName, qrPayload string) ([]byte, error) {
+	return ticket.RenderPDF(
+		ticket.Show{Title: show.Title, Venue: show.Venue, StartsAt: show.StartsAt},
+		ticket.Seat{Row: seat.Row, Col: seat.Col},
+		buyerName, qrPayload,
+	)
 }

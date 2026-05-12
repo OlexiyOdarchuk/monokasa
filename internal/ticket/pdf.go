@@ -10,9 +10,6 @@ import (
 
 	"github.com/jung-kurt/gofpdf"
 	"github.com/skip2/go-qrcode"
-
-	"github.com/OlexiyOdarchuk/mono-tix/internal/store"
-	"github.com/OlexiyOdarchuk/mono-tix/internal/timefmt"
 )
 
 //go:embed fonts/DejaVuSans.ttf
@@ -21,10 +18,23 @@ var fontRegular []byte
 //go:embed fonts/DejaVuSans-Bold.ttf
 var fontBold []byte
 
+// Show is the subset of show info the ticket needs to print.
+type Show struct {
+	Title    string
+	Venue    string
+	StartsAt time.Time
+}
+
+// Seat is the subset of seat info the ticket needs to print.
+type Seat struct {
+	Row int
+	Col int
+}
+
 // RenderPDF returns an A6 ticket with a navy header band, big seat
 // callout, framed QR and footer. Uses embedded DejaVu Sans for Cyrillic.
 // buyerName is shown above the seat callout when non-empty.
-func RenderPDF(show store.Show, seat store.Seat, buyerName, qrPayload string) ([]byte, error) {
+func RenderPDF(show Show, seat Seat, buyerName, qrPayload string) ([]byte, error) {
 	q, err := qrcode.New(qrPayload, qrcode.Medium)
 	if err != nil {
 		return nil, fmt.Errorf("qrcode: %w", err)
@@ -60,7 +70,7 @@ func RenderPDF(show store.Show, seat store.Seat, buyerName, qrPayload string) ([
 	pdf.SetX(0)
 	pdf.CellFormat(pageW, 5, show.Venue, "", 1, "C", false, 0, "")
 	pdf.SetX(0)
-	pdf.CellFormat(pageW, 5, timefmt.DateTime(show.StartsAt), "", 1, "C", false, 0, "")
+	pdf.CellFormat(pageW, 5, formatDateTime(show.StartsAt), "", 1, "C", false, 0, "")
 
 	// Buyer name (optional).
 	pdf.SetTextColor(20, 30, 60)
@@ -92,11 +102,21 @@ func RenderPDF(show store.Show, seat store.Seat, buyerName, qrPayload string) ([
 	pdf.SetFont("DejaVu", "", 8)
 	pdf.SetY(pageH - 14)
 	pdf.CellFormat(pageW, 4, "Покажи цей QR на вході — нам цього досить.", "", 1, "C", false, 0, "")
-	pdf.CellFormat(pageW, 4, "Видано "+timefmt.DateTime(time.Now()), "", 1, "C", false, 0, "")
+	pdf.CellFormat(pageW, 4, "Видано "+formatDateTime(time.Now()), "", 1, "C", false, 0, "")
 
 	var out bytes.Buffer
 	if err := pdf.Output(&out); err != nil {
 		return nil, fmt.Errorf("pdf output: %w", err)
 	}
 	return out.Bytes(), nil
+}
+
+var ukMonthsGenitive = [...]string{
+	"січня", "лютого", "березня", "квітня", "травня", "червня",
+	"липня", "серпня", "вересня", "жовтня", "листопада", "грудня",
+}
+
+func formatDateTime(t time.Time) string {
+	return fmt.Sprintf("%d %s %d · %s",
+		t.Day(), ukMonthsGenitive[t.Month()-1], t.Year(), t.Format("15:04"))
 }

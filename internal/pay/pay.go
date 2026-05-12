@@ -8,20 +8,64 @@ import (
 	"errors"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/vtopc/go-monobank"
-
-	"github.com/OlexiyOdarchuk/mono-tix/internal/bot"
-	"github.com/OlexiyOdarchuk/mono-tix/internal/store"
-	"github.com/OlexiyOdarchuk/mono-tix/internal/ticket"
-	"github.com/OlexiyOdarchuk/mono-tix/internal/token"
 )
 
+// Show is the subset of show info this package passes through to the renderer.
+type Show struct {
+	Title    string
+	Venue    string
+	StartsAt time.Time
+}
+
+// Seat is the subset of seat info this package passes through.
+type Seat struct {
+	ID           int64
+	Row, Col     int
+	PriceKopecks int64
+}
+
+// Reservation is the subset of reservation info the processor needs.
+type Reservation struct {
+	ID          int64
+	TGChatID    int64
+	BuyerName   string
+	ConfirmedAt *time.Time
+}
+
+// Domain errors the processor expects the Store to return.
+var (
+	ErrCodeNotFound  = errors.New("reservation code not found")
+	ErrAlreadyClosed = errors.New("reservation already closed")
+)
+
+// Store is the persistence behavior the processor needs.
+type Store interface {
+	FindReservationByCode(ctx context.Context, code string) (Reservation, Seat, error)
+	Confirm(ctx context.Context, reservationID int64, qrPayload string) error
+}
+
+// Coder mints the signed QR payload embedded in the issued ticket.
+type Coder interface {
+	QRPayload(reservationID, seatID int64) string
+}
+
+// Notifier delivers the rendered ticket back to the buyer.
+type Notifier interface {
+	SendTicket(chatID int64, seat Seat, pdf []byte) error
+}
+
+// Renderer turns a confirmed reservation into a printable PDF.
+type Renderer func(show Show, seat Seat, buyerName, qrPayload string) ([]byte, error)
+
 type Processor struct {
-	Store        *store.Store
-	Coder        *token.Coder
-	Bot          *bot.Bot
-	Show         store.Show
+	Store        Store
+	Coder        Coder
+	Notifier     Notifier
+	Renderer     Renderer
+	Show         Show
 	PriceKopecks int64
 }
 
@@ -38,7 +82,7 @@ func (p *Processor) Handle(ctx context.Context, e *monobank.WebHookResponse) err
 		return nil
 	}
 	res, seat, err := p.Store.FindReservationByCode(ctx, code)
-	if errors.Is(err, store.ErrCodeNotFound) || errors.Is(err, store.ErrAlreadyClosed) {
+	if errors.Is(err, ErrCodeNotFound) || errors.Is(err, ErrAlreadyClosed) {
 		log.Printf("payment %s: code %q has no open reservation", t.ID, code)
 		return nil
 	}
@@ -56,14 +100,14 @@ func (p *Processor) Handle(ctx context.Context, e *monobank.WebHookResponse) err
 	}
 
 	qrPayload := p.Coder.QRPayload(res.ID, seat.ID)
-	if _, err := p.Store.Confirm(ctx, res.ID, qrPayload); err != nil {
+	if err := p.Store.Confirm(ctx, res.ID, qrPayload); err != nil {
 		return err
 	}
-	pdf, err := ticket.RenderPDF(p.Show, seat, res.BuyerName, qrPayload)
+	pdf, err := p.Renderer(p.Show, seat, res.BuyerName, qrPayload)
 	if err != nil {
 		return err
 	}
-	if err := p.Bot.SendTicket(res.TGChatID, seat, pdf); err != nil {
+	if err := p.Notifier.SendTicket(res.TGChatID, seat, pdf); err != nil {
 		return err
 	}
 	log.Printf("ticket issued: code=%s row=%d seat=%d buyer=%q chat=%d",
