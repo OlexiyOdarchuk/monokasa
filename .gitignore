@@ -1,0 +1,6 @@
+.env
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+mono_tix
