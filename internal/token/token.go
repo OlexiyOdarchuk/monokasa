@@ -1,4 +1,7 @@
-package main
+// Package token mints two kinds of identifiers: an 8-char human-typeable
+// code that goes into the mono jar payment comment, and a self-verifying
+// payload that gets embedded into the ticket QR.
+package token
 
 import (
 	"crypto/hmac"
@@ -10,19 +13,14 @@ import (
 	"strings"
 )
 
-// Coder produces deterministic, signed identifiers for reservations and tickets.
-type Coder struct {
-	secret []byte
-}
+// Coder is the small HMAC-SHA256 verifier behind both code formats.
+type Coder struct{ secret []byte }
 
-func NewCoder(secret string) *Coder {
-	return &Coder{secret: []byte(secret)}
-}
+func NewCoder(secret string) *Coder { return &Coder{secret: []byte(secret)} }
 
-// NewReservationCode returns a short, url/base32-safe random code that the user
-// types into the mono jar payment comment. 8 chars (40 bits of entropy) is
-// plenty given comments are scoped to one show.
-func (c *Coder) NewReservationCode() (string, error) {
+// NewCode returns an 8-char lower-case base32 reservation code (~40 bits of
+// entropy). Short enough to type into a payment comment by hand.
+func (c *Coder) NewCode() (string, error) {
 	var raw [5]byte
 	if _, err := rand.Read(raw[:]); err != nil {
 		return "", err
@@ -30,20 +28,16 @@ func (c *Coder) NewReservationCode() (string, error) {
 	return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(raw[:])), nil
 }
 
-// QRPayload returns a self-verifying ticket token of the form
-// "<base64url(body)>.<base64url(hmac)>". body contains "<reservation_id>:<seat_id>".
-// Use [VerifyQRPayload] on the scanning side.
+// QRPayload returns "<base64url(body)>.<base64url(hmac)>" where body is
+// "<reservationID>:<seatID>". Use [Coder.VerifyQRPayload] on scan.
 func (c *Coder) QRPayload(reservationID, seatID int64) string {
 	body := fmt.Sprintf("%d:%d", reservationID, seatID)
 	mac := hmac.New(sha256.New, c.secret)
 	mac.Write([]byte(body))
-	sig := mac.Sum(nil)
 	return base64.RawURLEncoding.EncodeToString([]byte(body)) + "." +
-		base64.RawURLEncoding.EncodeToString(sig)
+		base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
-// VerifyQRPayload returns the embedded reservation_id and seat_id iff the
-// signature checks out.
 func (c *Coder) VerifyQRPayload(payload string) (reservationID, seatID int64, err error) {
 	parts := strings.SplitN(payload, ".", 2)
 	if len(parts) != 2 {

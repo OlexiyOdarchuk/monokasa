@@ -1,4 +1,4 @@
-module github.com/iShawyha/mono_tix
+module github.com/OlexiyOdarchuk/mono-tix
 
 go 1.26.3
 
