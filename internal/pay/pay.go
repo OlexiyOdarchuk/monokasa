@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/vtopc/go-monobank"
+	"github.com/OlexiyOdarchuk/monosdk"
 )
 
 // Show is the subset of show info this package passes through to the renderer.
@@ -69,8 +69,8 @@ type Processor struct {
 	PriceKopecks int64
 }
 
-// Handle is the OnEvent callback wired into monobank.WebhookHandler.
-func (p *Processor) Handle(ctx context.Context, e *monobank.WebHookResponse) error {
+// Handle is the OnEvent callback wired into monosdk.WebhookHandler.
+func (p *Processor) Handle(ctx context.Context, e *monosdk.WebHookResponse) error {
 	t := e.Data.Transaction
 	if t.Amount <= 0 {
 		return nil // outflow, not interesting
