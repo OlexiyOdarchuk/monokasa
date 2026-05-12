@@ -1,4 +1,4 @@
-// Command monotix is the entry point of the ticket-selling bot.
+// Command monokasa is the entry point of the ticket-selling bot.
 package main
 
 import (
@@ -13,14 +13,14 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/vtopc/go-monobank"
 
-	"github.com/OlexiyOdarchuk/mono-tix/internal/bot"
-	"github.com/OlexiyOdarchuk/mono-tix/internal/config"
-	"github.com/OlexiyOdarchuk/mono-tix/internal/pay"
-	"github.com/OlexiyOdarchuk/mono-tix/internal/store"
-	"github.com/OlexiyOdarchuk/mono-tix/internal/ticket"
-	"github.com/OlexiyOdarchuk/mono-tix/internal/timefmt"
-	"github.com/OlexiyOdarchuk/mono-tix/internal/token"
-	"github.com/OlexiyOdarchuk/mono-tix/internal/web"
+	"github.com/OlexiyOdarchuk/monokasa/internal/bot"
+	"github.com/OlexiyOdarchuk/monokasa/internal/config"
+	"github.com/OlexiyOdarchuk/monokasa/internal/pay"
+	"github.com/OlexiyOdarchuk/monokasa/internal/store"
+	"github.com/OlexiyOdarchuk/monokasa/internal/ticket"
+	"github.com/OlexiyOdarchuk/monokasa/internal/timefmt"
+	"github.com/OlexiyOdarchuk/monokasa/internal/token"
+	"github.com/OlexiyOdarchuk/monokasa/internal/web"
 )
 
 func main() {

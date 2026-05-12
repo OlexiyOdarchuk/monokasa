@@ -1,4 +1,4 @@
-module github.com/OlexiyOdarchuk/mono-tix
+module github.com/OlexiyOdarchuk/monokasa
 
 go 1.26.3
 
