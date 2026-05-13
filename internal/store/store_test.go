@@ -226,6 +226,45 @@ func TestFindFreeSeatNotFound(t *testing.T) {
 	}
 }
 
+func TestSweepExpiredHolds(t *testing.T) {
+	s := newTestStore(t)
+	showID := seedShow(t, s)
+	ctx := context.Background()
+
+	// Expired and unpaid → swept.
+	seat1, _ := s.FindFreeSeat(ctx, showID, 1, 1)
+	if _, err := s.Reserve(ctx, seat1, 1, 100, "A", "code0001", -1*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	// Live hold → untouched.
+	seat2, _ := s.FindFreeSeat(ctx, showID, 1, 2)
+	if _, err := s.Reserve(ctx, seat2, 2, 200, "B", "code0002", 5*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	// Expired but paid → untouched.
+	seat3, _ := s.FindFreeSeat(ctx, showID, 1, 3)
+	r3, _ := s.Reserve(ctx, seat3, 3, 300, "C", "code0003", -1*time.Minute)
+	if _, err := s.Confirm(ctx, r3.ID, "qr3"); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := s.SweepExpiredHolds(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("swept %d rows, want 1", n)
+	}
+	// Re-running is a no-op.
+	if n, _ := s.SweepExpiredHolds(ctx); n != 0 {
+		t.Fatalf("re-run swept %d rows, want 0", n)
+	}
+	// Seat1 is now free again.
+	if _, err := s.FindFreeSeat(ctx, showID, 1, 1); err != nil {
+		t.Fatalf("seat1 should be free after sweep, got %v", err)
+	}
+}
+
 func TestRemindFlow(t *testing.T) {
 	s := newTestStore(t)
 	showID := seedShow(t, s)

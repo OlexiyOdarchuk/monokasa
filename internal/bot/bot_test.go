@@ -33,7 +33,7 @@ func TestNormalizeName(t *testing.T) {
 			"   ",
 			"A",
 			"  Я ",
-			strings.Repeat("я", 101),
+			strings.Repeat("я", nameMaxRunes+1),
 		}
 		for _, in := range bad {
 			if _, err := normalizeName(in); err == nil {

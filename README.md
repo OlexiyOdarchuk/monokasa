@@ -8,6 +8,26 @@ Telegram-бот, що продає квитки на одну виставу ч�
 кабінету чи інтеграції з еквайрингом — це MVP для разової події, який
 можна підняти на найдешевшому VPS за вечір.
 
+## Quickstart
+
+Мінімум, щоб бот ожив:
+
+```sh
+cat > .env <<'EOF'
+TG_TOKEN=123:abc...           # від @BotFather
+TICKET_SECRET=$(openssl rand -hex 32)
+MONO_JAR_LINK=https://send.monobank.ua/jar/abc123
+EOF
+
+go build -o monokasa ./cmd/monokasa
+./monokasa
+```
+
+Бот стартує, створює `tix.db`, заповнює зал 5×6 по 250.00 ₴ і слухає
+`:8090`. Далі — пробрось HTTPS до `:8090` (cloudflared/ngrok у dev) і
+зареєструй вебхук у моно на `https://your.host/webhook` (див. нижче).
+Решта параметрів — у таблиці [Конфіг](#конфіг).
+
 ## Як це працює
 
 1. **Користувач** пише боту, бачить мапу місць (`/seats`), тицяє вільне.
@@ -28,16 +48,21 @@ Telegram-бот, що продає квитки на одну виставу ч�
 ## Архітектура
 
 ```
-cmd/monokasa/        # main: завантажує config, відкриває store, склеює бот+web+pay
+cmd/monokasa/        # main: завантажує config, відкриває store, склеює бот+web+pay,
+                     # адаптери до go-monobank-sdk (webhook, reconcile, jar)
 internal/
   config/            # ENV → Config
-  store/             # SQLite, схема, міграції, всі CRUD-методи
+  store/             # SQLite, схема, міграції, всі CRUD-методи, sweep-expired
   token/             # 8-символьний код + HMAC-підписаний QR payload
-  bot/               # Telegram: /seats, /my, /stats, callback'и, ForceReply для імені
-  pay/               # обробник monobank-вебхука: match → confirm → render → send
+  bot/               # Telegram: /seats, /my, /stats, /reconcile, /jar, callback'и, ForceReply для імені
+                     # + sweeper, що чистить покинуті pending-picks
+  pay/               # обробник monobank statement-події: match → confirm → render → send
+                     # використовується і вебхуком, і /reconcile (одна гілка — нуль розбіжностей)
   ticket/            # PDF A6 з вбудованим DejaVu Sans + QR
-  web/               # HTML-сторінка сканера + POST /scan/check
+  web/               # HTML-сторінка сканера + POST /scan/check + per-IP rate-limit + cookie auth
+  metrics/           # expvar-лічильники (квитки, помилки вебхука, скани) — лист, без домену
   timefmt/           # український форматер дати (для main)
+  e2e/               # cross-package integration test (store+pay+token+web)
 ```
 
 Внутрішні пакети **не імпортують один одного** — кожен оголошує власні
@@ -56,8 +81,10 @@ godotenv підхопить.
 | `TG_TOKEN` | — *обов'язково* | токен бота від @BotFather |
 | `TICKET_SECRET` | — *обов'язково* | секрет HMAC для підпису QR; будь-який рядок ≥32 символів |
 | `MONO_JAR_LINK` | — *обов'язково* | посилання на банку моно, до якої клеїться `?a=…&t=код` |
+| `MONO_TOKEN` | (порожньо) | токен monobank Personal API; вмикає `/reconcile` і авто-реєстрацію вебхуку |
+| `WEBHOOK_URL` | (порожньо) | публічний URL вебхуку; разом із `MONO_TOKEN` змушує бот при старті викликати `POST /personal/webhook` |
 | `SCANNER_TOKEN` | (порожньо) | shared-секрет для `/scan`; порожнє = доступ без авторизації |
-| `ADMIN_TG_ID` | `0` | TG user id, якому доступний `/stats` |
+| `ADMIN_TG_ID` | `0` | TG user id, якому доступні `/stats`, `/reconcile`, `/jar` |
 | `HTTP_ADDR` | `:8090` | порт HTTP-сервера (вебхук + сканер + /health) |
 | `DB_PATH` | `tix.db` | де лежатиме SQLite-файл |
 | `SHOW_TITLE` | `Моя вистава` | для шапки квитка і повідомлень бота |
@@ -79,11 +106,62 @@ monobank потребує публічного HTTPS для вебхука. На
 Caddy, з letsencrypt; у dev — `cloudflared tunnel` або `ngrok`. URL
 вебхука для реєстрації в моно: `https://your.host/webhook`.
 
-Health-check: `GET /health` → 200 `ok`.
+Реєстрацію вебхука можна зробити вручну через monobank API або автоматично —
+проставити `MONO_TOKEN` + `WEBHOOK_URL=https://your.host/webhook`, тоді бот
+сам викличе `POST /personal/webhook` при старті. Mono GET-пінгає URL перед
+тим, як прийняти підписку, тому виклик іде з exponential-backoff retry
+(5 спроб, ~30s сумарно), щоб пережити повільне піднімання TLS-фронту.
+
+Якщо не хочеш давати боту `MONO_TOKEN` у проді — зареєструй вручну:
+
+```sh
+curl -X POST https://api.monobank.ua/personal/webhook \
+     -H "X-Token: $MONO_TOKEN" \
+     -H 'Content-Type: application/json' \
+     -d '{"webHookUrl":"https://your.host/webhook"}'
+```
+
+### Службові ендпоінти
+
+- `GET /health` — readiness: 200 `ok`, якщо БД відповідає; 503 при таймауті
+  чи помилці пінга SQLite. Підходить для load-balancer health-check.
+- `GET /debug/vars` — лічильники `expvar` у JSON-форматі (видані квитки за
+  webhook/reconcile, помилки вебхука, OK/used/invalid сканування + поточні
+  sold/held/free gauges). Скрейпиться будь-яким Prometheus textfile-exporter.
+
+## Команди бота
+
+Для покупця:
+
+- `/seats` — мапа місць (вільні / зайняті / тимчасово в холді);
+- `/my` — список своїх бронювань зі статусами і кодом для оплати;
+- `/start`, `/help` — вітання + список доступних команд.
+
+Для адміна (`ADMIN_TG_ID`):
+
+- `/stats` — продажі, виторг, скільки місць ще вільно;
+- `/reconcile [тривалість]` — пройти по виписках monobank за вікно (за замовч.
+  24h, можна `/reconcile 48h`, `/reconcile 7d`) і вручну підтвердити кожну
+  оплату, для якої webhook не дійшов. Потрібен `MONO_TOKEN`. Mono лімітує
+  `/personal/statement` 1 запит/60s на акаунт, тому довге вікно займе хвилину-дві;
+- `/jar` — баланс і ціль банки моно (резолвиться через `send.monobank.ua`,
+  довгий id кешується в пам'яті).
+
+`/reconcile` — це рятувальна сітка на випадок, коли webhook загубився
+(downtime, рестарт, перенесення хосту). Проганяє кожну транзакцію через
+ту саму гілку `pay.Processor`, що й боєвий хук, тому подвійно нічого не
+підтвердиться — `Confirm` ідемпотентний на рівні store.
 
 ## Сканер на вході
 
-Дай людині на вході посилання `https://your.host/scan?token=<SCANNER_TOKEN>`.
+Відкрий `https://your.host/scan` у браузері. Якщо `SCANNER_TOKEN` заданий,
+сторінка покаже форму з полем «пароль» — введи значення `SCANNER_TOKEN`,
+бот видасть HttpOnly-куку (`Path=/scan`, 12 годин життя) і перекине на
+сам сканер. Усі подальші POST-и `/scan/check` користуються кукою. Якщо
+`SCANNER_TOKEN` порожній — форма не показується, сканер відкривається
+одразу. Перебір паролю ловить per-IP rate-limit (10 спроб/с), той самий,
+що й на `/scan/check`.
+
 Відкривається в Safari/Chrome, просить камеру, далі fullscreen-режим зі
 звуковими сигналами:
 
@@ -117,10 +195,37 @@ go test ./...
 Бекап: `cp tix.db tix.db.bak` під час непікової години. Або
 `sqlite3 tix.db ".backup tix.db.bak"` без зупинки сервісу.
 
+## Troubleshooting
+
+**Оплата пройшла, а PDF не прийшов.** Найімовірніше, webhook не дійшов
+(downtime / неправильно зареєстрований URL / monobank не дотиснувся).
+Перевір логи на рядок `mono webhook ready, keyId=…` при старті і на
+`webhook: …` помилки. Дієве — `/reconcile 2h` від адмін-акаунта: він
+прокачає виписку і добʼє все, що було пропущено. Якщо `MONO_TOKEN`
+не виставлений, `/reconcile` не активується — додай і перезапусти.
+
+**Сканер не бачить камеру.** Браузер віддає камеру тільки на HTTPS
+(виняток — `localhost`). Переконайся, що `/scan` відкритий через https,
+а не через IP/HTTP. На iOS — лише Safari, не in-app браузер Telegram.
+
+**QR сканується, але «✗ Недійсний».** Значить HMAC не зійшовся: або
+змінили `TICKET_SECRET` після випуску цього квитка, або QR з іншого
+інстансу/тестового запуску. Подивись `internal/store/store.go` → таблиця
+`tickets`, поле `qr_payload`.
+
+**Бот не реагує на команди.** Перевір, що в логах є `telegram bot up`.
+Якщо ні — `TG_TOKEN` невалідний. Якщо так, але `/stats` мовчить — у тебе
+не той `ADMIN_TG_ID` (порівняй з тим, що шле `@userinfobot`).
+
+**`/reconcile` довго думає.** Це нормально: monobank лімітує
+`/personal/statement` 1 запит/60s на акаунт. Якщо в `ClientInfo`
+кілька акаунтів+банок — буде минута-дві.
+
 ## Що свідомо не зроблено
 
 - мульти-show: завжди один захід на одну базу;
-- особистий кабінет / повернення коштів: усе руками через `sqlite3` і моно;
+- особистий кабінет / повернення коштів: усе руками через `sqlite3` і моно
+  (на пропущений webhook є `/reconcile`, але рефанди — ручні);
 - проміжний платіжний шлюз: розрахунок іде безпосередньо на банку моно;
 - авторизація сканера складніша за shared-token;
 - метрики/трейсинг: стандартний `log` у stdout.

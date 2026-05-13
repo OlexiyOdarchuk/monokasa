@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"expvar"
 	"fmt"
 	"log"
 	"net/http"
@@ -25,6 +26,7 @@ import (
 
 	"github.com/OlexiyOdarchuk/monokasa/internal/bot"
 	"github.com/OlexiyOdarchuk/monokasa/internal/config"
+	"github.com/OlexiyOdarchuk/monokasa/internal/metrics"
 	"github.com/OlexiyOdarchuk/monokasa/internal/pay"
 	"github.com/OlexiyOdarchuk/monokasa/internal/store"
 	"github.com/OlexiyOdarchuk/monokasa/internal/ticket"
@@ -95,7 +97,10 @@ func main() {
 		Keys:    monoClient,
 		Dedup:   webhook.NewMemoryDeduper(2048),
 		OnEvent: processor.Handle,
-		OnError: func(err error) { log.Printf("webhook: %v", err) },
+		OnError: func(err error) {
+			metrics.WebhookErrors.Add(1)
+			log.Printf("webhook: %v", err)
+		},
 	})
 	if err != nil {
 		log.Fatalf("webhook handler init: %v", err)
@@ -115,10 +120,30 @@ func main() {
 
 	scanner := web.NewScanner(webStore{st}, coder, cfg.ScannerToken)
 
+	// Seat gauges read straight from the store at scrape time — Prometheus
+	// scrapes infrequently enough that this is cheaper than maintaining a
+	// cached value in memory and keeping it consistent.
+	expvar.Publish("monokasa_seats_sold", expvar.Func(func() any {
+		return liveStat(st, show.ID, func(s store.Stats) int { return s.Sold })
+	}))
+	expvar.Publish("monokasa_seats_held", expvar.Func(func() any {
+		return liveStat(st, show.ID, func(s store.Stats) int { return s.Held })
+	}))
+	expvar.Publish("monokasa_seats_free", expvar.Func(func() any {
+		return liveStat(st, show.ID, func(s store.Stats) int { return s.Free })
+	}))
+
 	mux := http.NewServeMux()
 	mux.Handle("/webhook", hook)
+	mux.Handle("/debug/vars", expvar.Handler())
 	scanner.Register(mux)
-	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if err := st.Ping(ctx); err != nil {
+			http.Error(w, "db: "+err.Error(), http.StatusServiceUnavailable)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
@@ -146,6 +171,13 @@ func main() {
 	// Reminders.
 	go runReminderLoop(ctx, st, tg, show, cfg.RemindBefore)
 
+	// Eagerly free seats whose HOLD has lapsed without payment, so /seats
+	// reflects reality even when no user has triggered a status read.
+	go runHoldSweeper(ctx, st, 5*time.Minute)
+
+	// GC idle rate-limit buckets so the map doesn't grow over the show's lifetime.
+	go scanner.RunGC(ctx, 10*time.Minute, 30*time.Minute)
+
 	<-ctx.Done()
 	log.Printf("shutting down")
 }
@@ -162,24 +194,73 @@ func signalCtx() (context.Context, context.CancelFunc) {
 }
 
 // registerWebhook calls POST /personal/webhook so monobank starts pushing
-// statement events at the configured URL. Mono pings the URL with GET
-// before accepting the subscription, so we give the HTTP server a moment
-// to actually start listening. Failure is logged but doesn't crash the
-// process — the operator can register manually.
+// statement events at the configured URL. Two things can be unready at
+// startup: our own HTTP server (race with the listener), and the public
+// HTTPS path (TLS, tunnel, DNS). Mono pings the URL with GET before
+// accepting the subscription, so both must be reachable. We retry with
+// exponential backoff for ~30s; if it still fails, log and exit — the
+// operator can register manually via curl.
 func registerWebhook(ctx context.Context, token, url string) {
-	select {
-	case <-ctx.Done():
-		return
-	case <-time.After(time.Second):
-	}
 	cli := personal.New(token)
-	rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	if err := cli.SetWebHook(rctx, url); err != nil {
-		log.Printf("register webhook %s: %v", url, err)
-		return
+	backoff := time.Second
+	for attempt := 1; attempt <= 5; attempt++ {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		rctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		err := cli.SetWebHook(rctx, url)
+		cancel()
+		if err == nil {
+			log.Printf("registered webhook: %s (attempt %d)", url, attempt)
+			return
+		}
+		log.Printf("register webhook attempt %d/5 failed: %v", attempt, err)
+		backoff *= 2
 	}
-	log.Printf("registered webhook: %s", url)
+	log.Printf("register webhook %s: giving up — register manually", url)
+}
+
+// liveStat reads one field out of store.Stats with a 1s timeout. Used by
+// the expvar gauges; on failure it returns -1 so a flat-lined gauge in
+// Prometheus is a visible signal rather than a stale value.
+func liveStat(st *store.Store, showID int64, pick func(store.Stats) int) int {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	s, err := st.Stats(ctx, showID)
+	if err != nil {
+		return -1
+	}
+	return pick(s)
+}
+
+// runHoldSweeper periodically cancels expired-but-unpaid reservations so
+// their seats become free without waiting for someone to call /seats.
+func runHoldSweeper(ctx context.Context, st *store.Store, every time.Duration) {
+	tick := time.NewTicker(every)
+	defer tick.Stop()
+	sweep := func() {
+		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		n, err := st.SweepExpiredHolds(ctx)
+		if err != nil {
+			log.Printf("sweep holds: %v", err)
+			return
+		}
+		if n > 0 {
+			log.Printf("sweep holds: freed %d expired reservation(s)", n)
+		}
+	}
+	sweep() // fire once at startup to catch carry-over from before restart
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			sweep()
+		}
+	}
 }
 
 // runReminderLoop wakes up periodically; when we're within
@@ -391,19 +472,28 @@ type monoReconciler struct {
 	proc *pay.Processor
 }
 
-func (r *monoReconciler) Reconcile(ctx context.Context, lookback time.Duration) (bot.ReconcileResult, error) {
+func (r *monoReconciler) Reconcile(ctx context.Context, lookback time.Duration, progress func(string)) (bot.ReconcileResult, error) {
+	if progress == nil {
+		progress = func(string) {}
+	}
 	info, err := r.cli.ClientInfo(ctx)
 	if err != nil {
 		return bot.ReconcileResult{}, fmt.Errorf("client info: %w", err)
 	}
 	to := time.Now()
 	from := to.Add(-lookback)
+	totalSources := len(info.Accounts) + len(info.Jars)
 	var res bot.ReconcileResult
+	idx := 0
 	walk := func(accountID, label string) error {
+		idx++
+		progress(fmt.Sprintf("джерело %d/%d: %s — скан транзакцій…", idx, totalSources, label))
+		var seen int
 		for tx, err := range r.cli.TransactionsRangeIter(ctx, accountID, from, to) {
 			if err != nil {
 				return fmt.Errorf("%s: %w", label, err)
 			}
+			seen++
 			res.Scanned++
 			matched, err := r.proc.ReconcileTx(ctx, tx)
 			if err != nil {
@@ -414,15 +504,17 @@ func (r *monoReconciler) Reconcile(ctx context.Context, lookback time.Duration) 
 				res.Matched++
 			}
 		}
+		progress(fmt.Sprintf("джерело %d/%d: %s — %d транзакцій, %d збігів",
+			idx, totalSources, label, seen, res.Matched))
 		return nil
 	}
 	for _, a := range info.Accounts {
-		if err := walk(a.AccountID, "account "+a.AccountID); err != nil {
+		if err := walk(a.AccountID, "акаунт "+a.AccountID); err != nil {
 			return res, err
 		}
 	}
 	for _, j := range info.Jars {
-		if err := walk(j.ID, "jar "+j.ID); err != nil {
+		if err := walk(j.ID, "банка "+j.ID); err != nil {
 			return res, err
 		}
 	}

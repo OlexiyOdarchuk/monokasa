@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/OlexiyOdarchuk/monokasa/internal/metrics"
 )
 
 // Seat is the subset of seat info shown next to a scanned ticket.
@@ -51,13 +53,17 @@ type Coder interface {
 // Scanner is the QR-scanner web app: GET /scan serves the HTML, POST
 // /scan/check validates a payload and marks the ticket as used.
 type Scanner struct {
-	store Store
-	coder Coder
-	token string // shared auth token; empty disables auth
+	store   Store
+	coder   Coder
+	token   string // shared auth token; empty disables auth
+	limiter *rateLimiter
 }
 
 func NewScanner(s Store, c Coder, authToken string) *Scanner {
-	return &Scanner{store: s, coder: c, token: authToken}
+	// 10 req/s sustained, burst 20 — a doorman can comfortably scan one
+	// QR per second; anything faster is either an automated probe or a
+	// stuck client. Per-IP, so multiple staff devices don't fight.
+	return &Scanner{store: s, coder: c, token: authToken, limiter: newRateLimiter(10, 20)}
 }
 
 func (s *Scanner) Register(mux *http.ServeMux) {
@@ -65,24 +71,123 @@ func (s *Scanner) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/scan/check", s.handleCheck)
 }
 
+// RunGC periodically drops idle rate-limit buckets. Call from main with
+// the lifecycle context; returns when ctx is cancelled.
+func (s *Scanner) RunGC(ctx context.Context, every, idleMax time.Duration) {
+	tick := time.NewTicker(every)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			s.limiter.gc(idleMax)
+		}
+	}
+}
+
+// scanCookie holds the validated SCANNER_TOKEN after a successful login.
+// HttpOnly + Path=/scan + 12h MaxAge — long enough to cover a single
+// performance shift, short enough that a lost device stops working by
+// next day.
+const scanCookie = "monokasa_scan"
+const scanCookieMaxAge = 12 * 60 * 60
+
+// authOK checks cookie first, then the X-Scanner-Token header (curl path).
+// The password form at GET/POST /scan is the only way to obtain the cookie.
 func (s *Scanner) authOK(r *http.Request) bool {
 	if s.token == "" {
 		return true
 	}
-	got := r.URL.Query().Get("token")
-	if got == "" {
-		got = r.Header.Get("X-Scanner-Token")
+	if ck, err := r.Cookie(scanCookie); err == nil {
+		if subtle.ConstantTimeCompare([]byte(ck.Value), []byte(s.token)) == 1 {
+			return true
+		}
 	}
-	return subtle.ConstantTimeCompare([]byte(got), []byte(s.token)) == 1
+	if hdr := r.Header.Get("X-Scanner-Token"); hdr != "" {
+		return subtle.ConstantTimeCompare([]byte(hdr), []byte(s.token)) == 1
+	}
+	return false
 }
 
+// handlePage is a single endpoint that serves either the scanner UI or
+// the password gate, depending on whether SCANNER_TOKEN is set and whether
+// the request has a valid cookie. POST is the form submit; on success it
+// sets the cookie and 303s back to GET /scan, which now lands on the UI.
 func (s *Scanner) handlePage(w http.ResponseWriter, r *http.Request) {
-	if !s.authOK(r) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	// No password configured → scanner is open. Only GET makes sense.
+	if s.token == "" {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		writeScannerPage(w)
 		return
 	}
+
+	switch r.Method {
+	case http.MethodGet:
+		if s.authOK(r) {
+			writeScannerPage(w)
+			return
+		}
+		writeLoginPage(w, http.StatusOK, "")
+	case http.MethodPost:
+		// Login attempts share the same per-IP token bucket as /scan/check,
+		// so a password brute-force gets throttled to ~10 attempts/s.
+		if !s.limiter.allow(clientIP(r)) {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "rate limited", http.StatusTooManyRequests)
+			return
+		}
+		if err := r.ParseForm(); err != nil {
+			writeLoginPage(w, http.StatusBadRequest, "помилка форми")
+			return
+		}
+		pw := r.PostFormValue("password")
+		if subtle.ConstantTimeCompare([]byte(pw), []byte(s.token)) != 1 {
+			writeLoginPage(w, http.StatusUnauthorized, "невірний пароль")
+			return
+		}
+		http.SetCookie(w, &http.Cookie{
+			Name:     scanCookie,
+			Value:    s.token,
+			Path:     "/scan",
+			HttpOnly: true,
+			SameSite: http.SameSiteLaxMode,
+			Secure:   isTLS(r),
+			MaxAge:   scanCookieMaxAge,
+		})
+		http.Redirect(w, r, "/scan", http.StatusSeeOther)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func writeScannerPage(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write([]byte(pageHTML))
+}
+
+func writeLoginPage(w http.ResponseWriter, status int, errMsg string) {
+	body := loginHTML
+	if errMsg != "" {
+		body = strings.Replace(body, "{{ERR}}", `<div class="err">`+errMsg+`</div>`, 1)
+	} else {
+		body = strings.Replace(body, "{{ERR}}", "", 1)
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
+	_, _ = w.Write([]byte(body))
+}
+
+// isTLS returns true when the request reached us over HTTPS, either
+// directly or via a reverse proxy honouring X-Forwarded-Proto.
+func isTLS(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	return strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
 }
 
 type checkRequest struct {
@@ -107,6 +212,11 @@ func (s *Scanner) handleCheck(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
 	}
+	if !s.limiter.allow(clientIP(r)) {
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+		return
+	}
 	var req checkRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, checkResponse{Status: "invalid", Detail: "malformed body"})
@@ -118,6 +228,7 @@ func (s *Scanner) handleCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, _, err := s.coder.VerifyQRPayload(payload); err != nil {
+		metrics.ScansInvalid.Add(1)
 		writeJSON(w, http.StatusOK, checkResponse{Status: "invalid", Detail: err.Error()})
 		return
 	}
@@ -128,6 +239,7 @@ func (s *Scanner) handleCheck(w http.ResponseWriter, r *http.Request) {
 	t, err := s.store.UseTicket(ctx, payload)
 	switch {
 	case errors.Is(err, ErrTicketUsed):
+		metrics.ScansUsed.Add(1)
 		res, seat, _ := s.store.FindReservationByTicket(ctx, t.ID)
 		writeJSON(w, http.StatusOK, checkResponse{
 			Status:   "used",
@@ -138,12 +250,14 @@ func (s *Scanner) handleCheck(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	case errors.Is(err, ErrTicketNotFound):
+		metrics.ScansInvalid.Add(1)
 		writeJSON(w, http.StatusOK, checkResponse{Status: "invalid", Detail: "ticket not found"})
 		return
 	case err != nil:
 		writeJSON(w, http.StatusInternalServerError, checkResponse{Status: "invalid", Detail: err.Error()})
 		return
 	}
+	metrics.ScansOK.Add(1)
 	res, seat, _ := s.store.FindReservationByTicket(ctx, t.ID)
 	writeJSON(w, http.StatusOK, checkResponse{
 		Status:   "ok",

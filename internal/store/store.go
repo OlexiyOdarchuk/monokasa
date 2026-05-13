@@ -97,6 +97,13 @@ func Open(path string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+// Ping verifies the database is reachable. Used by the /health endpoint
+// so a stuck or evicted SQLite file fails readiness instead of silently
+// serving stale data.
+func (s *Store) Ping(ctx context.Context) error {
+	return s.db.PingContext(ctx)
+}
+
 // SeedIfEmpty inserts a single show plus a rows×cols seat grid when the
 // database is freshly initialised. Returns the show id either way.
 func (s *Store) SeedIfEmpty(ctx context.Context, show Show, rows, cols int, priceKopecks int64) (int64, error) {
@@ -533,6 +540,24 @@ func (s *Store) ConfirmedNotYetReminded(ctx context.Context, showID int64) ([]My
 		out = append(out, MyItem{Reservation: r, Seat: seat})
 	}
 	return out, rows.Err()
+}
+
+// SweepExpiredHolds cancels every reservation whose HOLD has lapsed and
+// which was never paid for. Returns the number of rows touched. Safe to
+// run on any schedule — it's idempotent and only touches stale rows.
+func (s *Store) SweepExpiredHolds(ctx context.Context) (int64, error) {
+	now := time.Now().Unix()
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE reservations
+		SET cancelled_at = ?
+		WHERE cancelled_at IS NULL
+		  AND confirmed_at IS NULL
+		  AND expires_at < ?`, now, now)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }
 
 func (s *Store) MarkReminded(ctx context.Context, reservationID int64) error {

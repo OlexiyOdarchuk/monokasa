@@ -13,6 +13,8 @@ import (
 	"github.com/OlexiyOdarchuk/go-monobank-sdk/bank"
 	"github.com/OlexiyOdarchuk/go-monobank-sdk/money"
 	"github.com/OlexiyOdarchuk/go-monobank-sdk/webhook"
+
+	"github.com/OlexiyOdarchuk/monokasa/internal/metrics"
 )
 
 // Show is the subset of show info this package passes through to the renderer.
@@ -75,7 +77,10 @@ type Processor struct {
 
 // Handle is the OnEvent callback wired into webhook.NewHandler.
 func (p *Processor) Handle(ctx context.Context, e *webhook.Response) error {
-	_, err := p.processTx(ctx, e.Data.Transaction)
+	matched, err := p.processTx(ctx, e.Data.Transaction)
+	if matched {
+		metrics.IssuedFromWebhook()
+	}
 	return err
 }
 
@@ -83,7 +88,11 @@ func (p *Processor) Handle(ctx context.Context, e *webhook.Response) error {
 // by the admin /reconcile command to catch webhooks Mono dropped. Returns
 // true if the transaction issued a ticket on this call.
 func (p *Processor) ReconcileTx(ctx context.Context, tx bank.Transaction) (bool, error) {
-	return p.processTx(ctx, tx)
+	matched, err := p.processTx(ctx, tx)
+	if matched {
+		metrics.IssuedFromReconcile()
+	}
+	return matched, err
 }
 
 func (p *Processor) processTx(ctx context.Context, t bank.Transaction) (bool, error) {

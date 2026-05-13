@@ -1,5 +1,43 @@
 package web
 
+// loginHTML is the password gate shown at GET /scan when SCANNER_TOKEN is
+// set and the request has no valid cookie. The {{ERR}} placeholder is
+// replaced server-side with either "" or a short error div — content is
+// fixed text from us, so no XSS escaping is needed.
+const loginHTML = `<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Сканер — вхід</title>
+<style>
+  :root { color-scheme: dark; }
+  html,body { margin:0; height:100%; background:#111; color:#eee;
+    font-family:system-ui,sans-serif; display:flex; align-items:center; justify-content:center; }
+  form { background:#1a1a1a; padding:1.5rem 1.5rem 1.2rem; border-radius:12px;
+    min-width:280px; box-shadow:0 4px 24px rgba(0,0,0,.4); }
+  h1 { margin:0 0 1rem; font-size:1.15rem; font-weight:600; letter-spacing:.02em; }
+  input[type=password] { width:100%; box-sizing:border-box; padding:.7rem;
+    font-size:1rem; background:#222; color:#eee; border:1px solid #333;
+    border-radius:6px; outline:none; }
+  input[type=password]:focus { border-color:#2563eb; }
+  button { width:100%; margin-top:.7rem; padding:.7rem; font-size:1rem;
+    background:#2563eb; color:#fff; border:0; border-radius:6px; font-weight:600; cursor:pointer; }
+  button:active { background:#1d4ed8; }
+  .err { color:#f87171; margin-top:.6rem; font-size:.9rem; text-align:center; }
+</style>
+</head>
+<body>
+<form method="POST" action="/scan" autocomplete="off">
+  <h1>🎟  Сканер квитків</h1>
+  <input type="password" name="password" autofocus required placeholder="пароль">
+  <button type="submit">Увійти</button>
+  {{ERR}}
+</form>
+</body>
+</html>
+`
+
 const pageHTML = `<!doctype html>
 <html lang="uk">
 <head>
@@ -89,14 +127,14 @@ const pageHTML = `<!doctype html>
 
   let lastPayload = '';
   let cooldownUntil = 0;
-  const TOKEN = new URLSearchParams(location.search).get('token') || '';
 
   async function check(payload) {
     try {
-      const res = await fetch('/scan/check' + (TOKEN ? '?token=' + encodeURIComponent(TOKEN) : ''), {
+      const res = await fetch('/scan/check', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ payload }),
+        credentials: 'same-origin',
       });
       const data = await res.json().catch(() => ({ status:'invalid', detail:'bad server response' }));
       const seat = data.seat || '';

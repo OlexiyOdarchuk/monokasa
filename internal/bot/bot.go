@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/url"
 	"strconv"
 	"strings"
@@ -105,9 +106,11 @@ type ReconcileResult struct {
 
 // Reconciler scans recent statement entries and confirms any whose
 // reservation code matches an open booking — a rescue net for webhook
-// events Mono never delivered.
+// events Mono never delivered. The optional progress callback is invoked
+// between accounts so the bot can keep the admin informed during the
+// minute-long monobank rate-limit waits.
 type Reconciler interface {
-	Reconcile(ctx context.Context, lookback time.Duration) (ReconcileResult, error)
+	Reconcile(ctx context.Context, lookback time.Duration, progress func(string)) (ReconcileResult, error)
 }
 
 // JarBalance is the snapshot returned by JarLookup.
@@ -135,9 +138,11 @@ type Bot struct {
 	jar        JarLookup  // optional — nil if jar link unparseable
 
 	// pending tracks users who clicked a seat and are about to type their
-	// name. Keyed by Telegram user ID; value is pendingPick. Cleared on
-	// successful reservation or natural expiry (no GC, lookup checks Until).
+	// name. Keyed by Telegram user ID; value is pendingPick. A background
+	// sweeper drops entries past Until so abandoned picks don't accumulate
+	// for the lifetime of the process.
 	pending sync.Map
+	done    chan struct{}
 }
 
 type pendingPick struct {
@@ -169,13 +174,43 @@ func New(opts Options) (*Bot, error) {
 		tb: tb, store: opts.Store, coder: opts.Coder, show: opts.Show,
 		jarLink: opts.JarLink, hold: opts.Hold, adminTGID: opts.AdminTGID,
 		reconciler: opts.Reconciler, jar: opts.Jar,
+		done: make(chan struct{}),
 	}
 	b.routes()
+	go b.sweepPending(time.Minute)
 	return b, nil
 }
 
 func (b *Bot) Start() { b.tb.Start() }
-func (b *Bot) Stop()  { b.tb.Stop() }
+
+func (b *Bot) Stop() {
+	select {
+	case <-b.done:
+	default:
+		close(b.done)
+	}
+	b.tb.Stop()
+}
+
+// sweepPending drops pending picks whose TTL has lapsed. Without this an
+// abandoned pick lives for the lifetime of the process — small, but real.
+func (b *Bot) sweepPending(every time.Duration) {
+	tick := time.NewTicker(every)
+	defer tick.Stop()
+	for {
+		select {
+		case <-b.done:
+			return
+		case now := <-tick.C:
+			b.pending.Range(func(k, v any) bool {
+				if p, ok := v.(pendingPick); ok && now.After(p.Until) {
+					b.pending.Delete(k)
+				}
+				return true
+			})
+		}
+	}
+}
 
 // SetReconciler wires the rescue-net scanner. Pass nil to disable.
 // Used when the reconciler depends on something built after the bot
@@ -426,11 +461,28 @@ func (b *Bot) handleReconcile(c tele.Context) error {
 		}
 		lookback = d
 	}
-	_ = c.Send(fmt.Sprintf("⏳ Шукаю пропущені оплати за останні %s…", lookback))
+	progressMsg, err := b.tb.Send(c.Chat(),
+		fmt.Sprintf("⏳ Шукаю пропущені оплати за останні %s…", lookback))
+	if err != nil {
+		// If we can't even send the ack, do the work anyway and hope the
+		// final reply lands.
+		log.Printf("reconcile ack: %v", err)
+	}
+	// Live-edit the progress message instead of spamming. Mono is rate-
+	// limited to 1 request/60s per account, so updates fire at most once
+	// a minute — well within Telegram's edit budget.
+	progress := func(s string) {
+		if progressMsg == nil {
+			return
+		}
+		if _, err := b.tb.Edit(progressMsg, "⏳ "+s); err != nil {
+			log.Printf("reconcile progress edit: %v", err)
+		}
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	res, err := b.reconciler.Reconcile(ctx, lookback)
+	res, err := b.reconciler.Reconcile(ctx, lookback, progress)
 	if err != nil {
 		return c.Send("Помилка: " + err.Error())
 	}
@@ -471,7 +523,11 @@ func (b *Bot) handleText(c tele.Context) error {
 	if !ok {
 		return nil // user typed text but isn't in name-input mode
 	}
-	pick := raw.(pendingPick)
+	pick, ok := raw.(pendingPick)
+	if !ok {
+		b.pending.Delete(sender.ID)
+		return nil
+	}
 	if time.Now().After(pick.Until) {
 		b.pending.Delete(sender.ID)
 		return c.Send("Час очікування імені вийшов. Натисни /seats і вибери місце ще раз.")
@@ -520,17 +576,23 @@ func (b *Bot) handleText(c tele.Context) error {
 		markup)
 }
 
-// normalizeName trims, collapses spaces and enforces a 2–100 rune length.
-// Letters, digits, spaces, apostrophes, hyphens and dots are accepted —
-// enough for Ukrainian double-barrelled names like "Анна-Марія О'Брайен".
+// nameMaxRunes caps the buyer name at a length that fits one line of the
+// A6 PDF (105mm wide) at font size 11. Names longer than this either wrap
+// or visually crowd the seat callout below.
+const nameMaxRunes = 60
+
+// normalizeName trims, collapses spaces and enforces a 2–nameMaxRunes rune
+// length. Letters, digits, spaces, apostrophes, hyphens and dots are
+// accepted — enough for Ukrainian double-barrelled names like
+// "Анна-Марія О'Брайен".
 func normalizeName(in string) (string, error) {
 	n := strings.Join(strings.Fields(in), " ")
 	rc := utf8.RuneCountInString(n)
 	if rc < 2 {
 		return "", fmt.Errorf("ім'я має бути щонайменше 2 символи")
 	}
-	if rc > 100 {
-		return "", fmt.Errorf("ім'я задовге (макс. 100 символів)")
+	if rc > nameMaxRunes {
+		return "", fmt.Errorf("ім'я задовге (макс. %d символів)", nameMaxRunes)
 	}
 	return n, nil
 }
