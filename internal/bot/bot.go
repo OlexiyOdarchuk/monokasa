@@ -502,16 +502,19 @@ func (b *Bot) handleText(c tele.Context) error {
 	b.pending.Delete(sender.ID)
 
 	payURL := jarPrefillURL(b.jarLink, seat.PriceKopecks, r.Code)
+	payBtn := tele.InlineButton{Text: "💳 Оплатити", URL: payURL}
 	cancelBtn := tele.InlineButton{Unique: "cancel", Text: "✖ Скасувати бронь", Data: r.Code}
-	markup := &tele.ReplyMarkup{InlineKeyboard: [][]tele.InlineButton{{cancelBtn}}}
+	// Pay on top, cancel below — reach-for-the-first-button habit lands on
+	// the safe action, not the destructive one.
+	markup := &tele.ReplyMarkup{InlineKeyboard: [][]tele.InlineButton{{payBtn}, {cancelBtn}}}
 
 	return c.Send(fmt.Sprintf(
 		"Місце забронювано: ряд %d, місце %d.\n"+
 			"На квитку буде: *%s*\n\n"+
-			"💳 Оплата (сума й коментар вже вписані):\n%s\n\n"+
+			"💳 Натисни *Оплатити* — сума й коментар вже вписані.\n"+
 			"Код у коментарі — `%s`.\n"+
 			"Бронювання дійсне до %s. Після оплати бот сам пришле PDF.",
-		seat.Row, seat.Col, name, payURL, r.Code, formatClock(r.ExpiresAt)),
+		seat.Row, seat.Col, name, r.Code, formatClock(r.ExpiresAt)),
 		tele.ModeMarkdown,
 		&tele.SendOptions{DisableWebPagePreview: true},
 		markup)
