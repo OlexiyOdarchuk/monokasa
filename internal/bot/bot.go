@@ -410,7 +410,7 @@ func (b *Bot) handleText(c tele.Context) error {
 		"Місце забронювано: ряд %d, місце %d.\n"+
 			"На квитку буде: *%s*\n\n"+
 			"💳 Оплата (сума й коментар вже вписані):\n%s\n\n"+
-			"Код у коментарі — `%s` (моно зробить це поле read-only).\n"+
+			"Код у коментарі — `%s`.\n"+
 			"Бронювання дійсне до %s. Після оплати бот сам пришле PDF.",
 		seat.Row, seat.Col, name, payURL, r.Code, formatClock(r.ExpiresAt)),
 		tele.ModeMarkdown,

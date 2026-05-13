@@ -15,11 +15,11 @@
             go
             gopls
             golangci-lint
-            gotools          # goimports, etc.
+            gotools          
             gh
             git
-            sqlite           # inspect tix.db
-            cloudflared      # public tunnel for the mono webhook
+            sqlite           
+            cloudflared      
           ];
 
           shellHook = ''
