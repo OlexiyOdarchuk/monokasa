@@ -13,6 +13,7 @@ import (
 	"github.com/joho/godotenv"
 
 	"github.com/OlexiyOdarchuk/go-monobank-sdk/bank"
+	"github.com/OlexiyOdarchuk/go-monobank-sdk/personal"
 	"github.com/OlexiyOdarchuk/go-monobank-sdk/webhook"
 
 	"github.com/OlexiyOdarchuk/monokasa/internal/bot"
@@ -117,6 +118,13 @@ func main() {
 		_ = srv.Shutdown(shutCtx)
 	}()
 
+	// Опціональна авто-реєстрація вебхуку у monobank. Mono на /personal/webhook
+	// GET-пінгне URL — тому даємо HTTP-серверу секунду на старт. Без MONO_TOKEN
+	// або WEBHOOK_URL крок пропускається.
+	if cfg.MonoToken != "" && cfg.WebhookURL != "" {
+		go registerWebhook(ctx, cfg.MonoToken, cfg.WebhookURL)
+	}
+
 	// Reminders.
 	go runReminderLoop(ctx, st, tg, show, cfg.RemindBefore)
 
@@ -133,6 +141,27 @@ func signalCtx() (context.Context, context.CancelFunc) {
 		cancel()
 	}()
 	return ctx, cancel
+}
+
+// registerWebhook calls POST /personal/webhook so monobank starts pushing
+// statement events at the configured URL. Mono pings the URL with GET
+// before accepting the subscription, so we give the HTTP server a moment
+// to actually start listening. Failure is logged but doesn't crash the
+// process — the operator can register manually.
+func registerWebhook(ctx context.Context, token, url string) {
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(time.Second):
+	}
+	cli := personal.New(token)
+	rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := cli.SetWebHook(rctx, url); err != nil {
+		log.Printf("register webhook %s: %v", url, err)
+		return
+	}
+	log.Printf("registered webhook: %s", url)
 }
 
 // runReminderLoop wakes up periodically; when we're within

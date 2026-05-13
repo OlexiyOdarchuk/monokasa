@@ -24,6 +24,12 @@ type Config struct {
 	PriceKopecks int64
 	HoldDuration time.Duration
 	RemindBefore time.Duration
+
+	// MonoToken і WebhookURL — опційні. Якщо обидва задані, при старті
+	// процес реєструє WebhookURL у monobank через /personal/webhook.
+	// Інакше реєстрацію треба зробити вручну (одноразово).
+	MonoToken  string
+	WebhookURL string
 }
 
 func Load() (Config, error) {
@@ -42,6 +48,8 @@ func Load() (Config, error) {
 	c.Secret = os.Getenv("TICKET_SECRET")
 	c.JarLink = os.Getenv("MONO_JAR_LINK")
 	c.ScannerToken = os.Getenv("SCANNER_TOKEN")
+	c.MonoToken = os.Getenv("MONO_TOKEN")
+	c.WebhookURL = os.Getenv("WEBHOOK_URL")
 	c.AdminTGID, _ = strconv.ParseInt(os.Getenv("ADMIN_TG_ID"), 10, 64)
 
 	if c.TGToken == "" {
