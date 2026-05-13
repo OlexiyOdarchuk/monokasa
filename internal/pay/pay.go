@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/OlexiyOdarchuk/monobank-sdk"
+	"github.com/OlexiyOdarchuk/go-monobank-sdk/webhook"
 )
 
 // Show is the subset of show info this package passes through to the renderer.
@@ -69,10 +69,10 @@ type Processor struct {
 	PriceKopecks int64
 }
 
-// Handle is the OnEvent callback wired into monobank.WebhookHandler.
-func (p *Processor) Handle(ctx context.Context, e *monobank.WebHookResponse) error {
+// Handle is the OnEvent callback wired into webhook.NewHandler.
+func (p *Processor) Handle(ctx context.Context, e *webhook.Response) error {
 	t := e.Data.Transaction
-	if t.Amount <= 0 {
+	if t.Amount.Minor <= 0 {
 		return nil // outflow, not interesting
 	}
 
@@ -93,9 +93,9 @@ func (p *Processor) Handle(ctx context.Context, e *monobank.WebHookResponse) err
 		log.Printf("payment %s: reservation %s already confirmed", t.ID, code)
 		return nil
 	}
-	if t.Amount < p.PriceKopecks {
+	if t.Amount.Minor < p.PriceKopecks {
 		log.Printf("payment %s: short amount %d (need %d) for code %s",
-			t.ID, t.Amount, p.PriceKopecks, code)
+			t.ID, t.Amount.Minor, p.PriceKopecks, code)
 		return nil
 	}
 

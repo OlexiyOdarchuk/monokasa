@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"github.com/joho/godotenv"
-	"github.com/OlexiyOdarchuk/monobank-sdk"
+
+	"github.com/OlexiyOdarchuk/go-monobank-sdk/bank"
+	"github.com/OlexiyOdarchuk/go-monobank-sdk/webhook"
 
 	"github.com/OlexiyOdarchuk/monokasa/internal/bot"
 	"github.com/OlexiyOdarchuk/monokasa/internal/config"
@@ -72,7 +74,7 @@ func main() {
 	defer tg.Stop()
 	log.Printf("telegram bot up")
 
-	monoClient := monobank.NewClient(nil)
+	monoClient := bank.New()
 	processor := &pay.Processor{
 		Store:        payStore{st},
 		Coder:        coder,
@@ -81,9 +83,9 @@ func main() {
 		Show:         pay.Show{Title: show.Title, Venue: show.Venue, StartsAt: show.StartsAt},
 		PriceKopecks: cfg.PriceKopecks,
 	}
-	hook, err := monobank.NewWebhookHandler(ctx, monobank.WebhookHandlerOptions{
+	hook, err := webhook.NewHandler(ctx, webhook.Options{
 		Keys:    monoClient,
-		Dedup:   monobank.NewMemoryDeduper(2048),
+		Dedup:   webhook.NewMemoryDeduper(2048),
 		OnEvent: processor.Handle,
 		OnError: func(err error) { log.Printf("webhook: %v", err) },
 	})
