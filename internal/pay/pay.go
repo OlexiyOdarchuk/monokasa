@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/OlexiyOdarchuk/go-monobank-sdk/bank"
+	"github.com/OlexiyOdarchuk/go-monobank-sdk/money"
 	"github.com/OlexiyOdarchuk/go-monobank-sdk/webhook"
 )
 
@@ -22,9 +24,9 @@ type Show struct {
 
 // Seat is the subset of seat info this package passes through.
 type Seat struct {
-	ID           int64
-	Row, Col     int
-	PriceKopecks int64
+	ID       int64
+	Row, Col int
+	Price    money.Money
 }
 
 // Reservation is the subset of reservation info the processor needs.
@@ -61,58 +63,73 @@ type Notifier interface {
 type Renderer func(show Show, seat Seat, buyerName, qrPayload string) ([]byte, error)
 
 type Processor struct {
-	Store        Store
-	Coder        Coder
-	Notifier     Notifier
-	Renderer     Renderer
-	Show         Show
-	PriceKopecks int64
+	Store    Store
+	Coder    Coder
+	Notifier Notifier
+	Renderer Renderer
+	Show     Show
+	// MinPrice is the minimum acceptable payment. Overpayment (paid >
+	// MinPrice) is fine — the ticket is still issued.
+	MinPrice money.Money
 }
 
 // Handle is the OnEvent callback wired into webhook.NewHandler.
 func (p *Processor) Handle(ctx context.Context, e *webhook.Response) error {
-	t := e.Data.Transaction
+	_, err := p.processTx(ctx, e.Data.Transaction)
+	return err
+}
+
+// ReconcileTx replays one transaction through the matching logic — used
+// by the admin /reconcile command to catch webhooks Mono dropped. Returns
+// true if the transaction issued a ticket on this call.
+func (p *Processor) ReconcileTx(ctx context.Context, tx bank.Transaction) (bool, error) {
+	return p.processTx(ctx, tx)
+}
+
+func (p *Processor) processTx(ctx context.Context, t bank.Transaction) (bool, error) {
 	if t.Amount.Minor <= 0 {
-		return nil // outflow, not interesting
+		return false, nil // outflow, not interesting
 	}
 
 	code := extractCode(t.Comment, t.Description)
 	if code == "" {
 		log.Printf("payment %s: no reservation code in comment %q", t.ID, t.Comment)
-		return nil
+		return false, nil
 	}
 	res, seat, err := p.Store.FindReservationByCode(ctx, code)
 	if errors.Is(err, ErrCodeNotFound) || errors.Is(err, ErrAlreadyClosed) {
 		log.Printf("payment %s: code %q has no open reservation", t.ID, code)
-		return nil
+		return false, nil
 	}
 	if err != nil {
-		return err
+		return false, err
 	}
 	if res.ConfirmedAt != nil {
 		log.Printf("payment %s: reservation %s already confirmed", t.ID, code)
-		return nil
+		return false, nil
 	}
-	if t.Amount.Minor < p.PriceKopecks {
-		log.Printf("payment %s: short amount %d (need %d) for code %s",
-			t.ID, t.Amount.Minor, p.PriceKopecks, code)
-		return nil
+	// Accept paid >= expected: overpayment is fine, exact match is fine,
+	// short payment is rejected.
+	if t.Amount.Minor < p.MinPrice.Minor {
+		log.Printf("payment %s: short amount %s (need %s) for code %s",
+			t.ID, t.Amount, p.MinPrice, code)
+		return false, nil
 	}
 
 	qrPayload := p.Coder.QRPayload(res.ID, seat.ID)
 	if err := p.Store.Confirm(ctx, res.ID, qrPayload); err != nil {
-		return err
+		return false, err
 	}
 	pdf, err := p.Renderer(p.Show, seat, res.BuyerName, qrPayload)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if err := p.Notifier.SendTicket(res.TGChatID, seat, pdf); err != nil {
-		return err
+		return false, err
 	}
-	log.Printf("ticket issued: code=%s row=%d seat=%d buyer=%q chat=%d",
-		code, seat.Row, seat.Col, res.BuyerName, res.TGChatID)
-	return nil
+	log.Printf("ticket issued: code=%s row=%d seat=%d buyer=%q chat=%d paid=%s",
+		code, seat.Row, seat.Col, res.BuyerName, res.TGChatID, t.Amount)
+	return true, nil
 }
 
 // extractCode pulls an 8-char base32 reservation code out of a free-form

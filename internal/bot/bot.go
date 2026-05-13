@@ -14,6 +14,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/OlexiyOdarchuk/go-monobank-sdk/money"
 	tele "gopkg.in/telebot.v3"
 )
 
@@ -96,14 +97,42 @@ type Coder interface {
 	NewCode() (string, error)
 }
 
+// ReconcileResult is the outcome of a /reconcile sweep.
+type ReconcileResult struct {
+	Scanned int // transactions examined
+	Matched int // tickets newly issued
+}
+
+// Reconciler scans recent statement entries and confirms any whose
+// reservation code matches an open booking — a rescue net for webhook
+// events Mono never delivered.
+type Reconciler interface {
+	Reconcile(ctx context.Context, lookback time.Duration) (ReconcileResult, error)
+}
+
+// JarBalance is the snapshot returned by JarLookup.
+type JarBalance struct {
+	Title   string
+	Owner   string
+	Balance money.Money
+	Goal    money.Money // zero if no goal set
+}
+
+// JarLookup returns the live balance of the configured monobank jar.
+type JarLookup interface {
+	Balance(ctx context.Context) (JarBalance, error)
+}
+
 type Bot struct {
-	tb        *tele.Bot
-	store     Store
-	coder     Coder
-	show      Show
-	jarLink   string
-	hold      time.Duration
-	adminTGID int64
+	tb         *tele.Bot
+	store      Store
+	coder      Coder
+	show       Show
+	jarLink    string
+	hold       time.Duration
+	adminTGID  int64
+	reconciler Reconciler // optional — nil if MONO_TOKEN missing
+	jar        JarLookup  // optional — nil if jar link unparseable
 
 	// pending tracks users who clicked a seat and are about to type their
 	// name. Keyed by Telegram user ID; value is pendingPick. Cleared on
@@ -117,13 +146,15 @@ type pendingPick struct {
 }
 
 type Options struct {
-	Token     string
-	Store     Store
-	Coder     Coder
-	Show      Show
-	JarLink   string
-	Hold      time.Duration
-	AdminTGID int64
+	Token      string
+	Store      Store
+	Coder      Coder
+	Show       Show
+	JarLink    string
+	Hold       time.Duration
+	AdminTGID  int64
+	Reconciler Reconciler // optional
+	Jar        JarLookup  // optional
 }
 
 func New(opts Options) (*Bot, error) {
@@ -137,6 +168,7 @@ func New(opts Options) (*Bot, error) {
 	b := &Bot{
 		tb: tb, store: opts.Store, coder: opts.Coder, show: opts.Show,
 		jarLink: opts.JarLink, hold: opts.Hold, adminTGID: opts.AdminTGID,
+		reconciler: opts.Reconciler, jar: opts.Jar,
 	}
 	b.routes()
 	return b, nil
@@ -144,6 +176,14 @@ func New(opts Options) (*Bot, error) {
 
 func (b *Bot) Start() { b.tb.Start() }
 func (b *Bot) Stop()  { b.tb.Stop() }
+
+// SetReconciler wires the rescue-net scanner. Pass nil to disable.
+// Used when the reconciler depends on something built after the bot
+// (e.g., a pay.Processor that itself needs the bot as a notifier).
+func (b *Bot) SetReconciler(r Reconciler) { b.reconciler = r }
+
+// SetJar wires the jar-balance lookup. Pass nil to disable.
+func (b *Bot) SetJar(j JarLookup) { b.jar = j }
 
 // SendTicket pushes a generated PDF back to the buyer's chat.
 func (b *Bot) SendTicket(chatID int64, seat Seat, pdf []byte) error {
@@ -169,18 +209,22 @@ func (b *Bot) routes() {
 	b.tb.Handle("/seats", b.handleSeats)
 	b.tb.Handle("/my", b.handleMy)
 	b.tb.Handle("/stats", b.handleStats)
+	b.tb.Handle("/reconcile", b.handleReconcile)
+	b.tb.Handle("/jar", b.handleJar)
 	b.tb.Handle(tele.OnText, b.handleText)
 	b.tb.Handle(tele.OnCallback, b.handleCallback)
 }
 
 func (b *Bot) handleStart(c tele.Context) error {
+	cmds := "  /seats — мапа місць\n  /my — мої бронювання\n"
+	if b.adminTGID != 0 && c.Sender().ID == b.adminTGID {
+		cmds += "  /stats — статистика (адмін)\n  /reconcile — звірити пропущені оплати (адмін)\n  /jar — баланс банки (адмін)\n"
+	}
 	return c.Send(fmt.Sprintf(
 		"Вітаю! Це бот продажу квитків на %q (%s, %s).\n\n"+
-			"Команди:\n"+
-			"  /seats — мапа місць\n"+
-			"  /my — мої бронювання\n\n"+
+			"Команди:\n%s\n"+
 			"Щоб купити: натисни /seats → обери вільне місце.",
-		b.show.Title, b.show.Venue, formatDateTime(b.show.StartsAt)))
+		b.show.Title, b.show.Venue, formatDateTime(b.show.StartsAt), cmds))
 }
 
 func (b *Bot) handleSeats(c tele.Context) error {
@@ -361,6 +405,61 @@ func (b *Bot) handleStats(c tele.Context) error {
 			"виторг: *%s*",
 		b.show.Title, b.show.Venue, formatDateTime(b.show.StartsAt),
 		st.Total, st.Sold, st.Held, st.Free, hryvnia(st.RevenueKopecks)), tele.ModeMarkdown)
+}
+
+func (b *Bot) handleReconcile(c tele.Context) error {
+	if b.adminTGID == 0 || c.Sender().ID != b.adminTGID {
+		return c.Send("⛔️ команда тільки для адміна")
+	}
+	if b.reconciler == nil {
+		return c.Send("Реконсайл недоступний: MONO_TOKEN не налаштований.")
+	}
+	// Default lookback: 24h. "/reconcile 7d" — explicit window.
+	lookback := 24 * time.Hour
+	if args := strings.TrimSpace(c.Message().Payload); args != "" {
+		d, err := time.ParseDuration(args)
+		if err != nil || d <= 0 {
+			return c.Send("Формат: /reconcile [тривалість], напр. `/reconcile 48h`", tele.ModeMarkdown)
+		}
+		if d > 30*24*time.Hour {
+			return c.Send("Максимум — 720h (30 днів). Mono не віддає старіше.")
+		}
+		lookback = d
+	}
+	_ = c.Send(fmt.Sprintf("⏳ Шукаю пропущені оплати за останні %s…", lookback))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	res, err := b.reconciler.Reconcile(ctx, lookback)
+	if err != nil {
+		return c.Send("Помилка: " + err.Error())
+	}
+	return c.Send(fmt.Sprintf("✅ Готово.\nПереглянуто транзакцій: *%d*\nВидано квитків: *%d*",
+		res.Scanned, res.Matched), tele.ModeMarkdown)
+}
+
+func (b *Bot) handleJar(c tele.Context) error {
+	if b.adminTGID == 0 || c.Sender().ID != b.adminTGID {
+		return c.Send("⛔️ команда тільки для адміна")
+	}
+	if b.jar == nil {
+		return c.Send("Інформація про банку недоступна (не вдалося розпарсити MONO_JAR_LINK).")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	info, err := b.jar.Balance(ctx)
+	if err != nil {
+		return c.Send("Помилка: " + err.Error())
+	}
+	out := fmt.Sprintf("🏦 *%s*\n", info.Title)
+	if info.Owner != "" {
+		out += "власник: " + info.Owner + "\n"
+	}
+	out += "зібрано: *" + info.Balance.String() + "*"
+	if !info.Goal.IsZero() {
+		out += "\nціль: " + info.Goal.String()
+	}
+	return c.Send(out, tele.ModeMarkdown)
 }
 
 func (b *Bot) handleText(c tele.Context) error {

@@ -24,12 +24,8 @@ type Config struct {
 	PriceKopecks int64
 	HoldDuration time.Duration
 	RemindBefore time.Duration
-
-	// MonoToken і WebhookURL — опційні. Якщо обидва задані, при старті
-	// процес реєструє WebhookURL у monobank через /personal/webhook.
-	// Інакше реєстрацію треба зробити вручну (одноразово).
-	MonoToken  string
-	WebhookURL string
+	MonoToken    string
+	WebhookURL   string
 }
 
 func Load() (Config, error) {

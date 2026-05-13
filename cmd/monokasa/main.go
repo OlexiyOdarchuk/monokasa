@@ -3,16 +3,23 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/joho/godotenv"
 
 	"github.com/OlexiyOdarchuk/go-monobank-sdk/bank"
+	"github.com/OlexiyOdarchuk/go-monobank-sdk/currency"
+	"github.com/OlexiyOdarchuk/go-monobank-sdk/jar"
+	"github.com/OlexiyOdarchuk/go-monobank-sdk/money"
 	"github.com/OlexiyOdarchuk/go-monobank-sdk/personal"
 	"github.com/OlexiyOdarchuk/go-monobank-sdk/webhook"
 
@@ -77,12 +84,12 @@ func main() {
 
 	monoClient := bank.New()
 	processor := &pay.Processor{
-		Store:        payStore{st},
-		Coder:        coder,
-		Notifier:     payNotifier{tg},
-		Renderer:     payRenderer,
-		Show:         pay.Show{Title: show.Title, Venue: show.Venue, StartsAt: show.StartsAt},
-		PriceKopecks: cfg.PriceKopecks,
+		Store:    payStore{st},
+		Coder:    coder,
+		Notifier: payNotifier{tg},
+		Renderer: payRenderer,
+		Show:     pay.Show{Title: show.Title, Venue: show.Venue, StartsAt: show.StartsAt},
+		MinPrice: money.New(cfg.PriceKopecks, currency.UAH),
 	}
 	hook, err := webhook.NewHandler(ctx, webhook.Options{
 		Keys:    monoClient,
@@ -94,6 +101,17 @@ func main() {
 		log.Fatalf("webhook handler init: %v", err)
 	}
 	log.Printf("mono webhook ready, keyId=%s", hook.KeyID())
+
+	// /reconcile rescue net + /jar balance — both optional. Reconciler
+	// needs MONO_TOKEN; jar lookup needs a parseable MONO_JAR_LINK.
+	if cfg.MonoToken != "" {
+		tg.SetReconciler(&monoReconciler{cli: personal.New(cfg.MonoToken), proc: processor})
+	}
+	if shortID := jarShortID(cfg.JarLink); shortID != "" {
+		tg.SetJar(&jarLookup{cli: jar.New(), shortID: shortID})
+	} else {
+		log.Printf("jar link %q has no short id — /jar command disabled", cfg.JarLink)
+	}
 
 	scanner := web.NewScanner(webStore{st}, coder, cfg.ScannerToken)
 
@@ -328,7 +346,7 @@ func (p payStore) FindReservationByCode(ctx context.Context, code string) (pay.R
 		BuyerName:   r.BuyerName,
 		ConfirmedAt: r.ConfirmedAt,
 	}
-	seat := pay.Seat{ID: s.ID, Row: s.Row, Col: s.Col, PriceKopecks: s.PriceKopecks}
+	seat := pay.Seat{ID: s.ID, Row: s.Row, Col: s.Col, Price: money.New(s.PriceKopecks, currency.UAH)}
 	switch err {
 	case nil:
 		return out, seat, nil
@@ -350,7 +368,7 @@ type payNotifier struct{ b *bot.Bot }
 
 func (p payNotifier) SendTicket(chatID int64, seat pay.Seat, pdf []byte) error {
 	return p.b.SendTicket(chatID, bot.Seat{
-		ID: seat.ID, Row: seat.Row, Col: seat.Col, PriceKopecks: seat.PriceKopecks,
+		ID: seat.ID, Row: seat.Row, Col: seat.Col, PriceKopecks: seat.Price.Minor,
 	}, pdf)
 }
 
@@ -360,4 +378,118 @@ func payRenderer(show pay.Show, seat pay.Seat, buyerName, qrPayload string) ([]b
 		ticket.Seat{Row: seat.Row, Col: seat.Col},
 		buyerName, qrPayload,
 	)
+}
+
+// --- /reconcile adapter ---
+
+// monoReconciler walks every account + jar in ClientInfo over the given
+// window and replays each transaction through pay.Processor. Mono
+// rate-limits /personal/statement to 1 call per 60s per account, so a
+// reconcile across multiple accounts can take a minute or two.
+type monoReconciler struct {
+	cli  *personal.Client
+	proc *pay.Processor
+}
+
+func (r *monoReconciler) Reconcile(ctx context.Context, lookback time.Duration) (bot.ReconcileResult, error) {
+	info, err := r.cli.ClientInfo(ctx)
+	if err != nil {
+		return bot.ReconcileResult{}, fmt.Errorf("client info: %w", err)
+	}
+	to := time.Now()
+	from := to.Add(-lookback)
+	var res bot.ReconcileResult
+	walk := func(accountID, label string) error {
+		for tx, err := range r.cli.TransactionsRangeIter(ctx, accountID, from, to) {
+			if err != nil {
+				return fmt.Errorf("%s: %w", label, err)
+			}
+			res.Scanned++
+			matched, err := r.proc.ReconcileTx(ctx, tx)
+			if err != nil {
+				log.Printf("reconcile %s tx=%s: %v", label, tx.ID, err)
+				continue
+			}
+			if matched {
+				res.Matched++
+			}
+		}
+		return nil
+	}
+	for _, a := range info.Accounts {
+		if err := walk(a.AccountID, "account "+a.AccountID); err != nil {
+			return res, err
+		}
+	}
+	for _, j := range info.Jars {
+		if err := walk(j.ID, "jar "+j.ID); err != nil {
+			return res, err
+		}
+	}
+	return res, nil
+}
+
+// --- /jar adapter ---
+
+// jarLookup caches the long jar id (resolved once via send.monobank.ua)
+// and queries /bank/jar for the balance.
+type jarLookup struct {
+	cli     *jar.Client
+	shortID string
+
+	mu     sync.Mutex
+	longID string
+}
+
+func (j *jarLookup) Balance(ctx context.Context) (bot.JarBalance, error) {
+	longID, err := j.resolveLongID(ctx)
+	if err != nil {
+		return bot.JarBalance{}, err
+	}
+	info, err := j.cli.ByLongID(ctx, longID)
+	if err != nil {
+		return bot.JarBalance{}, err
+	}
+	code := currency.Code(info.Currency)
+	return bot.JarBalance{
+		Title:   info.Title,
+		Owner:   info.OwnerName,
+		Balance: money.New(info.Amount, code),
+		Goal:    money.New(info.Goal, code),
+	}, nil
+}
+
+func (j *jarLookup) resolveLongID(ctx context.Context) (string, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.longID != "" {
+		return j.longID, nil
+	}
+	send, err := j.cli.ByShortID(ctx, j.shortID)
+	if err != nil {
+		return "", fmt.Errorf("resolve short id %q: %w", j.shortID, err)
+	}
+	if send.LongJarID == "" {
+		return "", fmt.Errorf("monobank did not return long jar id for %q", j.shortID)
+	}
+	j.longID = send.LongJarID
+	return j.longID, nil
+}
+
+// jarShortID extracts the short jar id from a send.monobank.ua URL —
+// the trailing path segment of "https://send.monobank.ua/<id>" or
+// "https://send.monobank.ua/jar/<id>". Returns "" when the URL doesn't
+// match either shape.
+func jarShortID(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	for i := len(parts) - 1; i >= 0; i-- {
+		if p := parts[i]; p != "" && p != "jar" {
+			return p
+		}
+	}
+	return ""
 }
