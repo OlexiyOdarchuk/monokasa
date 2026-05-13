@@ -4,3 +4,8 @@
 *.db-wal
 *.db-shm
 monokasa
+
+# direnv / Nix
+.direnv/
+result
+result-*
