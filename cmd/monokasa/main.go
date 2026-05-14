@@ -17,6 +17,7 @@ import (
 
 	"github.com/joho/godotenv"
 
+	monobank "github.com/OlexiyOdarchuk/go-monobank-sdk"
 	"github.com/OlexiyOdarchuk/go-monobank-sdk/bank"
 	"github.com/OlexiyOdarchuk/go-monobank-sdk/currency"
 	"github.com/OlexiyOdarchuk/go-monobank-sdk/jar"
@@ -110,7 +111,14 @@ func main() {
 	// /reconcile rescue net + /jar balance — both optional. Reconciler
 	// needs MONO_TOKEN; jar lookup needs a parseable MONO_JAR_LINK.
 	if cfg.MonoToken != "" {
-		tg.SetReconciler(&monoReconciler{cli: personal.New(cfg.MonoToken), proc: processor})
+		// KeyedLimiter dispatches by accountID — Mono caps both
+		// /personal/client-info and each /personal/statement/{account}
+		// at 1 call per 60s. ClientInfo uses the empty-key bucket;
+		// per-account statements get their own buckets through
+		// monobank.WithLimiterKey set in monoReconciler.walk.
+		klim := monobank.NewKeyedLimiter(time.Minute, 1)
+		cli := personal.New(cfg.MonoToken, monobank.WithRateLimiter(klim))
+		tg.SetReconciler(&monoReconciler{cli: cli, proc: processor})
 	}
 	if shortID := jarShortID(cfg.JarLink); shortID != "" {
 		tg.SetJar(&jarLookup{cli: jar.New(), shortID: shortID})
@@ -489,7 +497,11 @@ func (r *monoReconciler) Reconcile(ctx context.Context, lookback time.Duration, 
 		idx++
 		progress(fmt.Sprintf("джерело %d/%d: %s — скан транзакцій…", idx, totalSources, label))
 		var seen int
-		for tx, err := range r.cli.TransactionsRangeIter(ctx, accountID, from, to) {
+		// Tag the per-account quota bucket on the context so the
+		// KeyedLimiter wired into r.cli throttles each /personal/
+		// statement/{account} call independently.
+		walkCtx := monobank.WithLimiterKey(ctx, accountID)
+		for tx, err := range r.cli.TransactionsRangeIter(walkCtx, accountID, from, to) {
 			if err != nil {
 				return fmt.Errorf("%s: %w", label, err)
 			}
