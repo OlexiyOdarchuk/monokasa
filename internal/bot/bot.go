@@ -7,7 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/url"
 	"strconv"
 	"strings"
@@ -29,10 +29,10 @@ type Show struct {
 
 // Seat is the subset of seat info the bot needs.
 type Seat struct {
-	ID           int64
-	ShowID       int64
-	Row, Col     int
-	PriceKopecks int64
+	ID       int64
+	ShowID   int64
+	Row, Col int
+	Price    money.Money
 }
 
 // Reservation mirrors a stored reservation row.
@@ -56,11 +56,11 @@ type MyItem struct {
 
 // Stats is an admin snapshot of the only show.
 type Stats struct {
-	Total          int
-	Sold           int
-	Held           int
-	Free           int
-	RevenueKopecks int64
+	Total   int
+	Sold    int
+	Held    int
+	Free    int
+	Revenue money.Money
 }
 
 // SeatStatus is one of "free", "held", "sold".
@@ -308,7 +308,7 @@ func (b *Bot) handleSeats(c tele.Context) error {
 
 	header := "🎭 ━━━━━ СЦЕНА ━━━━━ 🎭\n               ▲ попереду\n\n"
 	return c.Send(fmt.Sprintf("%sРяд 1 — найближче до сцени.\nНатисни вільне місце, щоб забронювати.\nЦіна: %s",
-		header, hryvnia(seats[0].PriceKopecks)), markup)
+		header, seats[0].Price), markup)
 }
 
 func (b *Bot) handleCallback(c tele.Context) error {
@@ -439,7 +439,7 @@ func (b *Bot) handleStats(c tele.Context) error {
 			"вільно: *%d*\n\n"+
 			"виторг: *%s*",
 		b.show.Title, b.show.Venue, formatDateTime(b.show.StartsAt),
-		st.Total, st.Sold, st.Held, st.Free, hryvnia(st.RevenueKopecks)), tele.ModeMarkdown)
+		st.Total, st.Sold, st.Held, st.Free, st.Revenue), tele.ModeMarkdown)
 }
 
 func (b *Bot) handleReconcile(c tele.Context) error {
@@ -466,7 +466,7 @@ func (b *Bot) handleReconcile(c tele.Context) error {
 	if err != nil {
 		// If we can't even send the ack, do the work anyway and hope the
 		// final reply lands.
-		log.Printf("reconcile ack: %v", err)
+		slog.Warn("reconcile ack", "err", err)
 	}
 	// Live-edit the progress message instead of spamming. Mono is rate-
 	// limited to 1 request/60s per account, so updates fire at most once
@@ -476,7 +476,7 @@ func (b *Bot) handleReconcile(c tele.Context) error {
 			return
 		}
 		if _, err := b.tb.Edit(progressMsg, "⏳ "+s); err != nil {
-			log.Printf("reconcile progress edit: %v", err)
+			slog.Warn("reconcile progress edit", "err", err)
 		}
 	}
 
@@ -557,7 +557,7 @@ func (b *Bot) handleText(c tele.Context) error {
 	}
 	b.pending.Delete(sender.ID)
 
-	payURL := jarPrefillURL(b.jarLink, seat.PriceKopecks, r.Code)
+	payURL := jarPrefillURL(b.jarLink, seat.Price, r.Code)
 	payBtn := tele.InlineButton{Text: "💳 Оплатити", URL: payURL}
 	cancelBtn := tele.InlineButton{Unique: "cancel", Text: "✖ Скасувати бронь", Data: r.Code}
 	// Pay on top, cancel below — reach-for-the-first-button habit lands on
@@ -598,17 +598,23 @@ func normalizeName(in string) (string, error) {
 }
 
 // jarPrefillURL appends ?a=<amount>&t=<comment>. Short keys are what mono's
-// jar page actually honours in practice.
-func jarPrefillURL(base string, kopecks int64, comment string) string {
+// jar page actually honours in practice. Amount is currency-aware: UAH renders
+// as "250" / "250.99", JPY as a bare integer.
+func jarPrefillURL(base string, price money.Money, comment string) string {
 	u, err := url.Parse(base)
 	if err != nil {
 		return base
 	}
+	mpm := price.Code.MinorPerMajor()
+	dec := price.Code.Decimals()
 	var amount string
-	if kopecks%100 == 0 {
-		amount = fmt.Sprintf("%d", kopecks/100)
-	} else {
-		amount = fmt.Sprintf("%d.%02d", kopecks/100, kopecks%100)
+	switch {
+	case mpm <= 1:
+		amount = strconv.FormatInt(price.Minor, 10)
+	case price.Minor%mpm == 0:
+		amount = strconv.FormatInt(price.Minor/mpm, 10)
+	default:
+		amount = fmt.Sprintf("%d.%0*d", price.Minor/mpm, dec, price.Minor%mpm)
 	}
 	q := u.Query()
 	q.Set("a", amount)
@@ -626,10 +632,6 @@ func friendly(err error) string {
 	default:
 		return "Помилка"
 	}
-}
-
-func hryvnia(kopecks int64) string {
-	return fmt.Sprintf("%d.%02d UAH", kopecks/100, kopecks%100)
 }
 
 var ukMonthsGenitive = [...]string{

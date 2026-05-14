@@ -3,9 +3,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"expvar"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -36,17 +37,28 @@ import (
 	"github.com/OlexiyOdarchuk/monokasa/internal/web"
 )
 
+// fatal logs at error level and exits non-zero. slog has no built-in Fatal —
+// this helper keeps the call sites short while preserving structured fields.
+func fatal(msg string, args ...any) {
+	slog.Error(msg, args...)
+	os.Exit(1)
+}
+
 func main() {
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})))
+
 	_ = godotenv.Load()
 
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("config: %v", err)
+		fatal("config", "err", err)
 	}
 
 	st, err := store.Open(cfg.DBPath)
 	if err != nil {
-		log.Fatalf("open store: %v", err)
+		fatal("open store", "err", err)
 	}
 	defer st.Close()
 
@@ -59,13 +71,16 @@ func main() {
 		StartsAt: cfg.ShowStartsAt,
 	}, cfg.Rows, cfg.Cols, cfg.PriceKopecks)
 	if err != nil {
-		log.Fatalf("seed: %v", err)
+		fatal("seed", "err", err)
 	}
 	show, err := st.LoadShow(ctx, showID)
 	if err != nil {
-		log.Fatalf("load show: %v", err)
+		fatal("load show", "err", err)
 	}
-	log.Printf("show #%d ready: %q @ %s", show.ID, show.Title, timefmt.DateTime(show.StartsAt))
+	slog.Info("show ready",
+		"id", show.ID,
+		"title", show.Title,
+		"startsAt", timefmt.DateTime(show.StartsAt))
 
 	coder := token.NewCoder(cfg.Secret)
 
@@ -79,11 +94,11 @@ func main() {
 		AdminTGID: cfg.AdminTGID,
 	})
 	if err != nil {
-		log.Fatalf("bot init: %v", err)
+		fatal("bot init", "err", err)
 	}
 	go tg.Start()
 	defer tg.Stop()
-	log.Printf("telegram bot up")
+	slog.Info("telegram bot up")
 
 	monoClient := bank.New()
 	processor := &pay.Processor{
@@ -100,13 +115,13 @@ func main() {
 		OnEvent: processor.Handle,
 		OnError: func(err error) {
 			metrics.WebhookErrors.Add(1)
-			log.Printf("webhook: %v", err)
+			slog.Error("webhook", "err", err)
 		},
 	})
 	if err != nil {
-		log.Fatalf("webhook handler init: %v", err)
+		fatal("webhook handler init", "err", err)
 	}
-	log.Printf("mono webhook ready, keyId=%s", hook.KeyID())
+	slog.Info("mono webhook ready", "keyId", hook.KeyID())
 
 	// /reconcile rescue net + /jar balance — both optional. Reconciler
 	// needs MONO_TOKEN; jar lookup needs a parseable MONO_JAR_LINK.
@@ -116,14 +131,20 @@ func main() {
 		// at 1 call per 60s. ClientInfo uses the empty-key bucket;
 		// per-account statements get their own buckets through
 		// monobank.WithLimiterKey set in monoReconciler.walk.
-		klim := monobank.NewKeyedLimiter(time.Minute, 1)
+		// idleTTL=0: keyspace is bounded (one bucket per account/jar from
+		// ClientInfo), so no need for a background eviction sweeper.
+		klim := monobank.NewKeyedLimiter(time.Minute, 1, 0)
 		cli := personal.New(cfg.MonoToken, monobank.WithRateLimiter(klim))
 		tg.SetReconciler(&monoReconciler{cli: cli, proc: processor})
 	}
 	if shortID := jarShortID(cfg.JarLink); shortID != "" {
-		tg.SetJar(&jarLookup{cli: jar.New(), shortID: shortID})
+		jcli, err := jar.New()
+		if err != nil {
+			fatal("jar client init", "err", err)
+		}
+		tg.SetJar(&jarLookup{cli: jcli, shortID: shortID})
 	} else {
-		log.Printf("jar link %q has no short id — /jar command disabled", cfg.JarLink)
+		slog.Info("jar command disabled (no short id in link)", "jarLink", cfg.JarLink)
 	}
 
 	scanner := web.NewScanner(webStore{st}, coder, cfg.ScannerToken)
@@ -158,9 +179,9 @@ func main() {
 
 	srv := &http.Server{Addr: cfg.HTTPAddr, Handler: mux}
 	go func() {
-		log.Printf("listening on %s", cfg.HTTPAddr)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("http: %v", err)
+		slog.Info("http listening", "addr", cfg.HTTPAddr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			fatal("http", "err", err)
 		}
 	}()
 	defer func() {
@@ -187,7 +208,7 @@ func main() {
 	go scanner.RunGC(ctx, 10*time.Minute, 30*time.Minute)
 
 	<-ctx.Done()
-	log.Printf("shutting down")
+	slog.Info("shutting down")
 }
 
 func signalCtx() (context.Context, context.CancelFunc) {
@@ -221,13 +242,13 @@ func registerWebhook(ctx context.Context, token, url string) {
 		err := cli.SetWebHook(rctx, url)
 		cancel()
 		if err == nil {
-			log.Printf("registered webhook: %s (attempt %d)", url, attempt)
+			slog.Info("registered webhook", "url", url, "attempt", attempt)
 			return
 		}
-		log.Printf("register webhook attempt %d/5 failed: %v", attempt, err)
+		slog.Warn("register webhook failed", "attempt", attempt, "max", 5, "err", err)
 		backoff *= 2
 	}
-	log.Printf("register webhook %s: giving up — register manually", url)
+	slog.Error("register webhook giving up — register manually", "url", url)
 }
 
 // liveStat reads one field out of store.Stats with a 1s timeout. Used by
@@ -253,11 +274,11 @@ func runHoldSweeper(ctx context.Context, st *store.Store, every time.Duration) {
 		defer cancel()
 		n, err := st.SweepExpiredHolds(ctx)
 		if err != nil {
-			log.Printf("sweep holds: %v", err)
+			slog.Error("sweep holds", "err", err)
 			return
 		}
 		if n > 0 {
-			log.Printf("sweep holds: freed %d expired reservation(s)", n)
+			slog.Info("sweep holds: freed expired reservations", "count", n)
 		}
 	}
 	sweep() // fire once at startup to catch carry-over from before restart
@@ -287,16 +308,16 @@ func runReminderLoop(ctx context.Context, st *store.Store, tg *bot.Bot, show sto
 		defer cancel()
 		items, err := st.ConfirmedNotYetReminded(ctx, show.ID)
 		if err != nil {
-			log.Printf("remind: %v", err)
+			slog.Error("remind", "err", err)
 			return
 		}
 		for _, it := range items {
-			if err := tg.NotifyShowSoon(it.Reservation.TGChatID, bot.Seat(it.Seat), show.StartsAt); err != nil {
-				log.Printf("remind chat=%d: %v", it.Reservation.TGChatID, err)
+			if err := tg.NotifyShowSoon(it.Reservation.TGChatID, toBotSeat(it.Seat), show.StartsAt); err != nil {
+				slog.Warn("remind notify", "chatId", it.Reservation.TGChatID, "err", err)
 				continue
 			}
 			if err := st.MarkReminded(ctx, it.Reservation.ID); err != nil {
-				log.Printf("mark reminded id=%d: %v", it.Reservation.ID, err)
+				slog.Error("mark reminded", "reservationId", it.Reservation.ID, "err", err)
 			}
 		}
 	}
@@ -313,9 +334,31 @@ func runReminderLoop(ctx context.Context, st *store.Store, tg *bot.Bot, show sto
 
 // --- bot adapter ---
 
-// botStore wraps *store.Store to satisfy bot.Store: store types and bot types
-// are field-compatible, so a single struct conversion does the translation.
+// botStore wraps *store.Store to satisfy bot.Store. The store layer speaks
+// raw kopecks (matches the SQLite INTEGER column); the bot layer speaks
+// money.Money so prices format themselves and carry their currency. This
+// adapter does the conversion.
 type botStore struct{ s *store.Store }
+
+func toBotSeat(s store.Seat) bot.Seat {
+	return bot.Seat{
+		ID:     s.ID,
+		ShowID: s.ShowID,
+		Row:    s.Row,
+		Col:    s.Col,
+		Price:  money.New(s.PriceKopecks, currency.UAH),
+	}
+}
+
+func fromBotSeat(s bot.Seat) store.Seat {
+	return store.Seat{
+		ID:           s.ID,
+		ShowID:       s.ShowID,
+		Row:          s.Row,
+		Col:          s.Col,
+		PriceKopecks: s.Price.Minor,
+	}
+}
 
 func (b botStore) Seats(ctx context.Context, showID int64) ([]bot.Seat, error) {
 	seats, err := b.s.Seats(ctx, showID)
@@ -324,7 +367,7 @@ func (b botStore) Seats(ctx context.Context, showID int64) ([]bot.Seat, error) {
 	}
 	out := make([]bot.Seat, len(seats))
 	for i, s := range seats {
-		out[i] = bot.Seat(s)
+		out[i] = toBotSeat(s)
 	}
 	return out, nil
 }
@@ -343,20 +386,20 @@ func (b botStore) SeatStatuses(ctx context.Context, showID int64) (map[int64]bot
 
 func (b botStore) FindFreeSeat(ctx context.Context, showID int64, row, col int) (bot.Seat, error) {
 	s, err := b.s.FindFreeSeat(ctx, showID, row, col)
-	return bot.Seat(s), translateStoreErr(err)
+	return toBotSeat(s), translateStoreErr(err)
 }
 
 func (b botStore) Reserve(
 	ctx context.Context, seat bot.Seat, tgUserID, tgChatID int64,
 	buyerName, code string, hold time.Duration,
 ) (bot.Reservation, error) {
-	r, err := b.s.Reserve(ctx, store.Seat(seat), tgUserID, tgChatID, buyerName, code, hold)
+	r, err := b.s.Reserve(ctx, fromBotSeat(seat), tgUserID, tgChatID, buyerName, code, hold)
 	return bot.Reservation(r), translateStoreErr(err)
 }
 
 func (b botStore) CancelReservation(ctx context.Context, code string, tgUserID int64) (bot.Reservation, bot.Seat, error) {
 	r, s, err := b.s.CancelReservation(ctx, code, tgUserID)
-	return bot.Reservation(r), bot.Seat(s), translateStoreErr(err)
+	return bot.Reservation(r), toBotSeat(s), translateStoreErr(err)
 }
 
 func (b botStore) MyReservations(ctx context.Context, tgUserID int64) ([]bot.MyItem, error) {
@@ -366,14 +409,20 @@ func (b botStore) MyReservations(ctx context.Context, tgUserID int64) ([]bot.MyI
 	}
 	out := make([]bot.MyItem, len(items))
 	for i, it := range items {
-		out[i] = bot.MyItem{Reservation: bot.Reservation(it.Reservation), Seat: bot.Seat(it.Seat)}
+		out[i] = bot.MyItem{Reservation: bot.Reservation(it.Reservation), Seat: toBotSeat(it.Seat)}
 	}
 	return out, nil
 }
 
 func (b botStore) Stats(ctx context.Context, showID int64) (bot.Stats, error) {
 	s, err := b.s.Stats(ctx, showID)
-	return bot.Stats(s), err
+	return bot.Stats{
+		Total:   s.Total,
+		Sold:    s.Sold,
+		Held:    s.Held,
+		Free:    s.Free,
+		Revenue: money.New(s.RevenueKopecks, currency.UAH),
+	}, err
 }
 
 func translateStoreErr(err error) error {
@@ -457,7 +506,7 @@ type payNotifier struct{ b *bot.Bot }
 
 func (p payNotifier) SendTicket(chatID int64, seat pay.Seat, pdf []byte) error {
 	return p.b.SendTicket(chatID, bot.Seat{
-		ID: seat.ID, Row: seat.Row, Col: seat.Col, PriceKopecks: seat.Price.Minor,
+		ID: seat.ID, Row: seat.Row, Col: seat.Col, Price: seat.Price,
 	}, pdf)
 }
 
@@ -509,7 +558,7 @@ func (r *monoReconciler) Reconcile(ctx context.Context, lookback time.Duration, 
 			res.Scanned++
 			matched, err := r.proc.ReconcileTx(ctx, tx)
 			if err != nil {
-				log.Printf("reconcile %s tx=%s: %v", label, tx.ID, err)
+				slog.Warn("reconcile tx", "source", label, "txId", tx.ID, "err", err)
 				continue
 			}
 			if matched {

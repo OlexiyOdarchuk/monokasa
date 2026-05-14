@@ -4,6 +4,9 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+
+	"github.com/OlexiyOdarchuk/go-monobank-sdk/currency"
+	"github.com/OlexiyOdarchuk/go-monobank-sdk/money"
 )
 
 func TestNormalizeName(t *testing.T) {
@@ -47,7 +50,7 @@ func TestJarPrefillURL(t *testing.T) {
 	base := "https://send.monobank.ua/jar/abc"
 
 	t.Run("round amount", func(t *testing.T) {
-		got := jarPrefillURL(base, 25000, "abcdefgh")
+		got := jarPrefillURL(base, money.New(25000, currency.UAH), "abcdefgh")
 		u, err := url.Parse(got)
 		if err != nil {
 			t.Fatal(err)
@@ -61,7 +64,7 @@ func TestJarPrefillURL(t *testing.T) {
 	})
 
 	t.Run("non-round kopecks keep decimals", func(t *testing.T) {
-		got := jarPrefillURL(base, 25099, "x")
+		got := jarPrefillURL(base, money.New(25099, currency.UAH), "x")
 		u, _ := url.Parse(got)
 		if a := u.Query().Get("a"); a != "250.99" {
 			t.Errorf("a=%q want 250.99", a)
@@ -69,7 +72,7 @@ func TestJarPrefillURL(t *testing.T) {
 	})
 
 	t.Run("invalid base returns input", func(t *testing.T) {
-		got := jarPrefillURL("://not-a-url", 100, "x")
+		got := jarPrefillURL("://not-a-url", money.New(100, currency.UAH), "x")
 		if got != "://not-a-url" {
 			t.Errorf("got %q, want passthrough", got)
 		}

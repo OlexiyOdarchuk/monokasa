@@ -6,7 +6,7 @@ package pay
 import (
 	"context"
 	"errors"
-	"log"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -102,26 +102,29 @@ func (p *Processor) processTx(ctx context.Context, t bank.Transaction) (bool, er
 
 	code := extractCode(t.Comment, t.Description)
 	if code == "" {
-		log.Printf("payment %s: no reservation code in comment %q", t.ID, t.Comment)
+		slog.Info("payment with no reservation code in comment",
+			"txId", t.ID, "comment", t.Comment)
 		return false, nil
 	}
 	res, seat, err := p.Store.FindReservationByCode(ctx, code)
 	if errors.Is(err, ErrCodeNotFound) || errors.Is(err, ErrAlreadyClosed) {
-		log.Printf("payment %s: code %q has no open reservation", t.ID, code)
+		slog.Info("payment code has no open reservation",
+			"txId", t.ID, "code", code)
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
 	if res.ConfirmedAt != nil {
-		log.Printf("payment %s: reservation %s already confirmed", t.ID, code)
+		slog.Info("payment for already-confirmed reservation",
+			"txId", t.ID, "code", code)
 		return false, nil
 	}
 	// Accept paid >= expected: overpayment is fine, exact match is fine,
 	// short payment is rejected.
 	if t.Amount.Minor < p.MinPrice.Minor {
-		log.Printf("payment %s: short amount %s (need %s) for code %s",
-			t.ID, t.Amount, p.MinPrice, code)
+		slog.Warn("payment short",
+			"txId", t.ID, "paid", t.Amount, "need", p.MinPrice, "code", code)
 		return false, nil
 	}
 
@@ -136,8 +139,13 @@ func (p *Processor) processTx(ctx context.Context, t bank.Transaction) (bool, er
 	if err := p.Notifier.SendTicket(res.TGChatID, seat, pdf); err != nil {
 		return false, err
 	}
-	log.Printf("ticket issued: code=%s row=%d seat=%d buyer=%q chat=%d paid=%s",
-		code, seat.Row, seat.Col, res.BuyerName, res.TGChatID, t.Amount)
+	slog.Info("ticket issued",
+		"code", code,
+		"row", seat.Row,
+		"seat", seat.Col,
+		"buyer", res.BuyerName,
+		"chatId", res.TGChatID,
+		"paid", t.Amount)
 	return true, nil
 }
 
