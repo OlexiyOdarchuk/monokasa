@@ -26,6 +26,7 @@ import (
 	"github.com/OlexiyOdarchuk/go-monobank-sdk/personal"
 	"github.com/OlexiyOdarchuk/go-monobank-sdk/webhook"
 
+	"github.com/OlexiyOdarchuk/monokasa/internal/auth"
 	"github.com/OlexiyOdarchuk/monokasa/internal/bot"
 	"github.com/OlexiyOdarchuk/monokasa/internal/config"
 	"github.com/OlexiyOdarchuk/monokasa/internal/metrics"
@@ -152,6 +153,12 @@ func main() {
 		slog.Info("jar command disabled (no short id in link)", "jarLink", cfg.JarLink)
 	}
 
+	if err := bootstrapAdmin(ctx, st, cfg.AdminEmail, cfg.AdminPassword); err != nil {
+		fatal("bootstrap admin", "err", err)
+	}
+
+	authHandler := auth.NewHandler(st, cfg.SecureCookies)
+
 	scanner := web.NewScanner(webStore{st}, coder, cfg.ScannerToken)
 
 	// Seat gauges read straight from the store at scrape time — Prometheus
@@ -170,6 +177,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("/webhook", hook)
 	mux.Handle("/debug/vars", expvar.Handler())
+	authHandler.Register(mux)
 	scanner.Register(mux)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
@@ -211,6 +219,11 @@ func main() {
 
 	// GC idle rate-limit buckets so the map doesn't grow over the show's lifetime.
 	go scanner.RunGC(ctx, 10*time.Minute, 30*time.Minute)
+
+	// Drop expired session rows hourly. Cheap query (indexed) with no impact
+	// on user-visible behaviour — FindSession already rejects expired tokens
+	// at read time; the sweep is just housekeeping.
+	go runSessionSweeper(ctx, st, time.Hour)
 
 	<-ctx.Done()
 	slog.Info("shutting down")
@@ -287,6 +300,59 @@ func runHoldSweeper(ctx context.Context, st *store.Store, every time.Duration) {
 		}
 	}
 	sweep() // fire once at startup to catch carry-over from before restart
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			sweep()
+		}
+	}
+}
+
+// bootstrapAdmin seeds the first admin user when the DB is empty and the
+// ADMIN_EMAIL/ADMIN_PASSWORD ENV pair is set. After the first run the
+// caller should remove these from .env — they're a one-shot rescue door.
+func bootstrapAdmin(ctx context.Context, st *store.Store, email, password string) error {
+	if email == "" || password == "" {
+		return nil
+	}
+	n, err := st.CountUsers(ctx)
+	if err != nil {
+		return fmt.Errorf("count users: %w", err)
+	}
+	if n > 0 {
+		return nil // someone is already in there — never overwrite
+	}
+	hash, err := auth.HashPassword(password)
+	if err != nil {
+		return fmt.Errorf("hash password: %w", err)
+	}
+	if _, err := st.CreateUser(ctx, email, "Admin", hash); err != nil {
+		return fmt.Errorf("create user: %w", err)
+	}
+	slog.Warn("bootstrapped admin user — remove ADMIN_PASSWORD from environment",
+		"email", email)
+	return nil
+}
+
+// runSessionSweeper periodically deletes expired session rows.
+func runSessionSweeper(ctx context.Context, st *store.Store, every time.Duration) {
+	tick := time.NewTicker(every)
+	defer tick.Stop()
+	sweep := func() {
+		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		n, err := st.SweepExpiredSessions(ctx)
+		if err != nil {
+			slog.Error("sweep sessions", "err", err)
+			return
+		}
+		if n > 0 {
+			slog.Info("sweep sessions: deleted expired", "count", n)
+		}
+	}
+	sweep()
 	for {
 		select {
 		case <-ctx.Done():

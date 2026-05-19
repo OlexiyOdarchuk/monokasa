@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -26,6 +27,16 @@ type Config struct {
 	RemindBefore time.Duration
 	MonoToken    string
 	WebhookURL   string
+
+	// AdminEmail/AdminPassword bootstrap the first admin user on a fresh
+	// install. Once any user exists in the DB these are ignored, so they
+	// can be safely removed from .env after first start.
+	AdminEmail    string
+	AdminPassword string
+	// SecureCookies forces Secure=true on session cookies regardless of
+	// the request's TLS detection. Set in production behind HTTPS where
+	// the proxy may or may not expose X-Forwarded-Proto.
+	SecureCookies bool
 }
 
 func Load() (Config, error) {
@@ -47,6 +58,9 @@ func Load() (Config, error) {
 	c.MonoToken = os.Getenv("MONO_TOKEN")
 	c.WebhookURL = os.Getenv("WEBHOOK_URL")
 	c.AdminTGID, _ = strconv.ParseInt(os.Getenv("ADMIN_TG_ID"), 10, 64)
+	c.AdminEmail = os.Getenv("ADMIN_EMAIL")
+	c.AdminPassword = os.Getenv("ADMIN_PASSWORD")
+	c.SecureCookies = envBool("SECURE_COOKIES", false)
 
 	if c.TGToken == "" {
 		return c, errors.New("TG_TOKEN is required")
@@ -87,6 +101,16 @@ func envDur(k string, fallback time.Duration) time.Duration {
 		if d, err := time.ParseDuration(v); err == nil {
 			return d
 		}
+	}
+	return fallback
+}
+
+func envBool(k string, fallback bool) bool {
+	switch strings.ToLower(os.Getenv(k)) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
 	}
 	return fallback
 }

@@ -473,6 +473,139 @@ func TestStatsExcludesNonSellableFromTotal(t *testing.T) {
 	}
 }
 
+func TestUsersCreateAndLookup(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	u, err := s.CreateUser(ctx, "admin@example.com", "Admin", "hash:abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.ID == 0 || u.CreatedAt.IsZero() {
+		t.Fatalf("CreateUser returned incomplete: %+v", u)
+	}
+	byEmail, err := s.FindUserByEmail(ctx, "admin@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if byEmail.ID != u.ID {
+		t.Errorf("FindUserByEmail.ID = %d, want %d", byEmail.ID, u.ID)
+	}
+	byID, err := s.FindUserByID(ctx, u.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if byID.Email != "admin@example.com" {
+		t.Errorf("FindUserByID.Email = %q, want admin@example.com", byID.Email)
+	}
+}
+
+func TestUsersDuplicateEmailRejected(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	if _, err := s.CreateUser(ctx, "a@b.com", "A", "h1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateUser(ctx, "a@b.com", "B", "h2"); !errors.Is(err, ErrEmailTaken) {
+		t.Fatalf("duplicate email: got %v, want ErrEmailTaken", err)
+	}
+}
+
+func TestUsersNotFound(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	if _, err := s.FindUserByEmail(ctx, "missing@x.com"); !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("FindUserByEmail missing: got %v, want ErrUserNotFound", err)
+	}
+	if _, err := s.FindUserByID(ctx, 999); !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("FindUserByID missing: got %v, want ErrUserNotFound", err)
+	}
+}
+
+func TestCountUsers(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	if n, _ := s.CountUsers(ctx); n != 0 {
+		t.Errorf("CountUsers fresh = %d, want 0", n)
+	}
+	_, _ = s.CreateUser(ctx, "a@b.com", "A", "h")
+	_, _ = s.CreateUser(ctx, "c@d.com", "C", "h")
+	if n, _ := s.CountUsers(ctx); n != 2 {
+		t.Errorf("CountUsers after 2 inserts = %d, want 2", n)
+	}
+}
+
+func TestSessionLifecycle(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	u, _ := s.CreateUser(ctx, "admin@x.com", "Admin", "h")
+
+	sess, err := s.CreateSession(ctx, u.ID, "tok-fresh", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sess.ExpiresAt.Before(time.Now()) {
+		t.Errorf("fresh session already expired: %v", sess.ExpiresAt)
+	}
+
+	got, gotUser, err := s.FindSession(ctx, "tok-fresh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.UserID != u.ID || gotUser.Email != "admin@x.com" {
+		t.Errorf("FindSession got user %+v, want %s", gotUser, "admin@x.com")
+	}
+
+	if err := s.DeleteSession(ctx, "tok-fresh"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.FindSession(ctx, "tok-fresh"); !errors.Is(err, ErrSessionNotFound) {
+		t.Errorf("after delete: got %v, want ErrSessionNotFound", err)
+	}
+	// Idempotent — second delete is fine.
+	if err := s.DeleteSession(ctx, "tok-fresh"); err != nil {
+		t.Errorf("re-delete: got %v, want nil", err)
+	}
+}
+
+func TestSessionExpired(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	u, _ := s.CreateUser(ctx, "admin@x.com", "Admin", "h")
+
+	// TTL in the past → row stored, but FindSession reports expired.
+	if _, err := s.CreateSession(ctx, u.ID, "tok-expired", -time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.FindSession(ctx, "tok-expired"); !errors.Is(err, ErrSessionExpired) {
+		t.Fatalf("expired session: got %v, want ErrSessionExpired", err)
+	}
+}
+
+func TestSweepExpiredSessions(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	u, _ := s.CreateUser(ctx, "admin@x.com", "Admin", "h")
+	_, _ = s.CreateSession(ctx, u.ID, "live", time.Hour)
+	_, _ = s.CreateSession(ctx, u.ID, "dead-1", -time.Minute)
+	_, _ = s.CreateSession(ctx, u.ID, "dead-2", -time.Hour)
+
+	n, err := s.SweepExpiredSessions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Errorf("swept %d, want 2", n)
+	}
+	// Live session still resolvable.
+	if _, _, err := s.FindSession(ctx, "live"); err != nil {
+		t.Errorf("live session after sweep: %v", err)
+	}
+	// Dead sessions truly gone (not just expired).
+	if _, _, err := s.FindSession(ctx, "dead-1"); !errors.Is(err, ErrSessionNotFound) {
+		t.Errorf("dead session after sweep: got %v, want ErrSessionNotFound", err)
+	}
+}
+
 func TestRemindFlow(t *testing.T) {
 	s := newTestStore(t)
 	showID := seedShow(t, s)

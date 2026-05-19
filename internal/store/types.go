@@ -100,3 +100,25 @@ type NewSeat struct {
 	PriceKopecks int64
 	Sellable     bool
 }
+
+// User is an admin account that can log in to the management web UI.
+// PasswordHash is a bcrypt hash — never store or transmit the plaintext.
+type User struct {
+	ID           int64
+	Email        string
+	PasswordHash string
+	Name         string
+	CreatedAt    time.Time
+}
+
+// Session is a long-lived auth credential keyed by an opaque random Token.
+// Issued on successful login, looked up on every authed request, deleted
+// on logout. The token lives in an HttpOnly cookie on the client; the
+// row in this table is the server-side truth.
+type Session struct {
+	ID        int64
+	UserID    int64
+	Token     string
+	CreatedAt time.Time
+	ExpiresAt time.Time
+}

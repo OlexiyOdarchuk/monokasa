@@ -87,6 +87,9 @@ godotenv підхопить.
 | `WEBHOOK_URL` | (порожньо) | публічний URL вебхуку; разом із `MONO_TOKEN` змушує бот при старті викликати `POST /personal/webhook` |
 | `SCANNER_TOKEN` | (порожньо) | shared-секрет для `/scan`; порожнє = доступ без авторизації |
 | `ADMIN_TG_ID` | `0` | TG user id, якому доступні `/stats`, `/reconcile`, `/jar` |
+| `ADMIN_EMAIL` | (порожньо) | one-shot bootstrap: створює першого admin web-юзера при свіжому старті; після першого запуску прибрати з `.env` |
+| `ADMIN_PASSWORD` | (порожньо) | пара до `ADMIN_EMAIL`; обидва треба разом, після bootstrap прибрати |
+| `SECURE_COOKIES` | `false` | `true` форсує `Secure` cookie за HTTPS у проді; локально лиши `false` |
 | `HTTP_ADDR` | `:8090` | порт HTTP-сервера (вебхук + сканер + /health) |
 | `DB_PATH` | `tix.db` | де лежатиме SQLite-файл |
 | `SHOW_TITLE` | `Моя вистава` | для шапки квитка і повідомлень бота |
@@ -153,6 +156,25 @@ curl -X POST https://api.monobank.ua/personal/webhook \
 (downtime, рестарт, перенесення хосту). Проганяє кожну транзакцію через
 ту саму гілку `pay.Processor`, що й боєвий хук, тому подвійно нічого не
 підтвердиться — `Confirm` ідемпотентний на рівні store.
+
+## Admin web (вхід)
+
+`/admin/login` — форма входу для адміна, який керуватиме подіями через
+веб (повноцінний UI прийде в наступному PR; зараз — мінімальна HTML-форма
+як doorway до cookie-сесії).
+
+Перший адмін створюється one-shot через ENV: задаєш у `.env`
+`ADMIN_EMAIL=you@example.com` і `ADMIN_PASSWORD=<щось>` перед першим
+стартом. Бот при старті побачить, що БД ще без юзерів, забекриптить
+пароль (bcrypt cost 12), збереже і **виведе попередження в лог** з
+проханням прибрати `ADMIN_PASSWORD` з ENV. Після цього перезапуски
+ігнорують ці змінні — БД стає джерелом правди.
+
+Логін → HttpOnly cookie `monokasa_admin` (Path=/, SameSite=Lax, MaxAge=30
+днів). Logout (`POST /admin/logout`) видаляє сесію в БД і чистить cookie.
+Сесії, що протекли, періодично прибираються sweeper'ом — `FindSession`
+все одно блокує expired-токени на читанні, sweep лише прибирає мертві
+рядки.
 
 ## Сканер на вході
 
