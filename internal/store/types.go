@@ -33,7 +33,9 @@ type Seat struct {
 }
 
 // Reservation is a hold placed on a seat by a Telegram user. It becomes a
-// ticket once ConfirmedAt is set.
+// ticket once ConfirmedAt is set. CancelledAt is populated on soft-delete
+// (user cancel, sweeper expiry, admin force-cancel) and surfaced through
+// admin queries so the dashboard can show cancellation history.
 type Reservation struct {
 	ID          int64
 	SeatID      int64
@@ -44,6 +46,7 @@ type Reservation struct {
 	CreatedAt   time.Time
 	ExpiresAt   time.Time
 	ConfirmedAt *time.Time
+	CancelledAt *time.Time
 }
 
 // Ticket is the QR-bearing artifact issued after a confirmed payment.

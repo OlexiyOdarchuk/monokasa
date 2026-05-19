@@ -595,7 +595,9 @@ const resCols = `r.id, r.seat_id, r.tg_user_id, r.tg_chat_id, r.buyer_name, r.co
 	r.created_at, r.expires_at, r.confirmed_at`
 
 // scanReservationWithSeat scans the union of resCols + cancelled_at + seatCols
-// (with the `s.` prefix). The order must match the SELECT below.
+// (with the `s.` prefix). The order must match the SELECT below. Cancelled
+// rows are populated normally — callers that care about active-only state
+// (FindReservationByCode) check r.CancelledAt themselves.
 func scanReservationWithSeat(row interface{ Scan(...any) error }, r *Reservation, seat *Seat) error {
 	var conf, cancelled sql.NullInt64
 	var sellable int
@@ -612,7 +614,8 @@ func scanReservationWithSeat(row interface{ Scan(...any) error }, r *Reservation
 		r.ConfirmedAt = &t
 	}
 	if cancelled.Valid {
-		return ErrAlreadyClosed
+		t := time.Unix(cancelled.Int64, 0)
+		r.CancelledAt = &t
 	}
 	seat.Sellable = sellable != 0
 	return nil
@@ -630,13 +633,16 @@ func (s *Store) FindReservationByCode(ctx context.Context, code string) (Reserva
 		SELECT `+reservationJoinSeat+`
 		FROM reservations r JOIN seats s ON s.id = r.seat_id
 		WHERE r.code = ?`, code), &r, &seat)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
+	if errors.Is(err, sql.ErrNoRows) {
 		return r, seat, ErrCodeNotFound
-	case errors.Is(err, ErrAlreadyClosed):
+	}
+	if err != nil {
+		return r, seat, err
+	}
+	if r.CancelledAt != nil {
 		return r, seat, ErrAlreadyClosed
 	}
-	return r, seat, err
+	return r, seat, nil
 }
 
 // CancelReservation soft-deletes a reservation if it belongs to the user
@@ -750,13 +756,74 @@ func (s *Store) FindReservationByTicket(ctx context.Context, ticketID int64) (Re
 		JOIN reservations r ON r.id = t.reservation_id
 		JOIN seats s ON s.id = r.seat_id
 		WHERE t.id = ?`, ticketID), &r, &seat)
-	if errors.Is(err, ErrAlreadyClosed) {
-		// A scanned ticket whose reservation got cancelled in parallel —
-		// vanishingly rare, but don't fail the scan over it. Caller gets
-		// the row data; the cancelled state isn't surfaced here.
-		return r, seat, nil
-	}
+	// Cancelled-state is not raised here — a scanned ticket whose
+	// reservation got cancelled in parallel is vanishingly rare, and
+	// blocking entry over it isn't the right call. Caller gets the row.
 	return r, seat, err
+}
+
+// ListReservations returns every reservation for a show — including
+// cancelled rows, which are needed for admin audit. Newest first.
+func (s *Store) ListReservations(ctx context.Context, showID int64) ([]MyItem, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+reservationJoinSeat+`
+		FROM reservations r
+		JOIN seats s ON s.id = r.seat_id
+		WHERE s.show_id = ?
+		ORDER BY r.created_at DESC`, showID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []MyItem
+	for rows.Next() {
+		var r Reservation
+		var seat Seat
+		if err := scanReservationWithSeat(rows, &r, &seat); err != nil {
+			return nil, err
+		}
+		out = append(out, MyItem{Reservation: r, Seat: seat})
+	}
+	return out, rows.Err()
+}
+
+// AdminCancelReservation force-cancels any reservation (paid or held) by
+// id, without the per-user ownership check that the bot-side flow needs.
+// Paid cancellations are permitted because admin refunds happen out of
+// band in mono — we just need to free the seat and mark the row.
+// Already-cancelled rows return ErrAlreadyClosed.
+func (s *Store) AdminCancelReservation(ctx context.Context, reservationID int64) (Reservation, Seat, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Reservation{}, Seat{}, err
+	}
+	defer tx.Rollback()
+
+	var r Reservation
+	var seat Seat
+	err = scanReservationWithSeat(tx.QueryRowContext(ctx, `
+		SELECT `+reservationJoinSeat+`
+		FROM reservations r JOIN seats s ON s.id = r.seat_id
+		WHERE r.id = ?`, reservationID), &r, &seat)
+	if errors.Is(err, sql.ErrNoRows) {
+		return r, seat, ErrCodeNotFound
+	}
+	if err != nil {
+		return r, seat, err
+	}
+	if r.CancelledAt != nil {
+		return r, seat, ErrAlreadyClosed
+	}
+	now := time.Now()
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE reservations SET cancelled_at=? WHERE id=?`, now.Unix(), reservationID); err != nil {
+		return r, seat, err
+	}
+	if err := tx.Commit(); err != nil {
+		return r, seat, err
+	}
+	r.CancelledAt = &now
+	return r, seat, nil
 }
 
 // MyReservations returns the user's bookings, newest first.

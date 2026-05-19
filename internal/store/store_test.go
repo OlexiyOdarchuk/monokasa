@@ -606,6 +606,87 @@ func TestSweepExpiredSessions(t *testing.T) {
 	}
 }
 
+func TestListReservationsIncludesCancelled(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	showID, _ := s.CreateShow(ctx, Show{Title: "T", StartsAt: time.Now()}, 1, 3, 100)
+	seats, _ := s.Seats(ctx, showID)
+
+	// 1 paid, 1 held, 1 cancelled.
+	r1, _ := s.Reserve(ctx, seats[0], 1, 100, "A", "code0001", 5*time.Minute)
+	if _, err := s.Confirm(ctx, r1.ID, "qr1"); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = s.Reserve(ctx, seats[1], 2, 200, "B", "code0002", 5*time.Minute)
+	r3, _ := s.Reserve(ctx, seats[2], 3, 300, "C", "code0003", 5*time.Minute)
+	if _, _, err := s.CancelReservation(ctx, r3.Code, 3); err != nil {
+		t.Fatal(err)
+	}
+
+	items, err := s.ListReservations(ctx, showID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 3 {
+		t.Fatalf("ListReservations = %d, want 3 (paid + held + cancelled)", len(items))
+	}
+	// Verify CancelledAt populated for the cancelled one.
+	var cancelledSeen bool
+	for _, it := range items {
+		if it.Reservation.CancelledAt != nil {
+			cancelledSeen = true
+		}
+	}
+	if !cancelledSeen {
+		t.Error("no reservation with CancelledAt set, want one")
+	}
+}
+
+func TestAdminCancelReservationWorksOnPaid(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	showID, _ := s.CreateShow(ctx, Show{Title: "T", StartsAt: time.Now()}, 1, 1, 100)
+	seats, _ := s.Seats(ctx, showID)
+	r, _ := s.Reserve(ctx, seats[0], 1, 100, "A", "code0001", 5*time.Minute)
+	if _, err := s.Confirm(ctx, r.ID, "qr1"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, _, err := s.AdminCancelReservation(ctx, r.ID)
+	if err != nil {
+		t.Fatalf("AdminCancelReservation on paid: %v", err)
+	}
+	if got.CancelledAt == nil {
+		t.Error("CancelledAt should be set after admin cancel")
+	}
+	// Seat is now free.
+	if _, err := s.FindFreeSeat(ctx, showID, 1, 1); err != nil {
+		t.Errorf("seat should be free after admin cancel, got %v", err)
+	}
+}
+
+func TestAdminCancelReservationDoubleFails(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	showID, _ := s.CreateShow(ctx, Show{Title: "T", StartsAt: time.Now()}, 1, 1, 100)
+	seats, _ := s.Seats(ctx, showID)
+	r, _ := s.Reserve(ctx, seats[0], 1, 100, "A", "code0001", 5*time.Minute)
+
+	if _, _, err := s.AdminCancelReservation(ctx, r.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.AdminCancelReservation(ctx, r.ID); !errors.Is(err, ErrAlreadyClosed) {
+		t.Errorf("re-cancel: got %v, want ErrAlreadyClosed", err)
+	}
+}
+
+func TestAdminCancelReservationNotFound(t *testing.T) {
+	s := newTestStore(t)
+	if _, _, err := s.AdminCancelReservation(context.Background(), 9999); !errors.Is(err, ErrCodeNotFound) {
+		t.Errorf("got %v, want ErrCodeNotFound", err)
+	}
+}
+
 func TestRemindFlow(t *testing.T) {
 	s := newTestStore(t)
 	showID := seedShow(t, s)

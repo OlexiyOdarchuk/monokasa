@@ -26,6 +26,7 @@ import (
 	"github.com/OlexiyOdarchuk/go-monobank-sdk/personal"
 	"github.com/OlexiyOdarchuk/go-monobank-sdk/webhook"
 
+	"github.com/OlexiyOdarchuk/monokasa/internal/admin"
 	"github.com/OlexiyOdarchuk/monokasa/internal/auth"
 	"github.com/OlexiyOdarchuk/monokasa/internal/bot"
 	"github.com/OlexiyOdarchuk/monokasa/internal/config"
@@ -180,9 +181,15 @@ func main() {
 		fatal("webui", "err", err)
 	}
 
+	// Admin API gets its own sub-mux so we can wrap the whole thing in
+	// auth.RequireAuth once, rather than decorating every endpoint.
+	adminMux := http.NewServeMux()
+	admin.NewHandler(st).Register(adminMux)
+
 	mux := http.NewServeMux()
 	mux.Handle("/webhook", hook)
 	mux.Handle("/debug/vars", expvar.Handler())
+	mux.Handle("/api/admin/", authHandler.RequireAuth(adminMux))
 	authHandler.Register(mux)
 	scanner.Register(mux)
 	// SPA on "/" is the catch-all — http.ServeMux picks the longest pattern
@@ -470,17 +477,31 @@ func (b botStore) FindFreeSeat(ctx context.Context, showID int64, row, col int) 
 	return toBotSeat(s), translateStoreErr(err)
 }
 
+func toBotReservation(r store.Reservation) bot.Reservation {
+	return bot.Reservation{
+		ID:          r.ID,
+		SeatID:      r.SeatID,
+		TGUserID:    r.TGUserID,
+		TGChatID:    r.TGChatID,
+		BuyerName:   r.BuyerName,
+		Code:        r.Code,
+		CreatedAt:   r.CreatedAt,
+		ExpiresAt:   r.ExpiresAt,
+		ConfirmedAt: r.ConfirmedAt,
+	}
+}
+
 func (b botStore) Reserve(
 	ctx context.Context, seat bot.Seat, tgUserID, tgChatID int64,
 	buyerName, code string, hold time.Duration,
 ) (bot.Reservation, error) {
 	r, err := b.s.Reserve(ctx, fromBotSeat(seat), tgUserID, tgChatID, buyerName, code, hold)
-	return bot.Reservation(r), translateStoreErr(err)
+	return toBotReservation(r), translateStoreErr(err)
 }
 
 func (b botStore) CancelReservation(ctx context.Context, code string, tgUserID int64) (bot.Reservation, bot.Seat, error) {
 	r, s, err := b.s.CancelReservation(ctx, code, tgUserID)
-	return bot.Reservation(r), toBotSeat(s), translateStoreErr(err)
+	return toBotReservation(r), toBotSeat(s), translateStoreErr(err)
 }
 
 func (b botStore) MyReservations(ctx context.Context, tgUserID int64) ([]bot.MyItem, error) {
@@ -490,7 +511,7 @@ func (b botStore) MyReservations(ctx context.Context, tgUserID int64) ([]bot.MyI
 	}
 	out := make([]bot.MyItem, len(items))
 	for i, it := range items {
-		out[i] = bot.MyItem{Reservation: bot.Reservation(it.Reservation), Seat: toBotSeat(it.Seat)}
+		out[i] = bot.MyItem{Reservation: toBotReservation(it.Reservation), Seat: toBotSeat(it.Seat)}
 	}
 	return out, nil
 }
