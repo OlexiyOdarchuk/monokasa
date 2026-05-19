@@ -9,3 +9,10 @@ monokasa
 .direnv/
 result
 result-*
+
+# Build artifacts copied into the embed dir by `make build` /
+# `docker compose build`. The stub dist/index.html stays in git so
+# `go build` on a clean checkout succeeds; everything else here is
+# regenerated.
+internal/webui/dist/_app/
+internal/webui/dist/favicon.png
