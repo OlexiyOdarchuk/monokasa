@@ -1,23 +1,18 @@
-# Docker-compose стек monokasa: один Go бекенд + Svelte фронт (HMR) +
-# опційний Cloudflare Tunnel для публічного HTTPS без власного домена.
+# monokasa: один Go-бінарник із вшитим Svelte-фронтом, усе на :8093.
 #
-#   docker compose up --build              # dev стек (backend + frontend)
-#   docker compose --profile tunnel up     # + cloudflared (потрібен CLOUDFLARED_TOKEN)
-#   docker compose down -v                 # повний reset (включно з SQLite-volume)
+#   docker compose up --build              # backend
+#   docker compose --profile tunnel up     # + cloudflared (опційно)
+#   docker compose down -v                 # повний reset (видаляє SQLite-volume)
 #
-# Усі секрети — через .env (godotenv підхоплює, compose теж читає його з
-# поточної директорії). Обов'язкові змінні позначені `${VAR:?...}` —
-# compose впаде на старті без них, краще ніж тихо запуститися з порожнім.
+# Усі секрети через .env. Обов'язкові — `${VAR:?...}`: compose упаде на
+# старті без них, краще ніж тихий старт з порожніми токенами.
 
 services:
-  # ==========================================================================
-  # Go backend: Telegram бот + monobank webhook + scan UI + /admin/* + /api/*
-  # ==========================================================================
   backend:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: monokasa-backend
+    container_name: monokasa
     restart: unless-stopped
     environment:
       TG_TOKEN: ${TG_TOKEN:?TG_TOKEN must be set in .env (see .env.example)}
@@ -25,7 +20,7 @@ services:
       MONO_JAR_LINK: ${MONO_JAR_LINK:?MONO_JAR_LINK must be set in .env}
       MONO_TOKEN: ${MONO_TOKEN:-}
       WEBHOOK_URL: ${WEBHOOK_URL:-}
-      HTTP_ADDR: ":8090"
+      HTTP_ADDR: ":8093"
       DB_PATH: /data/tix.db
       SHOW_TITLE: ${SHOW_TITLE:-Моя вистава}
       SHOW_VENUE: ${SHOW_VENUE:-Театральна площа}
@@ -48,53 +43,19 @@ services:
       # without `-v`. Use `down -v` to wipe state intentionally.
       - db_data:/data
     ports:
-      - "${BACKEND_HOST_PORT:-8090}:8090"
-
-  # ==========================================================================
-  # Svelte frontend: Vite dev server with HMR. In production the built
-  # assets will be embedded into the Go binary (PR #4-5) and this service
-  # is no longer needed — keep it for local development only.
-  # ==========================================================================
-  frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
-    container_name: monokasa-frontend
-    restart: unless-stopped
-    depends_on:
-      - backend
-    environment:
-      # The Vite proxy forwards /api, /admin/*, /webhook, /scan to this URL
-      # so the browser only ever talks to localhost:5173 in dev — cookies
-      # set by the Go backend share that origin and "just work".
-      VITE_API_PROXY: http://backend:8090
-      # Polling-based file watcher: inotify is unreliable across the
-      # bind-mount on Docker Desktop (Mac/Win). On Linux it works either
-      # way; polling is cheap enough not to bother special-casing.
-      CHOKIDAR_USEPOLLING: "true"
-    ports:
-      - "${FRONTEND_HOST_PORT:-5173}:5173"
-    volumes:
-      # Bind-mount source so editing host files triggers HMR in the
-      # container. node_modules stays inside the image — never mount it
-      # from the host, that's how you get OS-mismatched native modules.
-      - ./frontend/src:/app/src
-      - ./frontend/static:/app/static
-      - ./frontend/svelte.config.js:/app/svelte.config.js
-      - ./frontend/vite.config.ts:/app/vite.config.ts
-      - ./frontend/tsconfig.json:/app/tsconfig.json
+      - "${BACKEND_HOST_PORT:-8093}:8093"
 
   # ==========================================================================
   # Cloudflare Tunnel (optional): publishes the backend on a real HTTPS URL
   # without exposing a public IP or managing TLS certs. Enable with
-  # `docker compose --profile tunnel up` once CLOUDFLARED_TOKEN is set.
+  # `docker compose --profile tunnel up` after setting CLOUDFLARED_TOKEN.
   #
   # Quick setup (5 min, free):
   #   1. Sign up at https://dash.cloudflare.com (no card required)
   #   2. Zero Trust → Access → Tunnels → Create a tunnel
   #   3. Pick "Cloudflared" connector → copy the token
   #   4. CLOUDFLARED_TOKEN=eyJ... in .env
-  #   5. Public hostname: route to http://backend:8090 (service name +
+  #   5. Public hostname: route to http://backend:8093 (service name +
   #      port, *not* localhost — cloudflared resolves it inside compose)
   # ==========================================================================
   cloudflared:
@@ -104,7 +65,14 @@ services:
     restart: unless-stopped
     depends_on:
       - backend
-    command: tunnel --no-autoupdate run --token ${CLOUDFLARED_TOKEN:?CLOUDFLARED_TOKEN must be set when --profile tunnel is active}
+    # cloudflared reads TUNNEL_TOKEN from env directly — passing it as a
+    # CLI flag with ${VAR:?} would fail at parse time even when the tunnel
+    # profile is inactive (Compose interpolates the whole file before
+    # filtering by profile). The image errors out clearly if it actually
+    # starts with an empty token.
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARED_TOKEN:-}
+    command: tunnel --no-autoupdate run
 
 volumes:
   db_data:

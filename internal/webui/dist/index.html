@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>monokasa · фронт не зібраний</title>
+<style>
+  body{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:0;display:grid;place-items:center;min-height:100vh;padding:1rem}
+  .card{background:#1a1a1a;padding:2rem;border-radius:.75rem;max-width:640px;border:1px solid #2a2a2a}
+  h1{margin:0 0 1rem;font-size:1.25rem}
+  p{color:#aaa;line-height:1.5}
+  pre{background:#0a0a0a;padding:.75rem;border-radius:.375rem;overflow-x:auto;color:#e0e0e0;font-size:.875rem}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>monokasa · фронт-плейсхолдер</h1>
+  <p>Це stub-сторінка <code>internal/webui/dist/index.html</code>. Реальний Svelte-фронт ще не зібрано в цей бінарник.</p>
+  <p>Через Docker (рекомендовано):</p>
+  <pre>docker compose up --build</pre>
+  <p>Вручну:</p>
+  <pre>cd frontend &amp;&amp; npm install &amp;&amp; npm run build
+rm -rf ../internal/webui/dist &amp;&amp; cp -r build ../internal/webui/dist
+cd .. &amp;&amp; go build -o monokasa ./cmd/app</pre>
+</div>
+</body>
+</html>

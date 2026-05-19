@@ -41,7 +41,7 @@ type Config struct {
 
 func Load() (Config, error) {
 	c := Config{
-		HTTPAddr:     env("HTTP_ADDR", ":8090"),
+		HTTPAddr:     env("HTTP_ADDR", ":8093"),
 		DBPath:       env("DB_PATH", "tix.db"),
 		ShowTitle:    env("SHOW_TITLE", "Моя вистава"),
 		ShowVenue:    env("SHOW_VENUE", "Театральна площа"),

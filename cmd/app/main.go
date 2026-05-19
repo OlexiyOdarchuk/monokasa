@@ -36,6 +36,7 @@ import (
 	"github.com/OlexiyOdarchuk/monokasa/internal/timefmt"
 	"github.com/OlexiyOdarchuk/monokasa/internal/token"
 	"github.com/OlexiyOdarchuk/monokasa/internal/web"
+	"github.com/OlexiyOdarchuk/monokasa/internal/webui"
 )
 
 // fatal logs at error level and exits non-zero. slog has no built-in Fatal —
@@ -174,11 +175,20 @@ func main() {
 		return liveStat(st, show.ID, func(s store.Stats) int { return s.Free })
 	}))
 
+	spa, err := webui.New()
+	if err != nil {
+		fatal("webui", "err", err)
+	}
+
 	mux := http.NewServeMux()
 	mux.Handle("/webhook", hook)
 	mux.Handle("/debug/vars", expvar.Handler())
 	authHandler.Register(mux)
 	scanner.Register(mux)
+	// SPA on "/" is the catch-all — http.ServeMux picks the longest pattern
+	// match, so the specific routes above (and /health below) win for their
+	// exact paths; everything else falls through to the Svelte build.
+	mux.Handle("/", spa)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()

@@ -1,32 +1,36 @@
 # syntax=docker/dockerfile:1.7
-# Multi-stage build for the monokasa backend.
-#
-# Stage 1 (build): pulls deps, compiles a static binary with CGO disabled.
-# Stage 2 (run):   distroless, nonroot. Binary serves HTTP on :8090 and
-#                  expects the SQLite file under /data (volume).
-#
-# When the Svelte admin/buyer UI lands (PR #4-5), a third stage will pull
-# its `vite build` output and copy it next to the binary for embed.FS.
+# One-shot build: Svelte SPA → Go binary with the SPA embedded → distroless.
+# Produces a single self-contained image that hosts everything on :8093.
 
-FROM golang:1.26.3-alpine AS build
+# Stage 1 — build the Svelte SPA into static files.
+FROM node:24-alpine AS frontend
+WORKDIR /app
+COPY frontend/package.json frontend/package-lock.json* ./
+RUN npm install
+COPY frontend/ ./
+RUN npm run build
+
+# Stage 2 — build the Go binary with the SPA baked in via embed.FS.
+FROM golang:1.26.3-alpine AS backend
 WORKDIR /src
-
-# Cache deps independently of source so editing .go files doesn't
-# re-download the module graph.
 COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     go mod download
-
 COPY . .
+# Replace the in-repo stub dist (which exists only so local `go build` doesn't
+# fail on an empty embed) with the real Svelte output before compiling.
+RUN rm -rf /src/internal/webui/dist
+COPY --from=frontend /app/build /src/internal/webui/dist
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=linux go build \
         -trimpath -ldflags="-s -w" \
         -o /out/monokasa ./cmd/app
 
+# Stage 3 — distroless runtime, nonroot. Nothing else to ship.
 FROM gcr.io/distroless/static-debian12:nonroot
-COPY --from=build /out/monokasa /monokasa
-EXPOSE 8090
+COPY --from=backend /out/monokasa /monokasa
+EXPOSE 8093
 USER nonroot:nonroot
 ENTRYPOINT ["/monokasa"]

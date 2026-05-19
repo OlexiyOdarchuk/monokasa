@@ -109,15 +109,14 @@ cp .env.example .env  # заповни TG_TOKEN, TICKET_SECRET, MONO_JAR_LINK
 docker compose up --build
 ```
 
-Підніметься:
-- `monokasa-backend` на `localhost:8090` (бот, webhook, /admin, /scan, /health)
-- `monokasa-frontend` на `localhost:5173` (Svelte з Vite HMR — поки що скелет)
+Один контейнер `monokasa` на `localhost:8093` — у ньому одразу:
+- Telegram-бот (long-polling)
+- HTTP-сервер: monobank `/webhook`, `/admin/login`, `/scan`, `/health`,
+  `/debug/vars`, і `/*` — вшитий Svelte SPA
 
-Frontend проксує `/api`, `/admin/*`, `/webhook`, `/scan` на backend, тож у
-браузері все живе під одним origin'ом `localhost:5173`.
-
-Готово до prod-білду — фронт буде вшито в Go-бінарник через `embed.FS`
-(прийде в PR #4-5). Поки що для prod-деплою лиш backend через `Dockerfile`.
+Docker build збирає Svelte окремим stage'м і клеїть результат у Go-бінарник
+через `embed.FS`, тому у проді — один distroless image, нуль Node-runtime,
+нічого додатково подавати.
 
 ### Cloudflare Tunnel (публічний HTTPS без власного домена)
 
@@ -127,7 +126,7 @@ Webhook monobank вимагає публічний HTTPS endpoint. Якщо не
 1. Зареєструйся на [Cloudflare Zero Trust](https://dash.cloudflare.com) (картка не потрібна)
 2. `Access → Tunnels → Create a tunnel` → connector `Cloudflared` → копіюй токен
 3. Додай у `.env`: `CLOUDFLARED_TOKEN=eyJ...`
-4. У панелі Cloudflare додай public hostname (`<щось>.trycloudflare.com` або свій домен) → `http://backend:8090`
+4. У панелі Cloudflare додай public hostname (`<щось>.trycloudflare.com` або свій домен) → `http://backend:8093`
 5. `docker compose --profile tunnel up`
 
 Тепер вебхук monobank можна реєструвати на цей URL, а в `.env` поставити
@@ -137,12 +136,18 @@ Webhook monobank вимагає публічний HTTPS endpoint. Якщо не
 ### Без Docker (для розробки бекенду)
 
 ```sh
+# Зібрати фронт окремо (інакше "/" віддасть stub-сторінку)
+cd frontend && npm install && npm run build
+rm -rf ../internal/webui/dist && cp -r build ../internal/webui/dist
+cd ..
+
 go build -o monokasa ./cmd/app
 ./monokasa
 ```
 
-У такому режимі фронту немає (тільки `/admin/login` HTML-форма + `/scan`).
 HTTPS для webhook'а — через `cloudflared tunnel` або `ngrok` як раніше.
+Якщо просто хочеш dev-loop з HMR — є `frontend/Dockerfile` (запусти
+окремо: `cd frontend && docker build -t monokasa-fe . && docker run -p 5173:5173 -v ./src:/app/src monokasa-fe`).
 
 Реєстрацію вебхука можна зробити вручну через monobank API або автоматично —
 проставити `MONO_TOKEN` + `WEBHOOK_URL=https://your.host/webhook`, тоді бот
