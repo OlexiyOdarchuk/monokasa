@@ -1,0 +1,9 @@
+# Don't ship dev artefacts or local secrets into the frontend image.
+node_modules
+.svelte-kit
+build
+.env
+.env.*
+.git
+.gitignore
+*.log

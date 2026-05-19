@@ -102,14 +102,47 @@ godotenv підхопить.
 
 ## Запуск
 
+### Через Docker (рекомендовано)
+
+```sh
+cp .env.example .env  # заповни TG_TOKEN, TICKET_SECRET, MONO_JAR_LINK
+docker compose up --build
+```
+
+Підніметься:
+- `monokasa-backend` на `localhost:8090` (бот, webhook, /admin, /scan, /health)
+- `monokasa-frontend` на `localhost:5173` (Svelte з Vite HMR — поки що скелет)
+
+Frontend проксує `/api`, `/admin/*`, `/webhook`, `/scan` на backend, тож у
+браузері все живе під одним origin'ом `localhost:5173`.
+
+Готово до prod-білду — фронт буде вшито в Go-бінарник через `embed.FS`
+(прийде в PR #4-5). Поки що для prod-деплою лиш backend через `Dockerfile`.
+
+### Cloudflare Tunnel (публічний HTTPS без власного домена)
+
+Webhook monobank вимагає публічний HTTPS endpoint. Якщо немає власного
+домена і VPS з TLS — підніми безкоштовний tunnel:
+
+1. Зареєструйся на [Cloudflare Zero Trust](https://dash.cloudflare.com) (картка не потрібна)
+2. `Access → Tunnels → Create a tunnel` → connector `Cloudflared` → копіюй токен
+3. Додай у `.env`: `CLOUDFLARED_TOKEN=eyJ...`
+4. У панелі Cloudflare додай public hostname (`<щось>.trycloudflare.com` або свій домен) → `http://backend:8090`
+5. `docker compose --profile tunnel up`
+
+Тепер вебхук monobank можна реєструвати на цей URL, а в `.env` поставити
+`WEBHOOK_URL=https://<щось>.trycloudflare.com/webhook` — бекенд сам
+зареєструє його при старті (якщо є `MONO_TOKEN`).
+
+### Без Docker (для розробки бекенду)
+
 ```sh
 go build -o monokasa ./cmd/app
 ./monokasa
 ```
 
-monobank потребує публічного HTTPS для вебхука. Найшвидше — за nginx чи
-Caddy, з letsencrypt; у dev — `cloudflared tunnel` або `ngrok`. URL
-вебхука для реєстрації в моно: `https://your.host/webhook`.
+У такому режимі фронту немає (тільки `/admin/login` HTML-форма + `/scan`).
+HTTPS для webhook'а — через `cloudflared tunnel` або `ngrok` як раніше.
 
 Реєстрацію вебхука можна зробити вручну через monobank API або автоматично —
 проставити `MONO_TOKEN` + `WEBHOOK_URL=https://your.host/webhook`, тоді бот

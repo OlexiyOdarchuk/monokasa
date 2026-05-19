@@ -1,0 +1,29 @@
+# Speed up `docker build` and avoid bloating images with host-only junk.
+
+.git
+.gitignore
+.direnv
+.envrc
+.jj
+.claude
+
+# Local secrets and dev artefacts
+.env
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+monokasa
+result
+result-*
+
+# Frontend stays in its own build context
+frontend/node_modules
+frontend/.svelte-kit
+frontend/build
+
+# Editor noise
+.vscode
+.idea
+*.swp
+*.swo

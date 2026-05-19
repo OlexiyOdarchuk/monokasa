@@ -1,0 +1,8 @@
+@import 'tailwindcss';
+
+@theme {
+	/* Brand colours — Claude-orange accent on a near-black neutral background.
+	   Tweak in PR #4 once we settle on the admin UI palette. */
+	--color-brand: #d97757;
+	--color-brand-hover: #e88865;
+}
