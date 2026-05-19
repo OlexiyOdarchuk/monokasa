@@ -1,0 +1,159 @@
+// Thin fetch wrapper for the /api/admin/* endpoints. Cookies travel
+// implicitly (same-origin), so there's no token plumbing to do here.
+//
+// On a 401 from any endpoint we hard-navigate to /admin/login. That's
+// either an expired session or the user never had one — either way the
+// SPA can't recover, the login page can.
+//
+// Body shape for errors matches what the Go side returns:
+//   { "error": "<machine_code>", "detail": "<human>" }
+// Wrapped as ApiError so callers can `instanceof` check and render
+// detail to the user.
+
+export class ApiError extends Error {
+	readonly status: number;
+	readonly code: string;
+	readonly detail: string;
+
+	constructor(status: number, code: string, detail: string) {
+		super(detail || code);
+		this.status = status;
+		this.code = code;
+		this.detail = detail;
+	}
+}
+
+async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+	const init: RequestInit = {
+		method,
+		credentials: 'same-origin',
+		headers: {
+			Accept: 'application/json'
+		}
+	};
+	if (body !== undefined) {
+		init.body = JSON.stringify(body);
+		(init.headers as Record<string, string>)['Content-Type'] = 'application/json';
+	}
+
+	const r = await fetch(path, init);
+
+	if (r.status === 401) {
+		// No session → bounce to login. Use full reload so any in-memory
+		// state is wiped clean.
+		window.location.href = '/admin/login';
+		throw new ApiError(401, 'unauthorized', 'session expired');
+	}
+
+	if (r.status === 204) {
+		// No body — fine, return null-ish. Callers that expect a value
+		// shouldn't use 204 endpoints; type system enforces this for new code.
+		return undefined as T;
+	}
+
+	const contentType = r.headers.get('content-type') ?? '';
+	const isJson = contentType.includes('application/json');
+
+	if (!r.ok) {
+		if (isJson) {
+			const err = (await r.json()) as { error?: string; detail?: string };
+			throw new ApiError(r.status, err.error ?? 'unknown', err.detail ?? '');
+		}
+		const text = await r.text();
+		throw new ApiError(r.status, 'http_' + r.status, text || r.statusText);
+	}
+
+	if (!isJson) {
+		// Endpoints we use always return JSON unless 204 — surface this
+		// as a hard error so a wrong path doesn't silently corrupt state.
+		throw new ApiError(r.status, 'unexpected_content_type', contentType);
+	}
+	return (await r.json()) as T;
+}
+
+export const api = {
+	get: <T>(path: string) => request<T>('GET', path),
+	post: <T>(path: string, body?: unknown) => request<T>('POST', path, body),
+	patch: <T>(path: string, body?: unknown) => request<T>('PATCH', path, body),
+	del: <T>(path: string) => request<T>('DELETE', path)
+};
+
+// ---- typed response shapes (mirror internal/admin/admin.go) ----
+
+export interface Me {
+	id: number;
+	email: string;
+	name: string;
+}
+
+export interface Stats {
+	total: number;
+	sold: number;
+	held: number;
+	free: number;
+	revenue_kopecks: number;
+}
+
+export interface Show {
+	id: number;
+	title: string;
+	venue: string;
+	starts_at: string; // RFC3339
+	created_at: string;
+	archived_at?: string | null;
+	stats?: Stats | null;
+}
+
+export interface Seat {
+	id: number;
+	show_id: number;
+	row: number;
+	col: number;
+	x: number;
+	y: number;
+	label: string;
+	category: string;
+	price_kopecks: number;
+	sellable: boolean;
+}
+
+export interface Reservation {
+	id: number;
+	code: string;
+	buyer_name: string;
+	tg_user_id: number;
+	created_at: string;
+	expires_at: string;
+	confirmed_at?: string | null;
+	cancelled_at?: string | null;
+	status: 'paid' | 'held' | 'expired' | 'cancelled';
+}
+
+export interface SeatBrief {
+	id: number;
+	row: number;
+	col: number;
+	label: string;
+	category: string;
+	price_kopecks: number;
+}
+
+export interface Guest {
+	reservation: Reservation;
+	seat: SeatBrief;
+}
+
+export interface CreateShowInput {
+	title: string;
+	venue: string;
+	starts_at: string;
+	rows: number;
+	cols: number;
+	price_kopecks: number;
+}
+
+export interface UpdateShowInput {
+	title?: string;
+	venue?: string;
+	starts_at?: string;
+}

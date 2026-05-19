@@ -1,58 +1,89 @@
 <script lang="ts">
-	// Placeholder admin dashboard. Real content (events list, seat editor,
-	// guest list, broadcast) arrives in PR #4. For now we just confirm the
-	// session cookie made the redirect land somewhere sensible.
-	//
-	// The dashboard isn't gated on the client side yet — backend cookie
-	// auth happens at the /api/admin/* endpoints (to be added), and the
-	// SPA shell is intentionally servable to anyone. The login form
-	// itself sits on the Go side at /admin/login.
+	import { api, type Show, ApiError } from '$lib/api';
 
-	async function logout() {
-		// SameSite=Lax cookie + same-origin POST — no CSRF token needed
-		// for this single destructive endpoint.
-		await fetch('/admin/logout', { method: 'POST', credentials: 'same-origin' });
-		// Server returns 303; fetch follows it. After logout the cookie
-		// is cleared, so a hard navigation lands on the login form.
-		window.location.href = '/admin/login';
+	let shows = $state<Show[]>([]);
+	let loaded = $state(false);
+	let error = $state('');
+
+	$effect(() => {
+		(async () => {
+			try {
+				shows = await api.get<Show[]>('/api/admin/shows');
+			} catch (e) {
+				if (e instanceof ApiError) error = e.detail || e.code;
+				else error = String(e);
+			} finally {
+				loaded = true;
+			}
+		})();
+	});
+
+	function formatDate(iso: string): string {
+		const d = new Date(iso);
+		return d.toLocaleString('uk-UA', {
+			day: 'numeric',
+			month: 'long',
+			year: 'numeric',
+			hour: '2-digit',
+			minute: '2-digit'
+		});
 	}
 </script>
 
 <svelte:head>
-	<title>monokasa · admin</title>
+	<title>monokasa · події</title>
 </svelte:head>
 
-<main class="mx-auto max-w-3xl p-6">
-	<header class="mb-8 flex items-center justify-between">
-		<h1 class="text-2xl font-semibold tracking-tight">monokasa · admin</h1>
-		<button
-			onclick={logout}
-			class="rounded-md border border-neutral-700 px-3 py-1.5 text-sm text-neutral-300 hover:bg-neutral-800"
+<div class="flex items-center justify-between">
+	<h1 class="text-2xl font-semibold tracking-tight">Події</h1>
+	<a
+		href="/admin/shows/new"
+		class="rounded-md bg-[var(--color-brand)] px-4 py-2 text-sm font-medium text-black hover:bg-[var(--color-brand-hover)]"
+	>
+		+ Створити подію
+	</a>
+</div>
+
+{#if error}
+	<div class="mt-6 rounded-md border border-red-900 bg-red-950/50 p-4 text-sm text-red-300">
+		{error}
+	</div>
+{:else if !loaded}
+	<div class="mt-6 text-center text-neutral-500">Завантажую…</div>
+{:else if shows.length === 0}
+	<div class="mt-6 rounded-lg border border-neutral-800 bg-neutral-900 p-6 text-center">
+		<p class="text-neutral-400">Ще немає жодної події.</p>
+		<a
+			href="/admin/shows/new"
+			class="mt-3 inline-block text-sm text-[var(--color-brand)] hover:underline"
 		>
-			Вийти
-		</button>
-	</header>
-
-	<section class="rounded-lg border border-neutral-800 bg-neutral-900 p-6">
-		<h2 class="text-lg font-medium">Залогінено ✓</h2>
-		<p class="mt-2 text-sm text-neutral-400">
-			Це placeholder адмін-панелі. Повноцінний UI прийде наступним PR:
-			список подій, редактор зали (drag&amp;drop на canvas), список гостей з
-			фільтрами і CSV-експортом, broadcast куплених, кнопки "перевипустити QR"
-			та "скасувати бронь".
-		</p>
-		<p class="mt-2 text-sm text-neutral-500">
-			Поточна сесія живе 30 днів, лежить у HttpOnly cookie <code class="rounded bg-neutral-950 px-1 py-0.5 text-xs">monokasa_admin</code>.
-		</p>
-	</section>
-
-	<section class="mt-6 rounded-lg border border-neutral-800 bg-neutral-900 p-6">
-		<h3 class="text-sm font-semibold text-neutral-300">Що вже працює зараз</h3>
-		<ul class="mt-3 list-disc pl-5 text-sm text-neutral-400">
-			<li>Telegram-бот: <code>/seats</code>, <code>/my</code>, <code>/stats</code>, <code>/reconcile</code>, <code>/jar</code></li>
-			<li>monobank webhook на <code>/webhook</code></li>
-			<li>Сканер QR на <code>/scan</code></li>
-			<li>Reconcile-команда для пропущених webhook'ів</li>
-		</ul>
-	</section>
-</main>
+			Створити першу →
+		</a>
+	</div>
+{:else}
+	<ul class="mt-6 grid gap-3">
+		{#each shows as show (show.id)}
+			<li>
+				<a
+					href="/admin/shows/{show.id}"
+					class="block rounded-lg border bg-neutral-900 p-4 hover:bg-neutral-800/70 {show.archived_at
+						? 'border-neutral-800 opacity-60'
+						: 'border-neutral-800'}"
+				>
+					<div class="flex items-baseline justify-between gap-3">
+						<h2 class="text-lg font-medium text-neutral-100">
+							{show.title}
+							{#if show.archived_at}
+								<span class="ml-2 rounded bg-neutral-800 px-2 py-0.5 text-xs text-neutral-400">в архіві</span>
+							{/if}
+						</h2>
+						<span class="shrink-0 text-sm text-neutral-500">{formatDate(show.starts_at)}</span>
+					</div>
+					{#if show.venue}
+						<p class="mt-1 text-sm text-neutral-400">{show.venue}</p>
+					{/if}
+				</a>
+			</li>
+		{/each}
+	</ul>
+{/if}
