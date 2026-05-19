@@ -88,7 +88,12 @@ func main() {
 		Token:     cfg.TGToken,
 		Store:     botStore{st},
 		Coder:     coder,
-		Show:      bot.Show(show),
+		Show: bot.Show{
+			ID:       show.ID,
+			Title:    show.Title,
+			Venue:    show.Venue,
+			StartsAt: show.StartsAt,
+		},
 		JarLink:   cfg.JarLink,
 		Hold:      cfg.HoldDuration,
 		AdminTGID: cfg.AdminTGID,

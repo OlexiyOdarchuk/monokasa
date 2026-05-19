@@ -1,5 +1,7 @@
 # monokasa
 
+[![Built with Claude Code](https://img.shields.io/badge/Built%20with-Claude%20Code-D97757?logo=anthropic&logoColor=white)](https://claude.com/claude-code)
+
 Telegram-бот, що продає квитки на одну виставу через монобанку, видає
 квитки у вигляді PDF з QR-кодом і має веб-сторінку-сканер для контролю
 на вході.
@@ -19,7 +21,7 @@ TICKET_SECRET=$(openssl rand -hex 32)
 MONO_JAR_LINK=https://send.monobank.ua/jar/abc123
 EOF
 
-go build -o monokasa ./cmd/monokasa
+go build -o monokasa ./cmd/app
 ./monokasa
 ```
 
@@ -48,7 +50,7 @@ go build -o monokasa ./cmd/monokasa
 ## Архітектура
 
 ```
-cmd/monokasa/        # main: завантажує config, відкриває store, склеює бот+web+pay,
+cmd/app/             # main: завантажує config, відкриває store, склеює бот+web+pay,
                      # адаптери до go-monobank-sdk (webhook, reconcile, jar)
 internal/
   config/            # ENV → Config
@@ -67,7 +69,7 @@ internal/
 
 Внутрішні пакети **не імпортують один одного** — кожен оголошує власні
 типи і потрібні йому інтерфейси (`Store`, `Coder`, `Notifier`, `Renderer`).
-`cmd/monokasa/main.go` тримає всі адаптери і робить wiring. Завдяки цьому
+`cmd/app/main.go` тримає всі адаптери і робить wiring. Завдяки цьому
 будь-який пакет тривіально тестується ізольовано і будь-яку залежність
 можна підмінити на фейк.
 
@@ -98,7 +100,7 @@ godotenv підхопить.
 ## Запуск
 
 ```sh
-go build -o monokasa ./cmd/monokasa
+go build -o monokasa ./cmd/app
 ./monokasa
 ```
 

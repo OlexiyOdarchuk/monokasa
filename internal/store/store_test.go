@@ -265,6 +265,214 @@ func TestSweepExpiredHolds(t *testing.T) {
 	}
 }
 
+func TestCreateShowAndListShows(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	t1 := time.Date(2026, 6, 1, 19, 0, 0, 0, time.UTC)
+	t2 := time.Date(2026, 7, 1, 19, 0, 0, 0, time.UTC)
+	a, err := s.CreateShow(ctx, Show{Title: "A", Venue: "V1", StartsAt: t1}, 2, 2, 10000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := s.CreateShow(ctx, Show{Title: "B", Venue: "V2", StartsAt: t2}, 1, 1, 20000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a == b {
+		t.Fatalf("CreateShow should mint distinct ids, got %d twice", a)
+	}
+	shows, err := s.ListShows(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(shows) != 2 {
+		t.Fatalf("ListShows = %d, want 2", len(shows))
+	}
+	// Newest start first.
+	if shows[0].ID != b || shows[1].ID != a {
+		t.Errorf("ListShows order = [%d, %d], want [%d, %d]", shows[0].ID, shows[1].ID, b, a)
+	}
+	// CreatedAt populated from server clock.
+	if shows[0].CreatedAt.IsZero() {
+		t.Error("CreatedAt is zero, want non-zero")
+	}
+}
+
+func TestActiveShowPicksSoonestUpcoming(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	near := time.Now().Add(24 * time.Hour)
+	far := time.Now().Add(7 * 24 * time.Hour)
+	_, _ = s.CreateShow(ctx, Show{Title: "Far", StartsAt: far}, 1, 1, 100)
+	near1, _ := s.CreateShow(ctx, Show{Title: "Near", StartsAt: near}, 1, 1, 100)
+
+	active, err := s.ActiveShow(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active.ID != near1 {
+		t.Fatalf("ActiveShow = %d, want %d (soonest)", active.ID, near1)
+	}
+}
+
+func TestActiveShowFallbackToRecentPast(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	past := time.Now().Add(-2 * time.Hour)
+	id, _ := s.CreateShow(ctx, Show{Title: "Just ended", StartsAt: past}, 1, 1, 100)
+
+	active, err := s.ActiveShow(ctx)
+	if err != nil {
+		t.Fatalf("expected fallback to recent past, got %v", err)
+	}
+	if active.ID != id {
+		t.Fatalf("ActiveShow = %d, want %d", active.ID, id)
+	}
+}
+
+func TestActiveShowNothingReturnsError(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.ActiveShow(context.Background()); !errors.Is(err, ErrNoActiveShow) {
+		t.Fatalf("got %v, want ErrNoActiveShow", err)
+	}
+}
+
+func TestArchiveShowRemovesFromActive(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	id, _ := s.CreateShow(ctx, Show{Title: "X", StartsAt: time.Now().Add(24 * time.Hour)}, 1, 1, 100)
+	if err := s.ArchiveShow(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ActiveShow(ctx); !errors.Is(err, ErrNoActiveShow) {
+		t.Fatalf("after archive: got %v, want ErrNoActiveShow", err)
+	}
+	// Double-archive is a no-op (no row affected).
+	if err := s.ArchiveShow(ctx, id); !errors.Is(err, ErrShowNotFound) {
+		t.Fatalf("re-archive: got %v, want ErrShowNotFound", err)
+	}
+}
+
+func TestUpdateShowFields(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	id, _ := s.CreateShow(ctx, Show{Title: "Old", Venue: "Old", StartsAt: time.Now()}, 1, 1, 100)
+	newStart := time.Date(2027, 1, 1, 20, 0, 0, 0, time.UTC)
+	if err := s.UpdateShow(ctx, Show{ID: id, Title: "New", Venue: "New venue", StartsAt: newStart}); err != nil {
+		t.Fatal(err)
+	}
+	sh, _ := s.LoadShow(ctx, id)
+	if sh.Title != "New" || sh.Venue != "New venue" || !sh.StartsAt.Equal(newStart) {
+		t.Errorf("UpdateShow did not persist: %+v", sh)
+	}
+}
+
+func TestAddSeatAndConflict(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	showID, _ := s.CreateShow(ctx, Show{Title: "A", StartsAt: time.Now()}, 2, 2, 100)
+	// New row/col is fine.
+	added, err := s.AddSeat(ctx, NewSeat{
+		ShowID: showID, Row: 99, Col: 99, X: 500, Y: 500,
+		Label: "VIP-A", Category: "vip", PriceKopecks: 99900, Sellable: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if added.ID == 0 {
+		t.Error("AddSeat returned zero id")
+	}
+	// Existing row/col collides on UNIQUE constraint.
+	if _, err := s.AddSeat(ctx, NewSeat{ShowID: showID, Row: 1, Col: 1, PriceKopecks: 100, Sellable: true}); !errors.Is(err, ErrSeatExists) {
+		t.Fatalf("collision: got %v, want ErrSeatExists", err)
+	}
+}
+
+func TestUpdateSeatsBatch(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	showID, _ := s.CreateShow(ctx, Show{Title: "A", StartsAt: time.Now()}, 1, 2, 10000)
+	seats, _ := s.Seats(ctx, showID)
+	if len(seats) != 2 {
+		t.Fatalf("seed seats = %d, want 2", len(seats))
+	}
+	newX := 777.0
+	newPrice := int64(50000)
+	notSellable := false
+	newLabel := "балкон-1"
+	patches := []SeatPatch{
+		{ID: seats[0].ID, X: &newX, PriceKopecks: &newPrice, Label: &newLabel},
+		{ID: seats[1].ID, Sellable: &notSellable},
+	}
+	if err := s.UpdateSeats(ctx, patches); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.Seats(ctx, showID)
+	if got[0].X != newX || got[0].PriceKopecks != newPrice || got[0].Label != newLabel {
+		t.Errorf("seat[0] not updated: %+v", got[0])
+	}
+	if got[1].Sellable {
+		t.Errorf("seat[1].Sellable should be false")
+	}
+}
+
+func TestReserveNonSellableRejected(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	showID, _ := s.CreateShow(ctx, Show{Title: "A", StartsAt: time.Now()}, 1, 1, 100)
+	seats, _ := s.Seats(ctx, showID)
+	notSellable := false
+	if err := s.UpdateSeats(ctx, []SeatPatch{{ID: seats[0].ID, Sellable: &notSellable}}); err != nil {
+		t.Fatal(err)
+	}
+	// FindFreeSeat refuses it.
+	if _, err := s.FindFreeSeat(ctx, showID, 1, 1); !errors.Is(err, ErrSeatNotSellable) {
+		t.Fatalf("FindFreeSeat on non-sellable: got %v, want ErrSeatNotSellable", err)
+	}
+	// And so does Reserve directly (caller bypasses FindFreeSeat).
+	stale := seats[0]
+	stale.Sellable = true // pretend caller has stale data
+	if _, err := s.Reserve(ctx, stale, 1, 100, "X", "code0001", time.Minute); !errors.Is(err, ErrSeatNotSellable) {
+		t.Fatalf("Reserve on non-sellable: got %v, want ErrSeatNotSellable", err)
+	}
+}
+
+func TestRemoveSeatRequiresClean(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	showID, _ := s.CreateShow(ctx, Show{Title: "A", StartsAt: time.Now()}, 1, 2, 100)
+	seats, _ := s.Seats(ctx, showID)
+
+	// Untouched seat — removable.
+	if err := s.RemoveSeat(ctx, seats[0].ID); err != nil {
+		t.Fatalf("RemoveSeat clean: %v", err)
+	}
+	// Seat with even a cancelled reservation — not removable (history matters).
+	r, _ := s.Reserve(ctx, seats[1], 1, 100, "A", "code0001", time.Minute)
+	if _, _, err := s.CancelReservation(ctx, r.Code, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RemoveSeat(ctx, seats[1].ID); !errors.Is(err, ErrSeatHasReservations) {
+		t.Fatalf("RemoveSeat with cancelled res: got %v, want ErrSeatHasReservations", err)
+	}
+}
+
+func TestStatsExcludesNonSellableFromTotal(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	showID, _ := s.CreateShow(ctx, Show{Title: "A", StartsAt: time.Now()}, 1, 4, 100) // 4 seats
+	seats, _ := s.Seats(ctx, showID)
+	notSellable := false
+	// Mark one as aisle.
+	if err := s.UpdateSeats(ctx, []SeatPatch{{ID: seats[0].ID, Sellable: &notSellable}}); err != nil {
+		t.Fatal(err)
+	}
+	st, _ := s.Stats(ctx, showID)
+	if st.Total != 3 {
+		t.Errorf("Stats.Total = %d, want 3 (one seat is non-sellable)", st.Total)
+	}
+}
+
 func TestRemindFlow(t *testing.T) {
 	s := newTestStore(t)
 	showID := seedShow(t, s)
