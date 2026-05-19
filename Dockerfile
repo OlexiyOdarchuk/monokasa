@@ -28,9 +28,17 @@ RUN --mount=type=cache,target=/go/pkg/mod \
         -trimpath -ldflags="-s -w" \
         -o /out/monokasa ./cmd/app
 
+# Pre-create the SQLite data dir with nonroot ownership. Distroless has no
+# shell, so we can't chown at runtime — and Docker named volumes inherit
+# permissions from whatever the mount point looks like in the image. With
+# /data owned by 65532 (the nonroot uid in distroless), the volume comes
+# up writable for the running process on first start.
+RUN mkdir -p /out/data && chown 65532:65532 /out/data
+
 # Stage 3 — distroless runtime, nonroot. Nothing else to ship.
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=backend /out/monokasa /monokasa
+COPY --from=backend --chown=nonroot:nonroot /out/data /data
 EXPOSE 8093
 USER nonroot:nonroot
 ENTRYPOINT ["/monokasa"]
