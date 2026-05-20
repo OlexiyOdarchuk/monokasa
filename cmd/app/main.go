@@ -107,10 +107,9 @@ func main() {
 	tg, err := bot.New(bot.Options{
 		Token:     cfg.TGToken,
 		Store:     botStore{st},
-		Coder:     coder,
 		ShowFn:    botShowFn,
+		BaseURL:   cfg.BaseURL,
 		JarLink:   cfg.JarLink,
-		Hold:      cfg.HoldDuration,
 		AdminTGID: cfg.AdminTGID,
 	})
 	if err != nil {
@@ -494,43 +493,43 @@ func toBotSeat(s store.Seat) bot.Seat {
 	}
 }
 
-func fromBotSeat(s bot.Seat) store.Seat {
-	return store.Seat{
-		ID:           s.ID,
-		ShowID:       s.ShowID,
-		Row:          s.Row,
-		Col:          s.Col,
-		PriceKopecks: s.Price.Minor,
+func toBotShow(s store.Show) bot.Show {
+	return bot.Show{
+		ID: s.ID, Slug: s.Slug, Title: s.Title, Venue: s.Venue, StartsAt: s.StartsAt,
 	}
 }
 
-func (b botStore) Seats(ctx context.Context, showID int64) ([]bot.Seat, error) {
-	seats, err := b.s.Seats(ctx, showID)
+// Shows lists non-archived shows whose start is in the future or within
+// the last two hours — same window the public landing uses, so the bot
+// "афіша" doesn't drift from monokasa.app.
+func (b botStore) Shows(ctx context.Context) ([]bot.Show, error) {
+	shows, err := b.s.ListShows(ctx)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]bot.Seat, len(seats))
-	for i, s := range seats {
-		out[i] = toBotSeat(s)
+	now := time.Now()
+	out := make([]bot.Show, 0, len(shows))
+	for _, sh := range shows {
+		if sh.ArchivedAt != nil {
+			continue
+		}
+		if sh.StartsAt.Before(now.Add(-2 * time.Hour)) {
+			continue
+		}
+		out = append(out, toBotShow(sh))
 	}
 	return out, nil
 }
 
-func (b botStore) SeatStatuses(ctx context.Context, showID int64) (map[int64]bot.SeatStatus, error) {
-	in, err := b.s.SeatStatuses(ctx, showID)
+func (b botStore) FindShowBySlug(ctx context.Context, slug string) (bot.Show, error) {
+	sh, err := b.s.LoadShowBySlug(ctx, slug)
+	if errors.Is(err, store.ErrShowNotFound) {
+		return bot.Show{}, bot.ErrShowNotFound
+	}
 	if err != nil {
-		return nil, err
+		return bot.Show{}, err
 	}
-	out := make(map[int64]bot.SeatStatus, len(in))
-	for id, st := range in {
-		out[id] = bot.SeatStatus(st)
-	}
-	return out, nil
-}
-
-func (b botStore) FindFreeSeat(ctx context.Context, showID int64, row, col int) (bot.Seat, error) {
-	s, err := b.s.FindFreeSeat(ctx, showID, row, col)
-	return toBotSeat(s), translateStoreErr(err)
+	return toBotShow(sh), nil
 }
 
 func toBotReservation(r store.Reservation) bot.Reservation {
@@ -545,16 +544,6 @@ func toBotReservation(r store.Reservation) bot.Reservation {
 		ExpiresAt:   r.ExpiresAt,
 		ConfirmedAt: r.ConfirmedAt,
 	}
-}
-
-func (b botStore) Reserve(
-	ctx context.Context, seat bot.Seat, tgUserID, tgChatID int64,
-	buyerName, code string, hold time.Duration,
-) (bot.Reservation, error) {
-	// Bot users get their tickets through Telegram; no email channel
-	// involved, so the buyer_email column stays empty for these rows.
-	r, err := b.s.Reserve(ctx, fromBotSeat(seat), tgUserID, tgChatID, buyerName, "", code, hold)
-	return toBotReservation(r), translateStoreErr(err)
 }
 
 func (b botStore) CancelReservation(ctx context.Context, code string, tgUserID int64) (bot.Reservation, bot.Seat, error) {
@@ -594,11 +583,7 @@ func translateStoreErr(err error) error {
 	switch err {
 	case nil:
 		return nil
-	case store.ErrSeatTaken:
-		return bot.ErrSeatTaken
-	case store.ErrSeatNotFound:
-		return bot.ErrSeatNotFound
-	case store.ErrCodeNotFound:
+	case store.ErrCodeNotFound, store.ErrShowNotFound:
 		return bot.ErrCodeNotFound
 	case store.ErrAlreadyPaid:
 		return bot.ErrAlreadyPaid

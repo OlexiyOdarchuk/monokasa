@@ -1,5 +1,16 @@
-// Package bot is the Telegram side of the ticket app: seat picking,
-// payment instructions, cancellation, /my, /stats.
+// Package bot is the Telegram side of the ticket app.
+//
+// UX model (PR #5f1):
+//   - /start без deep-link: показуємо афішу — inline keyboard з усіма
+//     актуальними подіями.
+//   - Тап події → меню події з кнопками "📍 Обрати місце" (WebApp →
+//     /event/<slug>), "🎟 Мої бронювання", "↩ До списку".
+//   - /start res_<code>: deep link з public web-flow; прив'язує цей
+//     чат до резервації, щоб PDF прийшов сюди після оплати.
+//
+// Map-pick через inline kb (старий 5×6 grid) прибрано — мапа місць
+// тепер живе у Telegram Mini App (/event/<slug>). Це уніфікує UX
+// з вебом і знімає обмеження на ~8 кнопок у рядок.
 package bot
 
 import (
@@ -11,7 +22,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -19,15 +29,19 @@ import (
 	tele "gopkg.in/telebot.v3"
 )
 
-// Show is the subset of show info the bot needs.
+// Show is the subset of show info the bot needs. Slug is used to build
+// the WebApp / public-link URLs the bot ships to buyers.
 type Show struct {
 	ID       int64
+	Slug     string
 	Title    string
 	Venue    string
 	StartsAt time.Time
 }
 
-// Seat is the subset of seat info the bot needs.
+// Seat is the subset of seat info the bot needs (for reservation cards,
+// reminders, ticket captions). The map-pick UI doesn't live in the bot
+// any more — only delivery and admin commands surface seat info.
 type Seat struct {
 	ID       int64
 	ShowID   int64
@@ -54,7 +68,7 @@ type MyItem struct {
 	Seat        Seat
 }
 
-// Stats is an admin snapshot of the only show.
+// Stats is an admin snapshot of one show.
 type Stats struct {
 	Total   int
 	Sold    int
@@ -63,7 +77,7 @@ type Stats struct {
 	Revenue money.Money
 }
 
-// SeatStatus is one of "free", "held", "sold".
+// SeatStatus reflects the live availability of a seat.
 type SeatStatus string
 
 const (
@@ -74,20 +88,21 @@ const (
 
 // Domain errors the bot expects the Store to return.
 var (
-	ErrSeatTaken      = errors.New("seat is already reserved or sold")
-	ErrSeatNotFound   = errors.New("seat does not exist for this show")
 	ErrCodeNotFound   = errors.New("reservation code not found")
 	ErrAlreadyPaid    = errors.New("reservation already confirmed")
 	ErrAlreadyClosed  = errors.New("reservation already closed")
 	ErrNotYourBooking = errors.New("reservation belongs to another user")
+	ErrShowNotFound   = errors.New("show not found")
 )
 
 // Store is the persistence behavior the bot needs.
 type Store interface {
-	Seats(ctx context.Context, showID int64) ([]Seat, error)
-	SeatStatuses(ctx context.Context, showID int64) (map[int64]SeatStatus, error)
-	FindFreeSeat(ctx context.Context, showID int64, row, col int) (Seat, error)
-	Reserve(ctx context.Context, seat Seat, tgUserID, tgChatID int64, buyerName, code string, hold time.Duration) (Reservation, error)
+	// Shows lists upcoming, non-archived shows — used to render the
+	// "афіша" menu when the user runs /start without a deep link.
+	Shows(ctx context.Context) ([]Show, error)
+	// FindShowBySlug resolves a slug from a "show:<slug>" callback into
+	// the full Show record.
+	FindShowBySlug(ctx context.Context, slug string) (Show, error)
 	CancelReservation(ctx context.Context, code string, tgUserID int64) (Reservation, Seat, error)
 	MyReservations(ctx context.Context, tgUserID int64) ([]MyItem, error)
 	Stats(ctx context.Context, showID int64) (Stats, error)
@@ -98,11 +113,6 @@ type Store interface {
 	LinkReservationToTGChat(ctx context.Context, code string, tgUserID, tgChatID int64) (Reservation, Seat, error)
 }
 
-// Coder issues short reservation codes.
-type Coder interface {
-	NewCode() (string, error)
-}
-
 // ReconcileResult is the outcome of a /reconcile sweep.
 type ReconcileResult struct {
 	Scanned int // transactions examined
@@ -111,9 +121,7 @@ type ReconcileResult struct {
 
 // Reconciler scans recent statement entries and confirms any whose
 // reservation code matches an open booking — a rescue net for webhook
-// events Mono never delivered. The optional progress callback is invoked
-// between accounts so the bot can keep the admin informed during the
-// minute-long monobank rate-limit waits.
+// events Mono never delivered.
 type Reconciler interface {
 	Reconcile(ctx context.Context, lookback time.Duration, progress func(string)) (ReconcileResult, error)
 }
@@ -131,44 +139,29 @@ type JarLookup interface {
 	Balance(ctx context.Context) (JarBalance, error)
 }
 
-// ShowFn returns the currently active show. Called on every handler that
-// needs show metadata so admin edits via the web UI take effect without
-// restarting the bot. Returning an error tells callers to surface a
-// friendly "no active event right now" message rather than crashing the
-// command.
+// ShowFn resolves the currently active show. Used by reminders and the
+// /stats command for "the most relevant show right now".
 type ShowFn func(ctx context.Context) (Show, error)
 
 type Bot struct {
 	tb         *tele.Bot
 	store      Store
-	coder      Coder
-	showFn     ShowFn
+	baseURL    string // e.g. https://monokasa.app — used for WebApp deep links
 	jarLink    string
-	hold       time.Duration
 	adminTGID  int64
 	reconciler Reconciler // optional — nil if MONO_TOKEN missing
 	jar        JarLookup  // optional — nil if jar link unparseable
+	showFn     ShowFn
 
-	// pending tracks users who clicked a seat and are about to type their
-	// name. Keyed by Telegram user ID; value is pendingPick. A background
-	// sweeper drops entries past Until so abandoned picks don't accumulate
-	// for the lifetime of the process.
-	pending sync.Map
-	done    chan struct{}
-}
-
-type pendingPick struct {
-	Row, Col int
-	Until    time.Time
+	done chan struct{}
 }
 
 type Options struct {
 	Token      string
 	Store      Store
-	Coder      Coder
-	ShowFn     ShowFn // resolves the active show at call time
+	ShowFn     ShowFn
+	BaseURL    string // optional; without it WebApp buttons fall back to plain URL share
 	JarLink    string
-	Hold       time.Duration
 	AdminTGID  int64
 	Reconciler Reconciler // optional
 	Jar        JarLookup  // optional
@@ -183,27 +176,14 @@ func New(opts Options) (*Bot, error) {
 		return nil, err
 	}
 	b := &Bot{
-		tb: tb, store: opts.Store, coder: opts.Coder, showFn: opts.ShowFn,
-		jarLink: opts.JarLink, hold: opts.Hold, adminTGID: opts.AdminTGID,
+		tb: tb, store: opts.Store, showFn: opts.ShowFn,
+		baseURL: strings.TrimRight(opts.BaseURL, "/"),
+		jarLink: opts.JarLink, adminTGID: opts.AdminTGID,
 		reconciler: opts.Reconciler, jar: opts.Jar,
 		done: make(chan struct{}),
 	}
 	b.routes()
-	go b.sweepPending(time.Minute)
 	return b, nil
-}
-
-// activeShow resolves the show with a short context so a hung DB doesn't
-// freeze the bot handler. Errors are wrapped with friendly user-facing
-// text the caller can pass straight to c.Send.
-func (b *Bot) activeShow(ctx context.Context) (Show, string) {
-	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	sh, err := b.showFn(ctx)
-	if err != nil {
-		return Show{}, "Зараз немає активної події. Загляни пізніше."
-	}
-	return sh, ""
 }
 
 func (b *Bot) Start() { b.tb.Start() }
@@ -217,29 +197,7 @@ func (b *Bot) Stop() {
 	b.tb.Stop()
 }
 
-// sweepPending drops pending picks whose TTL has lapsed. Without this an
-// abandoned pick lives for the lifetime of the process — small, but real.
-func (b *Bot) sweepPending(every time.Duration) {
-	tick := time.NewTicker(every)
-	defer tick.Stop()
-	for {
-		select {
-		case <-b.done:
-			return
-		case now := <-tick.C:
-			b.pending.Range(func(k, v any) bool {
-				if p, ok := v.(pendingPick); ok && now.After(p.Until) {
-					b.pending.Delete(k)
-				}
-				return true
-			})
-		}
-	}
-}
-
 // SetReconciler wires the rescue-net scanner. Pass nil to disable.
-// Used when the reconciler depends on something built after the bot
-// (e.g., a pay.Processor that itself needs the bot as a notifier).
 func (b *Bot) SetReconciler(r Reconciler) { b.reconciler = r }
 
 // SetJar wires the jar-balance lookup. Pass nil to disable.
@@ -258,8 +216,6 @@ func (b *Bot) SendTicket(chatID int64, seat Seat, pdf []byte) error {
 
 // NotifyShowSoon pings a buyer about the upcoming show. Title is fetched
 // fresh so an admin rename right before show-time lands in the reminder.
-// Falls back to a generic "захід" on lookup failure rather than blocking
-// the reminder over a transient DB hiccup.
 func (b *Bot) NotifyShowSoon(chatID int64, seat Seat, when time.Time) error {
 	title := "захід"
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -275,126 +231,62 @@ func (b *Bot) NotifyShowSoon(chatID int64, seat Seat, when time.Time) error {
 
 func (b *Bot) routes() {
 	b.tb.Handle("/start", b.handleStart)
-	b.tb.Handle("/seats", b.handleSeats)
+	b.tb.Handle("/help", b.handleStart)
+	b.tb.Handle("/events", b.handleEvents)
+	b.tb.Handle("/seats", b.handleEvents) // legacy alias
 	b.tb.Handle("/my", b.handleMy)
 	b.tb.Handle("/stats", b.handleStats)
 	b.tb.Handle("/reconcile", b.handleReconcile)
 	b.tb.Handle("/jar", b.handleJar)
-	b.tb.Handle(tele.OnText, b.handleText)
 	b.tb.Handle(tele.OnCallback, b.handleCallback)
 }
 
+// --- /start ---
+
 func (b *Bot) handleStart(c tele.Context) error {
-	// Deep-link from web-buyer flow: `/start res_<code>` attaches this
+	// Deep-link from public web flow: /start res_<code> attaches this
 	// chat to that reservation so the bot delivers the PDF on payment.
 	payload := strings.TrimSpace(c.Message().Payload)
 	if rest, ok := strings.CutPrefix(payload, "res_"); ok && rest != "" {
 		return b.linkReservation(c, rest)
 	}
-
-	cmds := "  /seats — мапа місць\n  /my — мої бронювання\n"
-	if b.adminTGID != 0 && c.Sender().ID == b.adminTGID {
-		cmds += "  /stats — статистика (адмін)\n  /reconcile — звірити пропущені оплати (адмін)\n  /jar — баланс банки (адмін)\n"
-	}
-	show, friendly := b.activeShow(context.Background())
-	if friendly != "" {
-		return c.Send(friendly)
-	}
-	return c.Send(fmt.Sprintf(
-		"Вітаю! Це бот продажу квитків на %q (%s, %s).\n\n"+
-			"Команди:\n%s\n"+
-			"Щоб купити: натисни /seats → обери вільне місце.",
-		show.Title, show.Venue, formatDateTime(show.StartsAt), cmds))
+	return b.sendEventList(c, "Привіт! Це бот продажу квитків. Обери подію:")
 }
 
-// linkReservation attaches the current Telegram chat to a web-flow
-// reservation. Called from /start res_<code> deep links generated by the
-// public buyer page. After linking, the pay processor's Telegram
-// delivery path activates for this reservation.
-func (b *Bot) linkReservation(c tele.Context, code string) error {
-	sender := c.Sender()
-	if sender == nil {
-		return nil
-	}
+func (b *Bot) handleEvents(c tele.Context) error {
+	return b.sendEventList(c, "📅 Афіша:")
+}
+
+// sendEventList renders the upcoming-shows menu as an inline keyboard.
+// Each button carries "show:<slug>" so the callback handler can fetch
+// fresh data on tap (titles can change in the admin web).
+func (b *Bot) sendEventList(c tele.Context, header string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	r, seat, err := b.store.LinkReservationToTGChat(ctx, code, sender.ID, c.Chat().ID)
-	switch {
-	case errors.Is(err, ErrCodeNotFound):
-		return c.Send("Цю бронь не знайдено. Можливо, посилання застаріле.")
-	case errors.Is(err, ErrAlreadyClosed):
-		return c.Send("Цю бронь вже скасовано.")
-	case err != nil:
-		slog.Error("link reservation", "code", code, "err", err)
+	shows, err := b.store.Shows(ctx)
+	if err != nil {
+		slog.Error("list shows", "err", err)
 		return c.Send("Внутрішня помилка, спробуй пізніше.")
 	}
-
-	if r.ConfirmedAt != nil {
-		// Linking after payment is allowed but the PDF was already sent
-		// via email at confirm-time. We don't re-render here (no PDF
-		// caching); operator can resend from admin if needed.
-		return c.Send(fmt.Sprintf(
-			"Бронь вже оплачена 🎉\nРяд %d, місце %d.\nКвиток із QR прийшов на email — перевір пошту.",
-			seat.Row, seat.Col))
-	}
-	return c.Send(fmt.Sprintf(
-		"Підключив цю бронь до Telegram ✅\nРяд %d, місце %d.\nПісля оплати квиток із QR прийде сюди (і на email також).",
-		seat.Row, seat.Col))
-}
-
-func (b *Bot) handleSeats(c tele.Context) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	show, friendly := b.activeShow(ctx)
-	if friendly != "" {
-		return c.Send(friendly)
-	}
-	seats, err := b.store.Seats(ctx, show.ID)
-	if err != nil {
-		return c.Send("storage error: " + err.Error())
-	}
-	status, err := b.store.SeatStatuses(ctx, show.ID)
-	if err != nil {
-		return c.Send("storage error: " + err.Error())
-	}
-
-	rows := make(map[int][]Seat)
-	maxRow := 0
-	for _, s := range seats {
-		rows[s.Row] = append(rows[s.Row], s)
-		if s.Row > maxRow {
-			maxRow = s.Row
-		}
+	if len(shows) == 0 {
+		return c.Send("Зараз подій немає. Загляни пізніше 🎭")
 	}
 
 	markup := &tele.ReplyMarkup{}
-	keyboard := make([][]tele.InlineButton, 0, maxRow)
-	for r := 1; r <= maxRow; r++ {
-		kbRow := make([]tele.InlineButton, 0, len(rows[r]))
-		for _, s := range rows[r] {
-			label := fmt.Sprintf("%d", s.Col)
-			switch status[s.ID] {
-			case SeatSold:
-				label = "✖"
-			case SeatHeld:
-				label = "…"
-			}
-			kbRow = append(kbRow, tele.InlineButton{
-				Unique: "seat",
-				Text:   label,
-				Data:   fmt.Sprintf("%d:%d", s.Row, s.Col),
-			})
-		}
-		keyboard = append(keyboard, kbRow)
+	rows := make([][]tele.InlineButton, 0, len(shows))
+	for _, sh := range shows {
+		rows = append(rows, []tele.InlineButton{{
+			Unique: "show",
+			Text:   fmt.Sprintf("%s · %s", sh.Title, formatDateShort(sh.StartsAt)),
+			Data:   sh.Slug,
+		}})
 	}
-	markup.InlineKeyboard = keyboard
-
-	header := "🎭 ━━━━━ СЦЕНА ━━━━━ 🎭\n               ▲ попереду\n\n"
-	return c.Send(fmt.Sprintf("%sРяд 1 — найближче до сцени.\nНатисни вільне місце, щоб забронювати.\nЦіна: %s",
-		header, seats[0].Price), markup)
+	markup.InlineKeyboard = rows
+	return c.Send(header, markup)
 }
+
+// --- callbacks ---
 
 func (b *Bot) handleCallback(c tele.Context) error {
 	cb := c.Callback()
@@ -402,57 +294,68 @@ func (b *Bot) handleCallback(c tele.Context) error {
 		return nil
 	}
 	switch {
-	case strings.HasPrefix(cb.Data, "\fseat|"):
-		return b.callbackSeat(c, cb)
+	case strings.HasPrefix(cb.Data, "\fshow|"):
+		return b.callbackShow(c, cb)
 	case strings.HasPrefix(cb.Data, "\fcancel|"):
 		return b.callbackCancel(c, cb)
+	case strings.HasPrefix(cb.Data, "\fevents|"):
+		_ = c.Respond(&tele.CallbackResponse{})
+		return b.sendEventList(c, "📅 Афіша:")
 	}
 	return c.Respond(&tele.CallbackResponse{Text: "unknown action"})
 }
 
-// pendingTTL bounds how long a user has to type their name after picking a
-// seat. Long enough for someone to switch apps and come back; short enough
-// that an abandoned pick doesn't reserve mind-share.
-const pendingTTL = 10 * time.Minute
-
-func (b *Bot) callbackSeat(c tele.Context, cb *tele.Callback) error {
-	data := strings.TrimPrefix(cb.Data, "\fseat|")
-	parts := strings.SplitN(data, ":", 2)
-	if len(parts) != 2 {
-		return c.Respond(&tele.CallbackResponse{Text: "bad seat"})
-	}
-	row, err1 := strconv.Atoi(parts[0])
-	col, err2 := strconv.Atoi(parts[1])
-	if err1 != nil || err2 != nil {
-		return c.Respond(&tele.CallbackResponse{Text: "bad seat"})
-	}
-
+// callbackShow renders the per-event menu after the user tapped a show
+// from the афіша list. The "Обрати місце" button is a Telegram WebApp
+// button → opens /event/<slug> as a Mini App. Falls back to plain link
+// when BASE_URL isn't configured.
+func (b *Bot) callbackShow(c tele.Context, cb *tele.Callback) error {
+	slug := strings.TrimPrefix(cb.Data, "\fshow|")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	show, friendlyErr := b.activeShow(ctx)
-	if friendlyErr != "" {
-		return c.Respond(&tele.CallbackResponse{Text: friendlyErr})
+	sh, err := b.store.FindShowBySlug(ctx, slug)
+	if errors.Is(err, ErrShowNotFound) {
+		return c.Respond(&tele.CallbackResponse{Text: "Подію не знайдено"})
 	}
-	// Pre-check the seat is free so we don't ask for a name on a taken seat.
-	// We re-check on Reserve to close the (small) race window.
-	seat, err := b.store.FindFreeSeat(ctx, show.ID, row, col)
 	if err != nil {
-		return c.Respond(&tele.CallbackResponse{Text: friendly(err)})
+		slog.Error("find show", "slug", slug, "err", err)
+		return c.Respond(&tele.CallbackResponse{Text: "Помилка"})
+	}
+	_ = c.Respond(&tele.CallbackResponse{})
+
+	markup := &tele.ReplyMarkup{}
+	pickRow := []tele.InlineButton{}
+	if b.baseURL != "" {
+		pickRow = append(pickRow, tele.InlineButton{
+			Text:   "📍 Обрати місце",
+			WebApp: &tele.WebApp{URL: fmt.Sprintf("%s/event/%s", b.baseURL, sh.Slug)},
+		})
+	}
+	markup.InlineKeyboard = [][]tele.InlineButton{
+		pickRow,
+		{{Unique: "events", Text: "↩ До списку", Data: "back"}},
+	}
+	if len(pickRow) == 0 {
+		// No BASE_URL — share the URL anyway so the user can open it
+		// manually in a browser. Better than a dead-end card.
+		markup.InlineKeyboard = [][]tele.InlineButton{
+			{{Unique: "events", Text: "↩ До списку", Data: "back"}},
+		}
 	}
 
-	b.pending.Store(cb.Sender.ID, pendingPick{
-		Row: row, Col: col,
-		Until: time.Now().Add(pendingTTL),
-	})
-	_ = c.Respond(&tele.CallbackResponse{Text: "Введи ім'я"})
-
-	_, err = b.tb.Send(cb.Sender, fmt.Sprintf(
-		"Місце ряд %d · %d вибрано.\n"+
-			"Введи ім'я та прізвище — вони будуть надруковані на квитку:",
-		seat.Row, seat.Col),
-		&tele.ReplyMarkup{ForceReply: true, Selective: true})
-	return err
+	text := fmt.Sprintf("🎭 *%s*\n📅 %s\n",
+		escapeMarkdown(sh.Title), formatDateTime(sh.StartsAt))
+	if sh.Venue != "" {
+		text += "📍 " + escapeMarkdown(sh.Venue) + "\n"
+	}
+	if b.baseURL == "" {
+		text += fmt.Sprintf("\nЩоб обрати місце — відкрий у браузері:\nmonokasa/event/%s",
+			escapeMarkdown(sh.Slug))
+	} else {
+		text += "\nТицяй *📍 Обрати місце* — відкриється мапа залу."
+	}
+	return c.Send(text, tele.ModeMarkdown, markup)
 }
 
 func (b *Bot) callbackCancel(c tele.Context, cb *tele.Callback) error {
@@ -479,6 +382,39 @@ func (b *Bot) callbackCancel(c tele.Context, cb *tele.Callback) error {
 	return err
 }
 
+// --- /start res_<code> deep-link from web-buyer ---
+
+func (b *Bot) linkReservation(c tele.Context, code string) error {
+	sender := c.Sender()
+	if sender == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	r, seat, err := b.store.LinkReservationToTGChat(ctx, code, sender.ID, c.Chat().ID)
+	switch {
+	case errors.Is(err, ErrCodeNotFound):
+		return c.Send("Цю бронь не знайдено. Можливо, посилання застаріле.")
+	case errors.Is(err, ErrAlreadyClosed):
+		return c.Send("Цю бронь вже скасовано.")
+	case err != nil:
+		slog.Error("link reservation", "code", code, "err", err)
+		return c.Send("Внутрішня помилка, спробуй пізніше.")
+	}
+
+	if r.ConfirmedAt != nil {
+		return c.Send(fmt.Sprintf(
+			"Бронь вже оплачена 🎉\nРяд %d, місце %d.\nКвиток із QR прийшов на email — перевір пошту.",
+			seat.Row, seat.Col))
+	}
+	return c.Send(fmt.Sprintf(
+		"Підключив цю бронь до Telegram ✅\nРяд %d, місце %d.\nПісля оплати квиток із QR прийде сюди (і на email також).",
+		seat.Row, seat.Col))
+}
+
+// --- /my ---
+
 func (b *Bot) handleMy(c tele.Context) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -488,7 +424,7 @@ func (b *Bot) handleMy(c tele.Context) error {
 		return c.Send("storage error: " + err.Error())
 	}
 	if len(items) == 0 {
-		return c.Send("У тебе ще немає бронювань. /seats — мапа місць.")
+		return c.Send("У тебе ще немає бронювань. /events — афіша.")
 	}
 
 	var out strings.Builder
@@ -507,6 +443,8 @@ func (b *Bot) handleMy(c tele.Context) error {
 	}
 	return c.Send(out.String(), tele.ModeMarkdown)
 }
+
+// --- /stats (admin) ---
 
 func (b *Bot) handleStats(c tele.Context) error {
 	if b.adminTGID == 0 || c.Sender().ID != b.adminTGID {
@@ -531,9 +469,23 @@ func (b *Bot) handleStats(c tele.Context) error {
 			"в очікуванні оплати: *%d*\n"+
 			"вільно: *%d*\n\n"+
 			"виторг: *%s*",
-		show.Title, show.Venue, formatDateTime(show.StartsAt),
+		escapeMarkdown(show.Title), escapeMarkdown(show.Venue), formatDateTime(show.StartsAt),
 		st.Total, st.Sold, st.Held, st.Free, st.Revenue), tele.ModeMarkdown)
 }
+
+// activeShow resolves the show with a short context so a hung DB doesn't
+// freeze the bot handler. Returns friendly user-facing text on error.
+func (b *Bot) activeShow(ctx context.Context) (Show, string) {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	sh, err := b.showFn(ctx)
+	if err != nil {
+		return Show{}, "Зараз немає активної події."
+	}
+	return sh, ""
+}
+
+// --- /reconcile (admin) ---
 
 func (b *Bot) handleReconcile(c tele.Context) error {
 	if b.adminTGID == 0 || c.Sender().ID != b.adminTGID {
@@ -542,7 +494,6 @@ func (b *Bot) handleReconcile(c tele.Context) error {
 	if b.reconciler == nil {
 		return c.Send("Реконсайл недоступний: MONO_TOKEN не налаштований.")
 	}
-	// Default lookback: 24h. "/reconcile 7d" — explicit window.
 	lookback := 24 * time.Hour
 	if args := strings.TrimSpace(c.Message().Payload); args != "" {
 		d, err := time.ParseDuration(args)
@@ -557,13 +508,8 @@ func (b *Bot) handleReconcile(c tele.Context) error {
 	progressMsg, err := b.tb.Send(c.Chat(),
 		fmt.Sprintf("⏳ Шукаю пропущені оплати за останні %s…", lookback))
 	if err != nil {
-		// If we can't even send the ack, do the work anyway and hope the
-		// final reply lands.
 		slog.Warn("reconcile ack", "err", err)
 	}
-	// Live-edit the progress message instead of spamming. Mono is rate-
-	// limited to 1 request/60s per account, so updates fire at most once
-	// a minute — well within Telegram's edit budget.
 	progress := func(s string) {
 		if progressMsg == nil {
 			return
@@ -583,6 +529,8 @@ func (b *Bot) handleReconcile(c tele.Context) error {
 		res.Scanned, res.Matched), tele.ModeMarkdown)
 }
 
+// --- /jar (admin) ---
+
 func (b *Bot) handleJar(c tele.Context) error {
 	if b.adminTGID == 0 || c.Sender().ID != b.adminTGID {
 		return c.Send("⛔️ команда тільки для адміна")
@@ -596,9 +544,9 @@ func (b *Bot) handleJar(c tele.Context) error {
 	if err != nil {
 		return c.Send("Помилка: " + err.Error())
 	}
-	out := fmt.Sprintf("🏦 *%s*\n", info.Title)
+	out := fmt.Sprintf("🏦 *%s*\n", escapeMarkdown(info.Title))
 	if info.Owner != "" {
-		out += "власник: " + info.Owner + "\n"
+		out += "власник: " + escapeMarkdown(info.Owner) + "\n"
 	}
 	out += "зібрано: *" + info.Balance.String() + "*"
 	if !info.Goal.IsZero() {
@@ -607,82 +555,15 @@ func (b *Bot) handleJar(c tele.Context) error {
 	return c.Send(out, tele.ModeMarkdown)
 }
 
-func (b *Bot) handleText(c tele.Context) error {
-	sender := c.Sender()
-	if sender == nil {
-		return nil
-	}
-	raw, ok := b.pending.Load(sender.ID)
-	if !ok {
-		return nil // user typed text but isn't in name-input mode
-	}
-	pick, ok := raw.(pendingPick)
-	if !ok {
-		b.pending.Delete(sender.ID)
-		return nil
-	}
-	if time.Now().After(pick.Until) {
-		b.pending.Delete(sender.ID)
-		return c.Send("Час очікування імені вийшов. Натисни /seats і вибери місце ще раз.")
-	}
+// --- name normalisation (still used by validation of buyer name fields
+// passed in elsewhere; keep for backward compat with /reserve flow if it
+// ever returns to the bot). ---
 
-	name, err := normalizeName(c.Text())
-	if err != nil {
-		return c.Send(err.Error() + "\nСпробуй ще раз:")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	show, friendlyErr := b.activeShow(ctx)
-	if friendlyErr != "" {
-		b.pending.Delete(sender.ID)
-		return c.Send(friendlyErr)
-	}
-	seat, err := b.store.FindFreeSeat(ctx, show.ID, pick.Row, pick.Col)
-	if err != nil {
-		b.pending.Delete(sender.ID)
-		return c.Send(friendly(err))
-	}
-	code, err := b.coder.NewCode()
-	if err != nil {
-		return c.Send("Внутрішня помилка, спробуй пізніше")
-	}
-	r, err := b.store.Reserve(ctx, seat, sender.ID, c.Chat().ID, name, code, b.hold)
-	if err != nil {
-		b.pending.Delete(sender.ID)
-		return c.Send(friendly(err))
-	}
-	b.pending.Delete(sender.ID)
-
-	payURL := jarPrefillURL(b.jarLink, seat.Price, r.Code)
-	payBtn := tele.InlineButton{Text: "💳 Оплатити", URL: payURL}
-	cancelBtn := tele.InlineButton{Unique: "cancel", Text: "✖ Скасувати бронь", Data: r.Code}
-	// Pay on top, cancel below — reach-for-the-first-button habit lands on
-	// the safe action, not the destructive one.
-	markup := &tele.ReplyMarkup{InlineKeyboard: [][]tele.InlineButton{{payBtn}, {cancelBtn}}}
-
-	return c.Send(fmt.Sprintf(
-		"Місце забронювано: ряд %d, місце %d.\n"+
-			"На квитку буде: *%s*\n\n"+
-			"💳 Натисни *Оплатити* — сума й коментар вже вписані.\n"+
-			"Код у коментарі — `%s`.\n"+
-			"Бронювання дійсне до %s. Після оплати бот сам пришле PDF.",
-		seat.Row, seat.Col, name, r.Code, formatClock(r.ExpiresAt)),
-		tele.ModeMarkdown,
-		&tele.SendOptions{DisableWebPagePreview: true},
-		markup)
-}
-
-// nameMaxRunes caps the buyer name at a length that fits one line of the
-// A6 PDF (105mm wide) at font size 11. Names longer than this either wrap
-// or visually crowd the seat callout below.
 const nameMaxRunes = 60
 
-// normalizeName trims, collapses spaces and enforces a 2–nameMaxRunes rune
+// normalizeName trims, collapses spaces and enforces 2..nameMaxRunes rune
 // length. Letters, digits, spaces, apostrophes, hyphens and dots are
-// accepted — enough for Ukrainian double-barrelled names like
-// "Анна-Марія О'Брайен".
+// accepted — enough for Ukrainian double-barrelled names.
 func normalizeName(in string) (string, error) {
 	n := strings.Join(strings.Fields(in), " ")
 	rc := utf8.RuneCountInString(n)
@@ -695,9 +576,9 @@ func normalizeName(in string) (string, error) {
 	return n, nil
 }
 
-// jarPrefillURL appends ?a=<amount>&t=<comment>. Short keys are what mono's
-// jar page actually honours in practice. Amount is currency-aware: UAH renders
-// as "250" / "250.99", JPY as a bare integer.
+// jarPrefillURL appends ?a=<amount>&t=<comment> to the jar share URL so
+// monobank opens with sum and comment pre-filled. Currency-aware: UAH
+// renders as "250" / "250.99"; JPY as a bare integer (no decimals).
 func jarPrefillURL(base string, price money.Money, comment string) string {
 	u, err := url.Parse(base)
 	if err != nil {
@@ -721,16 +602,7 @@ func jarPrefillURL(base string, price money.Money, comment string) string {
 	return u.String()
 }
 
-func friendly(err error) string {
-	switch {
-	case errors.Is(err, ErrSeatTaken):
-		return "Це місце вже зайняте"
-	case errors.Is(err, ErrSeatNotFound):
-		return "Такого місця нема"
-	default:
-		return "Помилка"
-	}
-}
+// --- formatters ---
 
 var ukMonthsGenitive = [...]string{
 	"січня", "лютого", "березня", "квітня", "травня", "червня",
@@ -742,4 +614,17 @@ func formatDateTime(t time.Time) string {
 		t.Day(), ukMonthsGenitive[t.Month()-1], t.Year(), t.Format("15:04"))
 }
 
+func formatDateShort(t time.Time) string {
+	return fmt.Sprintf("%d %s · %s",
+		t.Day(), ukMonthsGenitive[t.Month()-1], t.Format("15:04"))
+}
+
 func formatClock(t time.Time) string { return t.Format("15:04") }
+
+// escapeMarkdown escapes Telegram's "legacy" Markdown special chars for
+// fields where we control the surrounding *…* / `…` formatting. We don't
+// emit complex Markdown — escaping just _ * [ ` is enough.
+func escapeMarkdown(s string) string {
+	r := strings.NewReplacer(`_`, `\_`, `*`, `\*`, "`", "\\`", `[`, `\[`)
+	return r.Replace(s)
+}

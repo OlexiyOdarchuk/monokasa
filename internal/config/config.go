@@ -54,6 +54,12 @@ type Config struct {
 	// start=res_<code>. Without it, the button is hidden — bot still
 	// works for /seats users.
 	BotUsername string
+
+	// BaseURL is the public origin where the frontend is served (no
+	// trailing slash). Bot uses it to compose WebApp URLs ("📍 Обрати
+	// місце" → BASE_URL/event/<slug>). Without it the bot omits the
+	// WebApp button and shows a plain URL hint instead.
+	BaseURL string
 }
 
 func Load() (Config, error) {
@@ -85,6 +91,7 @@ func Load() (Config, error) {
 	c.SMTPFrom = os.Getenv("SMTP_FROM")
 	c.SMTPImplicitTLS = envBool("SMTP_IMPLICIT_TLS", false)
 	c.BotUsername = strings.TrimPrefix(os.Getenv("BOT_USERNAME"), "@")
+	c.BaseURL = strings.TrimRight(os.Getenv("BASE_URL"), "/")
 
 	if c.TGToken == "" {
 		return c, errors.New("TG_TOKEN is required")
