@@ -126,6 +126,32 @@ func newTestProcessor(store *fakeStore, notifier *fakeNotifier) *Processor {
 	}
 }
 
+// fakeEmail captures any EmailDelivery.SendTicketEmail calls so tests can
+// assert the web-buyer flow without standing up a real SMTP server.
+type fakeEmail struct {
+	mu    sync.Mutex
+	calls []emailCall
+	err   error
+}
+
+type emailCall struct {
+	to        string
+	buyerName string
+	seatRow   int
+	seatCol   int
+	pdfLen    int
+}
+
+func (f *fakeEmail) SendTicketEmail(_ context.Context, to, buyerName string, seat Seat, _ Show, pdf []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	f.calls = append(f.calls, emailCall{to, buyerName, seat.Row, seat.Col, len(pdf)})
+	return nil
+}
+
 func newTx(comment string, amount int64) bank.Transaction {
 	return bank.Transaction{
 		ID:      "tx-1",
@@ -259,6 +285,92 @@ func TestProcessor_CheapSeatAcceptedRegardlessOfDefaults(t *testing.T) {
 	}
 	if len(notifier.sends) != 1 {
 		t.Errorf("ticket sends = %d, want 1", len(notifier.sends))
+	}
+}
+
+func TestProcessor_WebBuyerGetsEmailNoTelegram(t *testing.T) {
+	// Web-buyer reservation: TGChatID=0, BuyerEmail set. The processor
+	// should email the PDF and *not* try to ping a non-existent chat.
+	st := &fakeStore{
+		codeKnown: "abcdefgh",
+		reservation: Reservation{
+			ID: 7, TGChatID: 0, BuyerName: "Web Buyer",
+			BuyerEmail: "buyer@example.com",
+		},
+		seat: Seat{ID: 3, Row: 1, Col: 2, Price: money.New(25000, currency.UAH)},
+	}
+	notifier := &fakeNotifier{}
+	mailer := &fakeEmail{}
+	p := newTestProcessor(st, notifier)
+	p.Email = mailer
+
+	if err := p.Handle(context.Background(), &webhook.Response{
+		Data: webhook.Data{Transaction: newTx("payment abcdefgh", 25000)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(notifier.sends) != 0 {
+		t.Errorf("notifier should not fire for web buyer, got %d sends", len(notifier.sends))
+	}
+	if len(mailer.calls) != 1 {
+		t.Fatalf("email calls = %d, want 1", len(mailer.calls))
+	}
+	if mailer.calls[0].to != "buyer@example.com" {
+		t.Errorf("to = %q", mailer.calls[0].to)
+	}
+	if mailer.calls[0].pdfLen == 0 {
+		t.Error("PDF body not passed through")
+	}
+}
+
+func TestProcessor_BotBuyerGetsTelegramOnly(t *testing.T) {
+	// Bot-flow reservation: TGChatID set, BuyerEmail empty. Telegram fires;
+	// email path is skipped even if a mailer is configured.
+	st := &fakeStore{
+		codeKnown:   "abcdefgh",
+		reservation: Reservation{ID: 7, TGChatID: 42, BuyerName: "Bot Buyer", BuyerEmail: ""},
+		seat:        Seat{ID: 3, Row: 1, Col: 2, Price: money.New(25000, currency.UAH)},
+	}
+	notifier := &fakeNotifier{}
+	mailer := &fakeEmail{}
+	p := newTestProcessor(st, notifier)
+	p.Email = mailer
+
+	if err := p.Handle(context.Background(), &webhook.Response{
+		Data: webhook.Data{Transaction: newTx("payment abcdefgh", 25000)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(notifier.sends) != 1 {
+		t.Errorf("notifier should fire for bot buyer, got %d", len(notifier.sends))
+	}
+	if len(mailer.calls) != 0 {
+		t.Errorf("email should not fire when BuyerEmail empty, got %d", len(mailer.calls))
+	}
+}
+
+func TestProcessor_EmailFailureDoesNotBlockConfirm(t *testing.T) {
+	// Email provider misbehaving should not undo the confirmation —
+	// reservation stays paid, operator sees error in logs and can resend.
+	st := &fakeStore{
+		codeKnown: "abcdefgh",
+		reservation: Reservation{
+			ID: 7, TGChatID: 0, BuyerName: "Web", BuyerEmail: "b@x.com",
+		},
+		seat: Seat{ID: 3, Row: 1, Col: 2, Price: money.New(25000, currency.UAH)},
+	}
+	notifier := &fakeNotifier{}
+	mailer := &fakeEmail{err: errors.New("smtp down")}
+	p := newTestProcessor(st, notifier)
+	p.Email = mailer
+
+	if err := p.Handle(context.Background(), &webhook.Response{
+		Data: webhook.Data{Transaction: newTx("payment abcdefgh", 25000)},
+	}); err != nil {
+		t.Fatalf("Handle should not propagate SMTP failure: %v", err)
+	}
+	if len(st.confirmCalls) != 1 {
+		t.Errorf("Confirm calls = %d, want 1 (email failure must not block confirm)", len(st.confirmCalls))
 	}
 }
 

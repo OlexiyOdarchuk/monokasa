@@ -37,6 +37,16 @@ type Config struct {
 	// the request's TLS detection. Set in production behind HTTPS where
 	// the proxy may or may not expose X-Forwarded-Proto.
 	SecureCookies bool
+
+	// SMTP: optional. When SMTPHost+SMTPFrom are set, web-buyer
+	// reservations get a PDF emailed after payment. Without these the
+	// reservation still confirms; operator just sees a warn log.
+	SMTPHost        string
+	SMTPPort        string
+	SMTPUser        string
+	SMTPPass        string
+	SMTPFrom        string
+	SMTPImplicitTLS bool
 }
 
 func Load() (Config, error) {
@@ -61,6 +71,12 @@ func Load() (Config, error) {
 	c.AdminEmail = os.Getenv("ADMIN_EMAIL")
 	c.AdminPassword = os.Getenv("ADMIN_PASSWORD")
 	c.SecureCookies = envBool("SECURE_COOKIES", false)
+	c.SMTPHost = os.Getenv("SMTP_HOST")
+	c.SMTPPort = env("SMTP_PORT", "587")
+	c.SMTPUser = os.Getenv("SMTP_USER")
+	c.SMTPPass = os.Getenv("SMTP_PASS")
+	c.SMTPFrom = os.Getenv("SMTP_FROM")
+	c.SMTPImplicitTLS = envBool("SMTP_IMPLICIT_TLS", false)
 
 	if c.TGToken == "" {
 		return c, errors.New("TG_TOKEN is required")

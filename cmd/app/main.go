@@ -30,6 +30,7 @@ import (
 	"github.com/OlexiyOdarchuk/monokasa/internal/auth"
 	"github.com/OlexiyOdarchuk/monokasa/internal/bot"
 	"github.com/OlexiyOdarchuk/monokasa/internal/config"
+	"github.com/OlexiyOdarchuk/monokasa/internal/email"
 	"github.com/OlexiyOdarchuk/monokasa/internal/metrics"
 	"github.com/OlexiyOdarchuk/monokasa/internal/pay"
 	"github.com/OlexiyOdarchuk/monokasa/internal/public"
@@ -119,6 +120,28 @@ func main() {
 	defer tg.Stop()
 	slog.Info("telegram bot up")
 
+	// SMTP wiring is optional. Without SMTPHost+SMTPFrom we run without
+	// email delivery; web-buyer reservations still confirm but the
+	// processor logs a warn for each one until the operator wires it up.
+	var emailDelivery pay.EmailDelivery
+	if cfg.SMTPHost != "" && cfg.SMTPFrom != "" {
+		sender, err := email.NewSMTPSender(email.Config{
+			Host:        cfg.SMTPHost,
+			Port:        cfg.SMTPPort,
+			Username:    cfg.SMTPUser,
+			Password:    cfg.SMTPPass,
+			From:        cfg.SMTPFrom,
+			ImplicitTLS: cfg.SMTPImplicitTLS,
+		})
+		if err != nil {
+			fatal("smtp init", "err", err)
+		}
+		emailDelivery = payEmail{sender: sender, from: cfg.SMTPFrom}
+		slog.Info("smtp ready", "host", cfg.SMTPHost, "from", cfg.SMTPFrom)
+	} else {
+		slog.Info("smtp not configured; email delivery disabled (web buyers won't receive PDFs)")
+	}
+
 	monoClient := bank.New()
 	processor := &pay.Processor{
 		Store:    payStore{st},
@@ -126,6 +149,7 @@ func main() {
 		Notifier: payNotifier{tg},
 		Renderer: payRenderer,
 		ShowFn:   payShowFn,
+		Email:    emailDelivery,
 	}
 	hook, err := webhook.NewHandler(ctx, webhook.Options{
 		Keys:    monoClient,
@@ -617,6 +641,7 @@ func (p payStore) FindReservationByCode(ctx context.Context, code string) (pay.R
 		ID:          r.ID,
 		TGChatID:    r.TGChatID,
 		BuyerName:   r.BuyerName,
+		BuyerEmail:  r.BuyerEmail,
 		ConfirmedAt: r.ConfirmedAt,
 	}
 	seat := pay.Seat{ID: s.ID, Row: s.Row, Col: s.Col, Price: money.New(s.PriceKopecks, currency.UAH)}
@@ -643,6 +668,48 @@ func (p payNotifier) SendTicket(chatID int64, seat pay.Seat, pdf []byte) error {
 	return p.b.SendTicket(chatID, bot.Seat{
 		ID: seat.ID, Row: seat.Row, Col: seat.Col, Price: seat.Price,
 	}, pdf)
+}
+
+// payEmail adapts the SMTPSender to pay.EmailDelivery, composing the
+// subject/body here so the email package stays domain-agnostic.
+type payEmail struct {
+	sender *email.SMTPSender
+	from   string
+}
+
+func (p payEmail) SendTicketEmail(ctx context.Context, to, buyerName string, seat pay.Seat, show pay.Show, pdf []byte) error {
+	body := fmt.Sprintf(`<!doctype html>
+<html><body style="font-family:system-ui,sans-serif;color:#111;line-height:1.5">
+<h2 style="margin:0 0 .5em">Твій квиток на «%s»</h2>
+<p>Привіт, %s!<br>
+Оплата зарахована — квиток у вкладеному PDF.</p>
+<p><b>Місце:</b> ряд %d · %d<br>
+<b>Коли:</b> %s<br>
+<b>Де:</b> %s</p>
+<p>На вході покажи QR з PDF — ми відскануємо.</p>
+<p style="color:#666;font-size:.875em">Питання? Просто дайте відповідь на цей лист.</p>
+</body></html>`,
+		htmlEscape(show.Title), htmlEscape(buyerName),
+		seat.Row, seat.Col,
+		timefmt.DateTime(show.StartsAt), htmlEscape(show.Venue))
+
+	return p.sender.Send(ctx, email.Message{
+		To:             to,
+		Subject:        fmt.Sprintf("Твій квиток на «%s»", show.Title),
+		HTMLBody:       body,
+		AttachmentName: fmt.Sprintf("ticket-row-%d-seat-%d.pdf", seat.Row, seat.Col),
+		AttachmentBody: pdf,
+	})
+}
+
+// htmlEscape is a tiny replacement for html.EscapeString to avoid pulling
+// in the whole html package just to escape four characters.
+func htmlEscape(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	s = strings.ReplaceAll(s, `"`, "&quot;")
+	return s
 }
 
 func payRenderer(show pay.Show, seat pay.Seat, buyerName, qrPayload string) ([]byte, error) {

@@ -33,10 +33,13 @@ type Seat struct {
 }
 
 // Reservation is the subset of reservation info the processor needs.
+// BuyerEmail is populated for web-buyer reservations; empty for the
+// Telegram-only flow.
 type Reservation struct {
 	ID          int64
 	TGChatID    int64
 	BuyerName   string
+	BuyerEmail  string
 	ConfirmedAt *time.Time
 }
 
@@ -57,9 +60,16 @@ type Coder interface {
 	QRPayload(reservationID, seatID int64) string
 }
 
-// Notifier delivers the rendered ticket back to the buyer.
+// Notifier delivers the rendered ticket back to the buyer over Telegram.
 type Notifier interface {
 	SendTicket(chatID int64, seat Seat, pdf []byte) error
+}
+
+// EmailDelivery is the side channel for web-buyer reservations that came
+// in without a Telegram chat. Implementations build their own subject/
+// body and ship the PDF as an attachment.
+type EmailDelivery interface {
+	SendTicketEmail(ctx context.Context, to, buyerName string, seat Seat, show Show, pdf []byte) error
 }
 
 // Renderer turns a confirmed reservation into a printable PDF.
@@ -76,6 +86,9 @@ type Processor struct {
 	Notifier Notifier
 	Renderer Renderer
 	ShowFn   ShowFn
+	// Email is optional. When nil, web-buyer reservations confirm but
+	// the buyer doesn't get an email — operator log will warn.
+	Email EmailDelivery
 }
 
 // Handle is the OnEvent callback wired into webhook.NewHandler.
@@ -149,14 +162,30 @@ func (p *Processor) processTx(ctx context.Context, t bank.Transaction) (bool, er
 	if err != nil {
 		return false, err
 	}
-	if err := p.Notifier.SendTicket(res.TGChatID, seat, pdf); err != nil {
-		return false, err
+	// Telegram delivery only when the reservation actually has a chat id
+	// (bot flow). Web-buyer reservations have chatId=0 and rely on email.
+	if res.TGChatID != 0 {
+		if err := p.Notifier.SendTicket(res.TGChatID, seat, pdf); err != nil {
+			return false, err
+		}
+	}
+	if res.BuyerEmail != "" {
+		if p.Email == nil {
+			slog.Warn("buyer has email but no SMTP configured — ticket only in DB",
+				"code", code, "email", res.BuyerEmail)
+		} else if err := p.Email.SendTicketEmail(ctx, res.BuyerEmail, res.BuyerName, seat, show, pdf); err != nil {
+			// Don't fail the webhook over an email hiccup — the reservation
+			// is confirmed in the DB; admin can re-trigger from the web UI
+			// later (and the operator already gets the SMTP error via slog).
+			slog.Error("send ticket email", "code", code, "to", res.BuyerEmail, "err", err)
+		}
 	}
 	slog.Info("ticket issued",
 		"code", code,
 		"row", seat.Row,
 		"seat", seat.Col,
 		"buyer", res.BuyerName,
+		"email", res.BuyerEmail,
 		"chatId", res.TGChatID,
 		"paid", t.Amount)
 	return true, nil
