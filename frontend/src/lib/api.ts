@@ -220,6 +220,12 @@ export interface ReservationResponse {
 	tg_deep_link?: string;
 }
 
+export type ReservationStatus = 'held' | 'paid' | 'expired' | 'cancelled';
+
+export interface ReservationStatusResponse {
+	status: ReservationStatus;
+}
+
 // publicApi mirrors api.* but does NOT auto-redirect to /admin/login on
 // 401 — the public buyer flow shouldn't even reach a 401, and bouncing
 // an anonymous visitor to an admin page would be confusing. Treats all

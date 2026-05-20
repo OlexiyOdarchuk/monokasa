@@ -59,6 +59,48 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/public/shows", h.listShows)
 	mux.HandleFunc("GET /api/public/shows/{slug}", h.getShow)
 	mux.HandleFunc("POST /api/public/reservations", h.createReservation)
+	mux.HandleFunc("GET /api/public/reservations/{code}/status", h.reservationStatus)
+}
+
+// --- GET /api/public/reservations/{code}/status ---
+//
+// Public endpoint for the success screen on /event/<slug> to poll until
+// the buyer's payment lands. Returns only the status enum — no buyer
+// name, email or chat id — so the link can be shared without leaking
+// PII to anyone with the code (codes are 8-char base32, ~40 bits, fine
+// to leave un-rate-limited).
+
+type reservationStatusResponse struct {
+	Status string `json:"status"` // held | paid | expired | cancelled
+}
+
+func (h *Handler) reservationStatus(w http.ResponseWriter, r *http.Request) {
+	code := r.PathValue("code")
+	if code == "" {
+		writeError(w, http.StatusBadRequest, "invalid_code", "")
+		return
+	}
+	res, _, err := h.st.FindReservationByCode(r.Context(), code)
+	switch {
+	case errors.Is(err, store.ErrCodeNotFound):
+		writeError(w, http.StatusNotFound, "not_found", "")
+		return
+	case errors.Is(err, store.ErrAlreadyClosed):
+		// FindReservationByCode raises this for cancelled rows.
+		writeJSON(w, http.StatusOK, reservationStatusResponse{Status: "cancelled"})
+		return
+	case err != nil:
+		writeInternal(w, "reservation status", err)
+		return
+	}
+	status := "held"
+	switch {
+	case res.ConfirmedAt != nil:
+		status = "paid"
+	case res.ExpiresAt.Before(time.Now()):
+		status = "expired"
+	}
+	writeJSON(w, http.StatusOK, reservationStatusResponse{Status: status})
 }
 
 // --- GET /api/public/shows ---
@@ -80,15 +122,14 @@ func (h *Handler) listShows(w http.ResponseWriter, r *http.Request) {
 		writeInternal(w, "list shows", err)
 		return
 	}
-	now := time.Now()
 	out := make([]publicShowSummary, 0, len(shows))
 	for _, sh := range shows {
-		// Hide archived shows and ones that already happened more than
-		// 2h ago — landing page is forward-looking.
+		// Hide archived shows — admin controls visibility via the
+		// Archive button in the show editor. We intentionally do NOT
+		// filter by start_at: in self-host mode the admin might create
+		// a past-dated event for testing and then wonder why it's
+		// invisible. If they want it hidden, they archive it.
 		if sh.ArchivedAt != nil {
-			continue
-		}
-		if sh.StartsAt.Before(now.Add(-2 * time.Hour)) {
 			continue
 		}
 		st, err := h.st.Stats(r.Context(), sh.ID)

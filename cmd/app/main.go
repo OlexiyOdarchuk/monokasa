@@ -499,21 +499,18 @@ func toBotShow(s store.Show) bot.Show {
 	}
 }
 
-// Shows lists non-archived shows whose start is in the future or within
-// the last two hours — same window the public landing uses, so the bot
-// "афіша" doesn't drift from monokasa.app.
+// Shows lists non-archived shows — same predicate the public landing
+// uses, so the bot афіша doesn't drift from monokasa.app/. Past-dated
+// events are deliberately shown (admin controls visibility through
+// archive).
 func (b botStore) Shows(ctx context.Context) ([]bot.Show, error) {
 	shows, err := b.s.ListShows(ctx)
 	if err != nil {
 		return nil, err
 	}
-	now := time.Now()
 	out := make([]bot.Show, 0, len(shows))
 	for _, sh := range shows {
 		if sh.ArchivedAt != nil {
-			continue
-		}
-		if sh.StartsAt.Before(now.Add(-2 * time.Hour)) {
 			continue
 		}
 		out = append(out, toBotShow(sh))

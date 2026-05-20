@@ -5,6 +5,8 @@
 		type PublicShow,
 		type PublicSeat,
 		type ReservationResponse,
+		type ReservationStatus,
+		type ReservationStatusResponse,
 		ApiError
 	} from '$lib/api';
 
@@ -23,6 +25,12 @@
 	let buyerEmail = $state('');
 	let submitting = $state(false);
 	let success = $state<ReservationResponse | null>(null);
+
+	// Polled by the success screen. Starts at 'held', flips to 'paid'
+	// when the webhook lands the confirmation, swaps the UI for the
+	// "оплачено" screen. monobank-jar doesn't redirect back to us after
+	// payment, so polling is the only way to detect completion.
+	let payStatus = $state<ReservationStatus>('held');
 
 	const SEAT_R = 22;
 	const PAD = 60;
@@ -92,6 +100,7 @@
 				buyer_name: buyerName.trim(),
 				buyer_email: buyerEmail.trim()
 			});
+			payStatus = 'held';
 		} catch (e) {
 			if (e instanceof ApiError && e.code === 'seat_taken') {
 				error = 'На жаль, це місце щойно зайняли. Обери інше.';
@@ -107,6 +116,38 @@
 			submitting = false;
 		}
 	}
+
+	// Polling: once we have a reservation `code`, ping the status endpoint
+	// every 5s until terminal state. Stop after 30 min as a safety net
+	// against forgotten tabs — by then the HOLD has expired anyway.
+	$effect(() => {
+		if (!success) return;
+		if (payStatus === 'paid' || payStatus === 'cancelled' || payStatus === 'expired') return;
+
+		const code = success.code;
+		const stopAt = Date.now() + 30 * 60_000;
+		let cancelled = false;
+
+		async function tick() {
+			if (cancelled || Date.now() > stopAt) return;
+			try {
+				const r = await publicApi.get<ReservationStatusResponse>(
+					`/api/public/reservations/${code}/status`
+				);
+				if (cancelled) return;
+				payStatus = r.status;
+				if (r.status !== 'held') return; // terminal — let effect re-run cleanup
+			} catch (e) {
+				console.warn('status poll failed', e);
+			}
+			setTimeout(tick, 5000);
+		}
+		setTimeout(tick, 5000);
+
+		return () => {
+			cancelled = true;
+		};
+	});
 
 	function startsAtText(iso: string): string {
 		return new Date(iso).toLocaleString('uk-UA', {
@@ -136,8 +177,60 @@
 		<h1 class="text-lg font-medium">😔</h1>
 		<p class="mt-2 text-neutral-400">{error}</p>
 	</div>
+{:else if success && show && payStatus === 'paid'}
+	<!-- Confirmed: webhook landed, ticket sent to email/telegram -->
+	<main class="mx-auto max-w-md p-6">
+		<div class="rounded-2xl border border-emerald-700 bg-emerald-950/60 p-6 text-center">
+			<div class="text-5xl">🎉</div>
+			<h1 class="mt-3 text-2xl font-semibold">Оплачено!</h1>
+			<p class="mt-2 text-sm text-emerald-200">
+				{show.title} · {startsAtText(show.starts_at)}
+			</p>
+			<p class="mt-1 text-sm text-emerald-300/80">
+				ряд {success.seat.row} · місце {success.seat.col}
+			</p>
+			<div class="mt-5 rounded-lg border border-emerald-900 bg-emerald-950 p-4 text-left">
+				<p class="text-sm text-emerald-200">
+					📧 Квиток із QR-кодом надіслано на <b>{success.buyer_email}</b>.
+				</p>
+				<p class="mt-2 text-xs text-emerald-300/70">
+					На вході відкривай PDF з телефону — охорона сканує QR.
+				</p>
+			</div>
+			<a href="/" class="mt-5 inline-block text-sm text-emerald-300 hover:underline">
+				← До списку подій
+			</a>
+		</div>
+	</main>
+{:else if success && show && (payStatus === 'expired' || payStatus === 'cancelled')}
+	<!-- HOLD timed out before payment landed, or admin cancelled -->
+	<main class="mx-auto max-w-md p-6">
+		<div class="rounded-2xl border border-neutral-800 bg-neutral-900 p-6 text-center">
+			<div class="text-3xl">⏰</div>
+			<h1 class="mt-2 text-xl font-semibold">
+				{payStatus === 'expired' ? 'Час бронювання вийшов' : 'Бронювання скасовано'}
+			</h1>
+			<p class="mt-2 text-sm text-neutral-400">
+				{#if payStatus === 'expired'}
+					Бронь жила 15 хв і пропала, бо оплата так і не дійшла. Можеш забронити те саме місце знов.
+				{:else}
+					Цю бронь було скасовано. Якщо ти оплатив після цього — напиши організатору.
+				{/if}
+			</p>
+			<button
+				onclick={() => {
+					success = null;
+					payStatus = 'held';
+					load();
+				}}
+				class="mt-5 rounded-md bg-[var(--color-brand)] px-4 py-2 text-sm font-medium text-black hover:bg-[var(--color-brand-hover)]"
+			>
+				Спробувати ще раз
+			</button>
+		</div>
+	</main>
 {:else if success && show}
-	<!-- Success screen: post-reservation, pre-payment -->
+	<!-- Held: post-reservation, awaiting payment. Polling runs in background. -->
 	<main class="mx-auto max-w-md p-6">
 		<div class="rounded-2xl border border-emerald-900 bg-emerald-950/40 p-6 text-center">
 			<div class="text-3xl">🎟</div>
@@ -177,10 +270,10 @@
 				</p>
 			{/if}
 
-			<p class="mt-4 text-xs text-neutral-500">
-				Після оплати квиток із QR прийде на <b>{success.buyer_email}</b>
-				(потерпи кілька хвилин на доставку).
-			</p>
+			<div class="mt-4 flex items-center justify-center gap-2 text-xs text-neutral-500">
+				<span class="inline-block size-2 animate-pulse rounded-full bg-amber-400"></span>
+				Чекаю підтвердження оплати… (оновлюю кожні 5с)
+			</div>
 		</div>
 	</main>
 {:else if show}
