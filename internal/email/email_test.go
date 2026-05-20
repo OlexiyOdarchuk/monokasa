@@ -65,11 +65,12 @@ func TestBuildMessageEncodesNonASCIISubject(t *testing.T) {
 func TestBuildMessageRoundTripsPDFAttachment(t *testing.T) {
 	pdf := []byte("%PDF-1.4 fake pdf bytes")
 	raw, err := BuildMessage("from@x.com", Message{
-		To:             "to@y.com",
-		Subject:        "Your ticket",
-		HTMLBody:       "<p>see attachment</p>",
-		AttachmentName: "ticket.pdf",
-		AttachmentBody: pdf,
+		To:       "to@y.com",
+		Subject:  "Your ticket",
+		HTMLBody: "<p>see attachment</p>",
+		Attachments: []Attachment{
+			{Filename: "ticket.pdf", Body: pdf, ContentType: "application/pdf"},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)

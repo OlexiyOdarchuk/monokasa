@@ -119,6 +119,37 @@ var migrations = []string{
 	`CREATE UNIQUE INDEX IF NOT EXISTS idx_shows_slug ON shows(slug)`,
 	`ALTER TABLE shows ADD COLUMN description TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE shows ADD COLUMN poster_url TEXT NOT NULL DEFAULT ''`,
+	// Orders: groups one or more reservations under one payment code.
+	// Single-seat reservations created before this migration get one
+	// row each so the new code path (look up Order by code) handles
+	// every reservation uniformly.
+	`CREATE TABLE IF NOT EXISTS orders (
+		id              INTEGER PRIMARY KEY,
+		code            TEXT NOT NULL UNIQUE,
+		buyer_name      TEXT NOT NULL DEFAULT '',
+		buyer_email     TEXT NOT NULL DEFAULT '',
+		tg_user_id      INTEGER NOT NULL DEFAULT 0,
+		tg_chat_id      INTEGER NOT NULL DEFAULT 0,
+		total_kopecks   INTEGER NOT NULL DEFAULT 0,
+		created_at      INTEGER NOT NULL,
+		expires_at      INTEGER NOT NULL,
+		confirmed_at    INTEGER,
+		cancelled_at    INTEGER,
+		reminded_at     INTEGER
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_orders_code ON orders(code)`,
+	`ALTER TABLE reservations ADD COLUMN order_id INTEGER`,
+	`CREATE INDEX IF NOT EXISTS idx_res_order ON reservations(order_id)`,
+	// Backfill: every existing reservation becomes a single-item order.
+	// INSERT OR IGNORE skips reservations already migrated (code UNIQUE
+	// conflict). UPDATE then attaches order_id to all still-loose rows.
+	`INSERT OR IGNORE INTO orders (code, buyer_name, buyer_email, tg_user_id, tg_chat_id, total_kopecks, created_at, expires_at, confirmed_at, cancelled_at, reminded_at)
+		SELECT r.code, r.buyer_name, r.buyer_email, r.tg_user_id, r.tg_chat_id,
+		       (SELECT price_kopecks FROM seats WHERE id = r.seat_id),
+		       r.created_at, r.expires_at, r.confirmed_at, r.cancelled_at, r.reminded_at
+		FROM reservations r
+		WHERE r.order_id IS NULL`,
+	`UPDATE reservations SET order_id = (SELECT id FROM orders WHERE code = reservations.code) WHERE order_id IS NULL`,
 }
 
 // Errors.
@@ -529,65 +560,18 @@ func (s *Store) FindFreeSeat(ctx context.Context, showID int64, row, col int) (S
 	return seat, nil
 }
 
-// Reserve atomically claims a seat for the user. Refuses non-sellable seats.
-// buyerEmail is the optional email channel for ticket delivery — empty when
-// the reservation comes through Telegram (delivered via the bot) and set
-// when the buyer comes through the public web checkout.
+// Reserve is a single-seat shortcut around CreateOrder. Keeps a stable
+// API for the bot/legacy public flow while ensuring every reservation
+// still belongs to an order (pay processor only looks orders up by code).
 func (s *Store) Reserve(
 	ctx context.Context, seat Seat, tgUserID, tgChatID int64,
 	buyerName, buyerEmail, code string, hold time.Duration,
 ) (Reservation, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	_, reservations, err := s.CreateOrder(ctx, []Seat{seat}, tgUserID, tgChatID, buyerName, buyerEmail, code, hold)
 	if err != nil {
 		return Reservation{}, err
 	}
-	defer tx.Rollback()
-
-	// Re-read sellable inside the tx so a caller that passed a stale Seat
-	// (e.g., layout changed between FindFreeSeat and Reserve) can't bypass
-	// the check.
-	var sellable int
-	if err := tx.QueryRowContext(ctx,
-		`SELECT sellable FROM seats WHERE id=?`, seat.ID).Scan(&sellable); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return Reservation{}, ErrSeatNotFound
-		}
-		return Reservation{}, err
-	}
-	if sellable == 0 {
-		return Reservation{}, ErrSeatNotSellable
-	}
-
-	now := time.Now()
-	var taken int
-	if err := tx.QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM reservations
-		WHERE seat_id=? AND cancelled_at IS NULL
-		  AND (confirmed_at IS NOT NULL OR expires_at > ?)`,
-		seat.ID, now.Unix()).Scan(&taken); err != nil {
-		return Reservation{}, err
-	}
-	if taken > 0 {
-		return Reservation{}, ErrSeatTaken
-	}
-
-	expires := now.Add(hold)
-	res, err := tx.ExecContext(ctx, `
-		INSERT INTO reservations(seat_id, tg_user_id, tg_chat_id, buyer_name, buyer_email, code, created_at, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		seat.ID, tgUserID, tgChatID, buyerName, buyerEmail, code, now.Unix(), expires.Unix())
-	if err != nil {
-		return Reservation{}, err
-	}
-	id, _ := res.LastInsertId()
-	if err := tx.Commit(); err != nil {
-		return Reservation{}, err
-	}
-	return Reservation{
-		ID: id, SeatID: seat.ID, TGUserID: tgUserID, TGChatID: tgChatID,
-		BuyerName: buyerName, BuyerEmail: buyerEmail,
-		Code: code, CreatedAt: now, ExpiresAt: expires,
-	}, nil
+	return reservations[0], nil
 }
 
 // AddSeat inserts a new seat into an existing show.
@@ -897,11 +881,14 @@ func (s *Store) ListReservations(ctx context.Context, showID int64) ([]MyItem, e
 	return out, rows.Err()
 }
 
-// AdminCancelReservation force-cancels any reservation (paid or held) by
-// id, without the per-user ownership check that the bot-side flow needs.
-// Paid cancellations are permitted because admin refunds happen out of
-// band in mono — we just need to free the seat and mark the row.
-// Already-cancelled rows return ErrAlreadyClosed.
+// AdminCancelReservation force-cancels the order this reservation
+// belongs to. Cancelling a single seat in a multi-seat order cascades to
+// every peer — partial cancels would leave the order half-paid, which
+// confuses both the buyer and the pay processor.
+//
+// Paid cancellations are permitted: monobank refunds happen out of band,
+// the DB just frees the seats and marks the rows. Already-cancelled
+// orders return ErrAlreadyClosed.
 func (s *Store) AdminCancelReservation(ctx context.Context, reservationID int64) (Reservation, Seat, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -924,10 +911,36 @@ func (s *Store) AdminCancelReservation(ctx context.Context, reservationID int64)
 	if r.CancelledAt != nil {
 		return r, seat, ErrAlreadyClosed
 	}
-	now := time.Now()
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE reservations SET cancelled_at=? WHERE id=?`, now.Unix(), reservationID); err != nil {
+
+	var orderID sql.NullInt64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT order_id FROM reservations WHERE id = ?`, reservationID).Scan(&orderID); err != nil {
 		return r, seat, err
+	}
+
+	now := time.Now()
+	if orderID.Valid {
+		// Cascade: cancel every reservation in the order and the order
+		// itself. Idempotent guards (cancelled_at IS NULL) prevent
+		// stamping the same row twice if some peer was already
+		// individually cancelled.
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE reservations SET cancelled_at=? WHERE order_id=? AND cancelled_at IS NULL`,
+			now.Unix(), orderID.Int64); err != nil {
+			return r, seat, err
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE orders SET cancelled_at=? WHERE id=? AND cancelled_at IS NULL`,
+			now.Unix(), orderID.Int64); err != nil {
+			return r, seat, err
+		}
+	} else {
+		// Legacy reservation pre-dating orders (shouldn't exist after
+		// the backfill, but defend against partial state).
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE reservations SET cancelled_at=? WHERE id=?`, now.Unix(), r.ID); err != nil {
+			return r, seat, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return r, seat, err
@@ -936,51 +949,331 @@ func (s *Store) AdminCancelReservation(ctx context.Context, reservationID int64)
 	return r, seat, nil
 }
 
-// LinkReservationToTGChat associates a web-buyer reservation with a
-// Telegram chat so the bot can deliver the PDF after payment in addition
-// to (or instead of) the email channel. Idempotent: re-linking the same
-// chat is a no-op; linking a different chat overwrites — the most recent
-// /start wins, which matches the user-facing expectation ("the bot I'm
-// chatting with now is the one that should get my ticket").
+// --- orders (multi-seat) ---
+
+// CreateOrder atomically books N seats under one payment code. Each
+// underlying reservation gets a derived sub-code "<orderCode>.<seq>" so
+// the legacy UNIQUE(reservations.code) constraint stays satisfied,
+// while the webhook still matches the bare 8-char base32 order code in
+// the monobank comment.
 //
-// Returns ErrCodeNotFound for missing codes, ErrAlreadyClosed for
-// cancelled reservations. Already-confirmed reservations link fine but
-// the caller (bot) should warn the user that the PDF won't auto-resend
-// — it was sent via email at confirm-time.
-func (s *Store) LinkReservationToTGChat(ctx context.Context, code string, tgUserID, tgChatID int64) (Reservation, Seat, error) {
+// All seats must belong to the same show and be free + sellable. Any
+// violation rolls back the entire transaction.
+func (s *Store) CreateOrder(
+	ctx context.Context, seats []Seat, tgUserID, tgChatID int64,
+	buyerName, buyerEmail, code string, hold time.Duration,
+) (Order, []Reservation, error) {
+	if len(seats) == 0 {
+		return Order{}, nil, errors.New("CreateOrder: empty seats")
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return Reservation{}, Seat{}, err
+		return Order{}, nil, err
 	}
 	defer tx.Rollback()
 
-	var r Reservation
-	var seat Seat
-	err = scanReservationWithSeat(tx.QueryRowContext(ctx, `
-		SELECT `+reservationJoinSeat+`
-		FROM reservations r JOIN seats s ON s.id = r.seat_id
-		WHERE r.code = ?`, code), &r, &seat)
-	if errors.Is(err, sql.ErrNoRows) {
-		return r, seat, ErrCodeNotFound
-	}
-	if err != nil {
-		return r, seat, err
-	}
-	if r.CancelledAt != nil {
-		return r, seat, ErrAlreadyClosed
+	now := time.Now()
+	expires := now.Add(hold)
+
+	var total int64
+	for _, seat := range seats {
+		// Re-verify each seat inside the tx: sellable, free, exists.
+		var sellable int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT sellable FROM seats WHERE id=?`, seat.ID).Scan(&sellable); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return Order{}, nil, ErrSeatNotFound
+			}
+			return Order{}, nil, err
+		}
+		if sellable == 0 {
+			return Order{}, nil, ErrSeatNotSellable
+		}
+		var taken int
+		if err := tx.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM reservations
+			WHERE seat_id=? AND cancelled_at IS NULL
+			  AND (confirmed_at IS NOT NULL OR expires_at > ?)`,
+			seat.ID, now.Unix()).Scan(&taken); err != nil {
+			return Order{}, nil, err
+		}
+		if taken > 0 {
+			return Order{}, nil, ErrSeatTaken
+		}
+		total += seat.PriceKopecks
 	}
 
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE reservations SET tg_user_id = ?, tg_chat_id = ? WHERE id = ?`,
-		tgUserID, tgChatID, r.ID); err != nil {
-		return r, seat, err
+	orderRes, err := tx.ExecContext(ctx, `
+		INSERT INTO orders(code, buyer_name, buyer_email, tg_user_id, tg_chat_id,
+		                   total_kopecks, created_at, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		code, buyerName, buyerEmail, tgUserID, tgChatID, total, now.Unix(), expires.Unix())
+	if err != nil {
+		if isUniqueErr(err) {
+			return Order{}, nil, fmt.Errorf("order code %q already exists", code)
+		}
+		return Order{}, nil, err
+	}
+	orderID, _ := orderRes.LastInsertId()
+
+	reservations := make([]Reservation, 0, len(seats))
+	for i, seat := range seats {
+		subcode := code
+		if len(seats) > 1 {
+			subcode = fmt.Sprintf("%s.%d", code, i+1)
+		}
+		resRes, err := tx.ExecContext(ctx, `
+			INSERT INTO reservations(order_id, seat_id, tg_user_id, tg_chat_id,
+			                         buyer_name, buyer_email, code, created_at, expires_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			orderID, seat.ID, tgUserID, tgChatID, buyerName, buyerEmail,
+			subcode, now.Unix(), expires.Unix())
+		if err != nil {
+			return Order{}, nil, err
+		}
+		resID, _ := resRes.LastInsertId()
+		reservations = append(reservations, Reservation{
+			ID: resID, SeatID: seat.ID, TGUserID: tgUserID, TGChatID: tgChatID,
+			BuyerName: buyerName, BuyerEmail: buyerEmail, Code: subcode,
+			CreatedAt: now, ExpiresAt: expires,
+		})
 	}
 	if err := tx.Commit(); err != nil {
-		return r, seat, err
+		return Order{}, nil, err
 	}
-	r.TGUserID = tgUserID
-	r.TGChatID = tgChatID
-	return r, seat, nil
+	return Order{
+		ID: orderID, Code: code,
+		BuyerName: buyerName, BuyerEmail: buyerEmail,
+		TGUserID: tgUserID, TGChatID: tgChatID,
+		TotalKopecks: total,
+		CreatedAt:    now, ExpiresAt: expires,
+	}, reservations, nil
+}
+
+// OrderItem couples a reservation with its seat — what the pay processor
+// needs to render one PDF per seat.
+type OrderItem struct {
+	Reservation Reservation
+	Seat        Seat
+}
+
+// FindOrderByCode looks up an active order (not cancelled) plus its items.
+// Returns ErrCodeNotFound for missing, ErrAlreadyClosed for cancelled.
+func (s *Store) FindOrderByCode(ctx context.Context, code string) (Order, []OrderItem, error) {
+	var o Order
+	var conf, cancelled, reminded sql.NullInt64
+	var createdAt, expiresAt int64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, code, buyer_name, buyer_email, tg_user_id, tg_chat_id,
+		       total_kopecks, created_at, expires_at, confirmed_at, cancelled_at, reminded_at
+		FROM orders WHERE code = ?`, code).Scan(
+		&o.ID, &o.Code, &o.BuyerName, &o.BuyerEmail, &o.TGUserID, &o.TGChatID,
+		&o.TotalKopecks, &createdAt, &expiresAt, &conf, &cancelled, &reminded)
+	if errors.Is(err, sql.ErrNoRows) {
+		return o, nil, ErrCodeNotFound
+	}
+	if err != nil {
+		return o, nil, err
+	}
+	o.CreatedAt = time.Unix(createdAt, 0)
+	o.ExpiresAt = time.Unix(expiresAt, 0)
+	if conf.Valid {
+		t := time.Unix(conf.Int64, 0)
+		o.ConfirmedAt = &t
+	}
+	if cancelled.Valid {
+		t := time.Unix(cancelled.Int64, 0)
+		o.CancelledAt = &t
+		return o, nil, ErrAlreadyClosed
+	}
+	if reminded.Valid {
+		t := time.Unix(reminded.Int64, 0)
+		o.RemindedAt = &t
+	}
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+resCols+`, r.cancelled_at,
+		       s.id, s.show_id, s.row, s.col, s.x, s.y, s.label, s.category, s.price_kopecks, s.sellable
+		FROM reservations r JOIN seats s ON s.id = r.seat_id
+		WHERE r.order_id = ?
+		ORDER BY r.id`, o.ID)
+	if err != nil {
+		return o, nil, err
+	}
+	defer rows.Close()
+	var items []OrderItem
+	for rows.Next() {
+		var r Reservation
+		var seat Seat
+		if err := scanReservationWithSeat(rows, &r, &seat); err != nil {
+			return o, nil, err
+		}
+		items = append(items, OrderItem{Reservation: r, Seat: seat})
+	}
+	return o, items, nil
+}
+
+// ConfirmOrder marks the order paid, issues a Ticket per reservation
+// with its QR payload, and stamps confirmed_at on every reservation row.
+// Atomic — partial confirmation is impossible.
+func (s *Store) ConfirmOrder(ctx context.Context, orderID int64, qrPayloads map[int64]string) ([]Ticket, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	var conf, cancelled sql.NullInt64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT confirmed_at, cancelled_at FROM orders WHERE id=?`, orderID).
+		Scan(&conf, &cancelled); err != nil {
+		return nil, err
+	}
+	if cancelled.Valid {
+		return nil, ErrAlreadyClosed
+	}
+	if conf.Valid {
+		return nil, ErrAlreadyPaid
+	}
+
+	now := time.Now()
+	if _, err := tx.ExecContext(ctx, `UPDATE orders SET confirmed_at=? WHERE id=?`,
+		now.Unix(), orderID); err != nil {
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE reservations SET confirmed_at=? WHERE order_id=?`,
+		now.Unix(), orderID); err != nil {
+		return nil, err
+	}
+
+	// Insert one Ticket per reservation. qrPayloads keyed by reservation.id.
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM reservations WHERE order_id=? ORDER BY id`, orderID)
+	if err != nil {
+		return nil, err
+	}
+	var resIDs []int64
+	for rows.Next() {
+		var id int64
+		_ = rows.Scan(&id)
+		resIDs = append(resIDs, id)
+	}
+	rows.Close()
+
+	tickets := make([]Ticket, 0, len(resIDs))
+	for _, rid := range resIDs {
+		qr, ok := qrPayloads[rid]
+		if !ok {
+			return nil, fmt.Errorf("ConfirmOrder: missing QR payload for reservation %d", rid)
+		}
+		res, err := tx.ExecContext(ctx,
+			`INSERT INTO tickets(reservation_id, qr_payload, issued_at) VALUES (?, ?, ?)`,
+			rid, qr, now.Unix())
+		if err != nil {
+			return nil, err
+		}
+		tid, _ := res.LastInsertId()
+		tickets = append(tickets, Ticket{
+			ID: tid, ReservationID: rid, QRPayload: qr, IssuedAt: now,
+		})
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return tickets, nil
+}
+
+// LinkOrderToTGChat associates a web-buyer order with a Telegram chat so
+// the bot can deliver the PDFs after payment in addition to (or instead
+// of) the email channel. Idempotent: re-linking the same chat is a
+// no-op; linking a different chat overwrites — the most recent /start
+// wins.
+//
+// Both the order row and every reservation row in it get the new chat
+// ids (reservations stay denormalised for legacy queries). Returns
+// ErrCodeNotFound for missing codes, ErrAlreadyClosed for cancelled.
+func (s *Store) LinkOrderToTGChat(ctx context.Context, code string, tgUserID, tgChatID int64) (Order, []OrderItem, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Order{}, nil, err
+	}
+	defer tx.Rollback()
+
+	o, items, err := s.findOrderByCodeTx(ctx, tx, code)
+	if err != nil {
+		return o, nil, err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE orders SET tg_user_id = ?, tg_chat_id = ? WHERE id = ?`,
+		tgUserID, tgChatID, o.ID); err != nil {
+		return o, nil, err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE reservations SET tg_user_id = ?, tg_chat_id = ? WHERE order_id = ?`,
+		tgUserID, tgChatID, o.ID); err != nil {
+		return o, nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return o, nil, err
+	}
+	o.TGUserID = tgUserID
+	o.TGChatID = tgChatID
+	return o, items, nil
+}
+
+// findOrderByCodeTx reuses the same scan as FindOrderByCode but inside an
+// open transaction. Extracted so LinkOrderToTGChat reads order + items
+// atomically with its own UPDATE.
+func (s *Store) findOrderByCodeTx(ctx context.Context, tx *sql.Tx, code string) (Order, []OrderItem, error) {
+	var o Order
+	var conf, cancelled, reminded sql.NullInt64
+	var createdAt, expiresAt int64
+	err := tx.QueryRowContext(ctx, `
+		SELECT id, code, buyer_name, buyer_email, tg_user_id, tg_chat_id,
+		       total_kopecks, created_at, expires_at, confirmed_at, cancelled_at, reminded_at
+		FROM orders WHERE code = ?`, code).Scan(
+		&o.ID, &o.Code, &o.BuyerName, &o.BuyerEmail, &o.TGUserID, &o.TGChatID,
+		&o.TotalKopecks, &createdAt, &expiresAt, &conf, &cancelled, &reminded)
+	if errors.Is(err, sql.ErrNoRows) {
+		return o, nil, ErrCodeNotFound
+	}
+	if err != nil {
+		return o, nil, err
+	}
+	o.CreatedAt = time.Unix(createdAt, 0)
+	o.ExpiresAt = time.Unix(expiresAt, 0)
+	if conf.Valid {
+		t := time.Unix(conf.Int64, 0)
+		o.ConfirmedAt = &t
+	}
+	if cancelled.Valid {
+		t := time.Unix(cancelled.Int64, 0)
+		o.CancelledAt = &t
+		return o, nil, ErrAlreadyClosed
+	}
+	if reminded.Valid {
+		t := time.Unix(reminded.Int64, 0)
+		o.RemindedAt = &t
+	}
+	rows, err := tx.QueryContext(ctx, `
+		SELECT `+resCols+`, r.cancelled_at,
+		       s.id, s.show_id, s.row, s.col, s.x, s.y, s.label, s.category, s.price_kopecks, s.sellable
+		FROM reservations r JOIN seats s ON s.id = r.seat_id
+		WHERE r.order_id = ?
+		ORDER BY r.id`, o.ID)
+	if err != nil {
+		return o, nil, err
+	}
+	defer rows.Close()
+	var items []OrderItem
+	for rows.Next() {
+		var r Reservation
+		var seat Seat
+		if err := scanReservationWithSeat(rows, &r, &seat); err != nil {
+			return o, nil, err
+		}
+		items = append(items, OrderItem{Reservation: r, Seat: seat})
+	}
+	return o, items, nil
 }
 
 // MyReservations returns the user's bookings, newest first.

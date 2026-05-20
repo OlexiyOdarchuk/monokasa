@@ -29,22 +29,39 @@ import (
 
 type payAdapter struct{ s *store.Store }
 
-func (p payAdapter) FindReservationByCode(ctx context.Context, code string) (pay.Reservation, pay.Seat, error) {
-	r, s, err := p.s.FindReservationByCode(ctx, code)
-	out := pay.Reservation{ID: r.ID, TGChatID: r.TGChatID, BuyerName: r.BuyerName, ConfirmedAt: r.ConfirmedAt}
-	seat := pay.Seat{ID: s.ID, Row: s.Row, Col: s.Col, Price: money.New(s.PriceKopecks, currency.UAH)}
+func (p payAdapter) FindOrderByCode(ctx context.Context, code string) (pay.Order, []pay.OrderItem, error) {
+	o, items, err := p.s.FindOrderByCode(ctx, code)
+	payOrder := pay.Order{
+		ID: o.ID, Code: o.Code,
+		BuyerName:    o.BuyerName,
+		BuyerEmail:   o.BuyerEmail,
+		TGChatID:     o.TGChatID,
+		TotalKopecks: o.TotalKopecks,
+		ConfirmedAt:  o.ConfirmedAt,
+	}
 	switch {
 	case errors.Is(err, store.ErrCodeNotFound):
-		return out, seat, pay.ErrCodeNotFound
+		return payOrder, nil, pay.ErrCodeNotFound
 	case errors.Is(err, store.ErrAlreadyClosed):
-		return out, seat, pay.ErrAlreadyClosed
-	default:
-		return out, seat, err
+		return payOrder, nil, pay.ErrAlreadyClosed
+	case err != nil:
+		return payOrder, nil, err
 	}
+	payItems := make([]pay.OrderItem, len(items))
+	for i, it := range items {
+		payItems[i] = pay.OrderItem{
+			ReservationID: it.Reservation.ID,
+			Seat: pay.Seat{
+				ID: it.Seat.ID, Row: it.Seat.Row, Col: it.Seat.Col,
+				Price: money.New(it.Seat.PriceKopecks, currency.UAH),
+			},
+		}
+	}
+	return payOrder, payItems, nil
 }
 
-func (p payAdapter) Confirm(ctx context.Context, reservationID int64, qrPayload string) error {
-	_, err := p.s.Confirm(ctx, reservationID, qrPayload)
+func (p payAdapter) ConfirmOrder(ctx context.Context, orderID int64, qrPayloads map[int64]string) error {
+	_, err := p.s.ConfirmOrder(ctx, orderID, qrPayloads)
 	return err
 }
 

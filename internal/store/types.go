@@ -68,6 +68,28 @@ type Ticket struct {
 	UsedAt        *time.Time
 }
 
+// Order groups one or more reservations under a single payment. Buyer
+// fields, Telegram-chat link, and totals live here — Reservation just
+// points at a seat. One pay code (in monobank comment) confirms the
+// whole order in one shot, producing N PDFs.
+//
+// Single-seat reservations created before multi-seat were migrated into
+// 1-row orders so the rest of the code can treat everything uniformly.
+type Order struct {
+	ID            int64
+	Code          string
+	BuyerName     string
+	BuyerEmail    string
+	TGUserID      int64
+	TGChatID      int64
+	TotalKopecks  int64
+	CreatedAt     time.Time
+	ExpiresAt     time.Time
+	ConfirmedAt   *time.Time
+	CancelledAt   *time.Time
+	RemindedAt    *time.Time
+}
+
 // SeatStatus is one of "free", "held", "sold".
 type SeatStatus string
 

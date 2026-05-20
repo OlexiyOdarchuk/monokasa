@@ -59,6 +59,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/public/shows", h.listShows)
 	mux.HandleFunc("GET /api/public/shows/{slug}", h.getShow)
 	mux.HandleFunc("POST /api/public/reservations", h.createReservation)
+	mux.HandleFunc("POST /api/public/orders", h.createOrder)
 	mux.HandleFunc("GET /api/public/reservations/{code}/status", h.reservationStatus)
 }
 
@@ -314,7 +315,7 @@ func (h *Handler) createReservation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := h.st.Reserve(r.Context(), target, 0, 0, name, email, code, h.hold)
+	order, _, err := h.st.CreateOrder(r.Context(), []store.Seat{target}, 0, 0, name, email, code, h.hold)
 	switch {
 	case errors.Is(err, store.ErrSeatTaken):
 		writeError(w, http.StatusConflict, "seat_taken", "")
@@ -323,22 +324,22 @@ func (h *Handler) createReservation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "seat_not_sellable", "")
 		return
 	case err != nil:
-		writeInternal(w, "reserve", err)
+		writeInternal(w, "create order", err)
 		return
 	}
 
-	payURL := jarPrefillURL(h.jarLink, target.PriceKopecks, res.Code)
+	payURL := jarPrefillURL(h.jarLink, target.PriceKopecks, order.Code)
 	slog.Info("public reservation created",
-		"code", res.Code, "slug", show.Slug, "seatId", target.ID,
+		"code", order.Code, "slug", show.Slug, "seatId", target.ID,
 		"buyer", name, "email", email)
 
 	var tgLink string
 	if h.botUsername != "" {
-		tgLink = fmt.Sprintf("https://t.me/%s?start=res_%s", h.botUsername, res.Code)
+		tgLink = fmt.Sprintf("https://t.me/%s?start=res_%s", h.botUsername, order.Code)
 	}
 
 	writeJSON(w, http.StatusCreated, createReservationResponse{
-		Code: res.Code, ExpiresAt: res.ExpiresAt,
+		Code: order.Code, ExpiresAt: order.ExpiresAt,
 		PayURL: payURL,
 		Seat: publicSeat{
 			ID: target.ID, Row: target.Row, Col: target.Col,
@@ -348,6 +349,151 @@ func (h *Handler) createReservation(w http.ResponseWriter, r *http.Request) {
 		BuyerName:  name,
 		BuyerEmail: email,
 		TGDeepLink: tgLink,
+	})
+}
+
+// --- POST /api/public/orders (multi-seat) ---
+
+type createOrderRequest struct {
+	Slug       string  `json:"slug"`
+	SeatIDs    []int64 `json:"seat_ids"`
+	BuyerName  string  `json:"buyer_name"`
+	BuyerEmail string  `json:"buyer_email"`
+}
+
+type orderItemResponse struct {
+	Seat publicSeat `json:"seat"`
+}
+
+type createOrderResponse struct {
+	Code         string              `json:"code"`
+	ExpiresAt    time.Time           `json:"expires_at"`
+	PayURL       string              `json:"pay_url"`
+	TotalKopecks int64               `json:"total_kopecks"`
+	Items        []orderItemResponse `json:"items"`
+	BuyerName    string              `json:"buyer_name"`
+	BuyerEmail   string              `json:"buyer_email"`
+	TGDeepLink   string              `json:"tg_deep_link,omitempty"`
+}
+
+func (h *Handler) createOrder(w http.ResponseWriter, r *http.Request) {
+	var req createOrderRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	name, err := normalizeName(req.BuyerName)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_name", err.Error())
+		return
+	}
+	email, err := normalizeEmail(req.BuyerEmail)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_email", err.Error())
+		return
+	}
+	if req.Slug == "" || len(req.SeatIDs) == 0 {
+		writeError(w, http.StatusBadRequest, "invalid_input", "slug and seat_ids required")
+		return
+	}
+	if len(req.SeatIDs) > 20 {
+		// Soft cap — keep one purchase from monopolising the room and
+		// blowing up the email batch / Telegram chat message count.
+		writeError(w, http.StatusBadRequest, "too_many_seats",
+			"максимум 20 місць за одну покупку")
+		return
+	}
+
+	show, err := h.st.LoadShowBySlug(r.Context(), req.Slug)
+	if errors.Is(err, store.ErrShowNotFound) {
+		writeError(w, http.StatusNotFound, "show_not_found", "")
+		return
+	}
+	if err != nil {
+		writeInternal(w, "load show", err)
+		return
+	}
+
+	allSeats, err := h.st.Seats(r.Context(), show.ID)
+	if err != nil {
+		writeInternal(w, "list seats", err)
+		return
+	}
+	byID := make(map[int64]store.Seat, len(allSeats))
+	for _, s := range allSeats {
+		byID[s.ID] = s
+	}
+	seenIDs := make(map[int64]struct{}, len(req.SeatIDs))
+	targets := make([]store.Seat, 0, len(req.SeatIDs))
+	for _, id := range req.SeatIDs {
+		if _, dup := seenIDs[id]; dup {
+			writeError(w, http.StatusBadRequest, "duplicate_seat",
+				"seat included twice")
+			return
+		}
+		seenIDs[id] = struct{}{}
+		s, ok := byID[id]
+		if !ok {
+			writeError(w, http.StatusNotFound, "seat_not_found",
+				"seat does not belong to this show")
+			return
+		}
+		if !s.Sellable {
+			writeError(w, http.StatusConflict, "seat_not_sellable", "")
+			return
+		}
+		if s.PriceKopecks < h.priceMin {
+			writeInternal(w, "seat below min price",
+				fmt.Errorf("seat %d price %d < min %d", s.ID, s.PriceKopecks, h.priceMin))
+			return
+		}
+		targets = append(targets, s)
+	}
+
+	code, err := h.coder.NewCode()
+	if err != nil {
+		writeInternal(w, "mint code", err)
+		return
+	}
+
+	order, _, err := h.st.CreateOrder(r.Context(), targets, 0, 0, name, email, code, h.hold)
+	switch {
+	case errors.Is(err, store.ErrSeatTaken):
+		writeError(w, http.StatusConflict, "seat_taken", "одне з місць щойно зайняли")
+		return
+	case errors.Is(err, store.ErrSeatNotSellable):
+		writeError(w, http.StatusConflict, "seat_not_sellable", "")
+		return
+	case err != nil:
+		writeInternal(w, "create order", err)
+		return
+	}
+
+	payURL := jarPrefillURL(h.jarLink, order.TotalKopecks, order.Code)
+	items := make([]orderItemResponse, 0, len(targets))
+	for _, s := range targets {
+		items = append(items, orderItemResponse{Seat: publicSeat{
+			ID: s.ID, Row: s.Row, Col: s.Col,
+			X: s.X, Y: s.Y, Label: s.Label, Category: s.Category,
+			PriceKopecks: s.PriceKopecks, Sellable: true,
+		}})
+	}
+	var tgLink string
+	if h.botUsername != "" {
+		tgLink = fmt.Sprintf("https://t.me/%s?start=res_%s", h.botUsername, order.Code)
+	}
+	slog.Info("public order created",
+		"code", order.Code, "slug", show.Slug, "seats", len(targets),
+		"total", order.TotalKopecks, "buyer", name, "email", email)
+
+	writeJSON(w, http.StatusCreated, createOrderResponse{
+		Code:         order.Code,
+		ExpiresAt:    order.ExpiresAt,
+		PayURL:       payURL,
+		TotalKopecks: order.TotalKopecks,
+		Items:        items,
+		BuyerName:    name,
+		BuyerEmail:   email,
+		TGDeepLink:   tgLink,
 	})
 }
 

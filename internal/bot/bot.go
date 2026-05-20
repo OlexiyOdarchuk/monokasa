@@ -52,6 +52,25 @@ type Seat struct {
 	Sellable bool
 }
 
+// Order is the bot-side view of a payment-grouping order. Used by
+// the /start res_<code> deep link to attach a chat to a web-buyer's
+// pending order so the PDFs land in Telegram on payment.
+type Order struct {
+	ID          int64
+	Code        string
+	BuyerName   string
+	BuyerEmail  string
+	TGChatID    int64
+	ConfirmedAt *time.Time
+}
+
+// OrderItem couples a reservation with its seat for /my output and
+// linking confirmations.
+type OrderItem struct {
+	Reservation Reservation
+	Seat        Seat
+}
+
 // Reservation mirrors a stored reservation row.
 type Reservation struct {
 	ID          int64
@@ -123,11 +142,11 @@ type Store interface {
 	CancelReservation(ctx context.Context, code string, tgUserID int64) (Reservation, Seat, error)
 	MyReservations(ctx context.Context, tgUserID int64) ([]MyItem, error)
 	Stats(ctx context.Context, showID int64) (Stats, error)
-	// LinkReservationToTGChat attaches a Telegram chat to a web-buyer
-	// reservation by its public code so the bot can deliver the PDF after
-	// payment. Returns ErrCodeNotFound for unknown codes, ErrAlreadyClosed
-	// for cancelled reservations.
-	LinkReservationToTGChat(ctx context.Context, code string, tgUserID, tgChatID int64) (Reservation, Seat, error)
+	// LinkOrderToTGChat attaches a Telegram chat to a web-buyer order
+	// by its public code so the bot can deliver the PDFs after payment.
+	// Returns ErrCodeNotFound for unknown codes, ErrAlreadyClosed for
+	// cancelled orders.
+	LinkOrderToTGChat(ctx context.Context, code string, tgUserID, tgChatID int64) (Order, []OrderItem, error)
 }
 
 // ReconcileResult is the outcome of a /reconcile sweep.
@@ -652,25 +671,32 @@ func (b *Bot) linkReservation(c tele.Context, code string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	r, seat, err := b.store.LinkReservationToTGChat(ctx, code, sender.ID, c.Chat().ID)
+	order, items, err := b.store.LinkOrderToTGChat(ctx, code, sender.ID, c.Chat().ID)
 	switch {
 	case errors.Is(err, ErrCodeNotFound):
 		return c.Send("Цю бронь не знайдено. Можливо, посилання застаріле.")
 	case errors.Is(err, ErrAlreadyClosed):
 		return c.Send("Цю бронь вже скасовано.")
 	case err != nil:
-		slog.Error("link reservation", "code", code, "err", err)
+		slog.Error("link order", "code", code, "err", err)
 		return c.Send("Внутрішня помилка, спробуй пізніше.")
 	}
 
-	if r.ConfirmedAt != nil {
+	var seatList strings.Builder
+	for i, it := range items {
+		if i > 0 {
+			seatList.WriteString(", ")
+		}
+		fmt.Fprintf(&seatList, "ряд %d місце %d", it.Seat.Row, it.Seat.Col)
+	}
+	if order.ConfirmedAt != nil {
 		return c.Send(fmt.Sprintf(
-			"Бронь вже оплачена 🎉\nРяд %d, місце %d.\nКвиток із QR прийшов на email — перевір пошту.",
-			seat.Row, seat.Col))
+			"Бронь вже оплачена 🎉\nМісця: %s.\nКвитки прийшли на email — перевір пошту.",
+			seatList.String()))
 	}
 	return c.Send(fmt.Sprintf(
-		"Підключив цю бронь до Telegram ✅\nРяд %d, місце %d.\nПісля оплати квиток із QR прийде сюди (і на email також).",
-		seat.Row, seat.Col))
+		"Підключив цю бронь до Telegram ✅\nМісця: %s.\nПісля оплати квитки прийдуть сюди (і на email також).",
+		seatList.String()))
 }
 
 // --- /my ---

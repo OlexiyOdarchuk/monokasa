@@ -1,6 +1,10 @@
-// Package pay glues the mono webhook to the rest of the app: match a
-// transfer against an open reservation by code, confirm it, render the
-// ticket PDF and send it to the buyer.
+// Package pay glues the mono webhook to the rest of the app: match the
+// short code in a transfer comment against an open Order, confirm the
+// whole order (one or N seats), render PDFs and ship them to the buyer
+// over Telegram and/or email.
+//
+// Pre-multi-seat single-seat reservations are migrated into 1-row
+// orders by store.Open, so this package has only one lookup path now.
 package pay
 
 import (
@@ -32,56 +36,64 @@ type Seat struct {
 	Price    money.Money
 }
 
-// Reservation is the subset of reservation info the processor needs.
-// BuyerEmail is populated for web-buyer reservations; empty for the
-// Telegram-only flow.
-type Reservation struct {
-	ID          int64
-	TGChatID    int64
-	BuyerName   string
-	BuyerEmail  string
-	ConfirmedAt *time.Time
+// Order is the subset of order info the processor reasons about.
+type Order struct {
+	ID           int64
+	Code         string
+	BuyerName    string
+	BuyerEmail   string
+	TGChatID     int64
+	TotalKopecks int64
+	ConfirmedAt  *time.Time
+}
+
+// OrderItem is one seat inside an order. ReservationID is what we mint
+// the QR payload for (each PDF carries one reservation's QR).
+type OrderItem struct {
+	ReservationID int64
+	Seat          Seat
 }
 
 // Domain errors the processor expects the Store to return.
 var (
-	ErrCodeNotFound  = errors.New("reservation code not found")
-	ErrAlreadyClosed = errors.New("reservation already closed")
+	ErrCodeNotFound  = errors.New("order code not found")
+	ErrAlreadyClosed = errors.New("order already closed")
 )
 
 // Store is the persistence behavior the processor needs.
 type Store interface {
-	FindReservationByCode(ctx context.Context, code string) (Reservation, Seat, error)
-	Confirm(ctx context.Context, reservationID int64, qrPayload string) error
+	FindOrderByCode(ctx context.Context, code string) (Order, []OrderItem, error)
+	ConfirmOrder(ctx context.Context, orderID int64, qrPayloads map[int64]string) error
 }
 
-// Coder mints the signed QR payload embedded in the issued ticket.
+// Coder mints the signed QR payload embedded in each issued ticket.
 type Coder interface {
 	QRPayload(reservationID, seatID int64) string
 }
 
-// Notifier delivers the rendered ticket back to the buyer over Telegram.
+// Notifier delivers a ticket PDF over Telegram. Called once per seat.
 type Notifier interface {
 	SendTicket(chatID int64, seat Seat, pdf []byte) error
 }
 
-// EmailDelivery is the side channel for web-buyer reservations that came
-// in without a Telegram chat. Implementations build their own subject/
-// body and ship the PDF as an attachment.
+// EmailItem couples a seat with its rendered PDF for batch email delivery.
+type EmailItem struct {
+	Seat Seat
+	PDF  []byte
+}
+
+// EmailDelivery ships tickets over SMTP. SendTicketBatchEmail takes all
+// items in one message (single email, N attachments). Cancellation is a
+// separate channel — body and no attachments.
 type EmailDelivery interface {
-	SendTicketEmail(ctx context.Context, to, buyerName string, seat Seat, show Show, pdf []byte) error
-	// SendCancellationEmail notifies the buyer that admin cancelled
-	// their reservation. Best-effort — caller logs failures but doesn't
-	// propagate them; the cancel succeeded in the DB regardless.
+	SendTicketBatchEmail(ctx context.Context, to, buyerName string, items []EmailItem, show Show) error
 	SendCancellationEmail(ctx context.Context, to, buyerName string, seat Seat, show Show) error
 }
 
 // Renderer turns a confirmed reservation into a printable PDF.
 type Renderer func(show Show, seat Seat, buyerName, qrPayload string) ([]byte, error)
 
-// ShowFn resolves the currently active show on each payment. Reading
-// fresh keeps the PDF header (title/venue/start) in sync with admin edits
-// without restarting the process.
+// ShowFn resolves the currently active show on each payment.
 type ShowFn func(ctx context.Context) (Show, error)
 
 type Processor struct {
@@ -105,8 +117,7 @@ func (p *Processor) Handle(ctx context.Context, e *webhook.Response) error {
 }
 
 // ReconcileTx replays one transaction through the matching logic — used
-// by the admin /reconcile command to catch webhooks Mono dropped. Returns
-// true if the transaction issued a ticket on this call.
+// by the admin /reconcile command to catch webhooks Mono dropped.
 func (p *Processor) ReconcileTx(ctx context.Context, tx bank.Transaction) (bool, error) {
 	matched, err := p.processTx(ctx, tx)
 	if matched {
@@ -122,76 +133,104 @@ func (p *Processor) processTx(ctx context.Context, t bank.Transaction) (bool, er
 
 	code := extractCode(t.Comment, t.Description)
 	if code == "" {
-		slog.Info("payment with no reservation code in comment",
+		slog.Info("payment with no order code in comment",
 			"txId", t.ID, "comment", t.Comment)
 		return false, nil
 	}
-	res, seat, err := p.Store.FindReservationByCode(ctx, code)
+	order, items, err := p.Store.FindOrderByCode(ctx, code)
 	if errors.Is(err, ErrCodeNotFound) || errors.Is(err, ErrAlreadyClosed) {
-		slog.Info("payment code has no open reservation",
+		slog.Info("payment code has no open order",
 			"txId", t.ID, "code", code)
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
-	if res.ConfirmedAt != nil {
-		slog.Info("payment for already-confirmed reservation",
+	if order.ConfirmedAt != nil {
+		slog.Info("payment for already-confirmed order",
 			"txId", t.ID, "code", code)
 		return false, nil
 	}
-	// Each seat carries its own price (set by the admin layout editor);
-	// the floor for "is this payment enough" is per-seat, not global.
-	// Overpayment is fine — exact match is fine — short payment is rejected.
-	if t.Amount.Minor < seat.Price.Minor {
+	// Accept paid >= total: overpayment is fine, exact match is fine,
+	// short payment is rejected.
+	if t.Amount.Minor < order.TotalKopecks {
 		slog.Warn("payment short",
-			"txId", t.ID, "paid", t.Amount, "need", seat.Price, "code", code)
+			"txId", t.ID, "paid", t.Amount, "need", order.TotalKopecks, "code", code)
 		return false, nil
 	}
 
-	// Resolve the show *before* Confirm so a transient store error doesn't
-	// leave us with a confirmed reservation we can't render a ticket for.
-	// Webhook retries replay processTx end-to-end; we'd then hit
-	// ErrAlreadyPaid on Confirm and never render the PDF.
+	// Resolve the show before Confirm so a transient failure doesn't
+	// leave us with a confirmed order and no rendered PDFs.
 	show, err := p.ShowFn(ctx)
 	if err != nil {
 		return false, fmt.Errorf("resolve show: %w", err)
 	}
 
-	qrPayload := p.Coder.QRPayload(res.ID, seat.ID)
-	if err := p.Store.Confirm(ctx, res.ID, qrPayload); err != nil {
+	// Mint a QR per reservation. ConfirmOrder writes Ticket rows
+	// pointing at these payloads — same atomic transaction.
+	qrs := make(map[int64]string, len(items))
+	for _, it := range items {
+		qrs[it.ReservationID] = p.Coder.QRPayload(it.ReservationID, it.Seat.ID)
+	}
+	if err := p.Store.ConfirmOrder(ctx, order.ID, qrs); err != nil {
 		return false, err
 	}
-	pdf, err := p.Renderer(show, seat, res.BuyerName, qrPayload)
-	if err != nil {
-		return false, err
+
+	// Render each PDF; if any render fails we still log_warn and
+	// continue — the rest of the order shouldn't be held hostage.
+	pdfs := make([][]byte, 0, len(items))
+	for _, it := range items {
+		pdf, err := p.Renderer(show, it.Seat, order.BuyerName, qrs[it.ReservationID])
+		if err != nil {
+			slog.Error("render pdf",
+				"code", code, "seatId", it.Seat.ID, "err", err)
+			continue
+		}
+		pdfs = append(pdfs, pdf)
 	}
-	// Telegram delivery only when the reservation actually has a chat id
-	// (bot flow). Web-buyer reservations have chatId=0 and rely on email.
-	if res.TGChatID != 0 {
-		if err := p.Notifier.SendTicket(res.TGChatID, seat, pdf); err != nil {
-			return false, err
+
+	// Telegram delivery: one document per seat. Stops on first send
+	// error — Telegram is usually all-or-nothing per chat.
+	if order.TGChatID != 0 {
+		for i, it := range items {
+			if i >= len(pdfs) {
+				break
+			}
+			if err := p.Notifier.SendTicket(order.TGChatID, it.Seat, pdfs[i]); err != nil {
+				return false, err
+			}
 		}
 	}
-	if res.BuyerEmail != "" {
+
+	// Email delivery: single message with N attachments. Failure
+	// doesn't block — order is already confirmed in the DB.
+	if order.BuyerEmail != "" {
 		if p.Email == nil {
 			slog.Warn("buyer has email but no SMTP configured — ticket only in DB",
-				"code", code, "email", res.BuyerEmail)
-		} else if err := p.Email.SendTicketEmail(ctx, res.BuyerEmail, res.BuyerName, seat, show, pdf); err != nil {
-			// Don't fail the webhook over an email hiccup — the reservation
-			// is confirmed in the DB; admin can re-trigger from the web UI
-			// later (and the operator already gets the SMTP error via slog).
-			slog.Error("send ticket email", "code", code, "to", res.BuyerEmail, "err", err)
+				"code", code, "email", order.BuyerEmail)
+		} else {
+			batch := make([]EmailItem, 0, len(pdfs))
+			for i, it := range items {
+				if i >= len(pdfs) {
+					break
+				}
+				batch = append(batch, EmailItem{Seat: it.Seat, PDF: pdfs[i]})
+			}
+			if err := p.Email.SendTicketBatchEmail(ctx, order.BuyerEmail, order.BuyerName, batch, show); err != nil {
+				slog.Error("send ticket batch email",
+					"code", code, "to", order.BuyerEmail, "err", err)
+			}
 		}
 	}
-	slog.Info("ticket issued",
+
+	slog.Info("order confirmed",
 		"code", code,
-		"row", seat.Row,
-		"seat", seat.Col,
-		"buyer", res.BuyerName,
-		"email", res.BuyerEmail,
-		"chatId", res.TGChatID,
-		"paid", t.Amount)
+		"seats", len(items),
+		"buyer", order.BuyerName,
+		"email", order.BuyerEmail,
+		"chatId", order.TGChatID,
+		"paid", t.Amount,
+		"need", order.TotalKopecks)
 	return true, nil
 }
 

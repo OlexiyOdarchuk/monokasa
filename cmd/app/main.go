@@ -632,9 +632,25 @@ func (b botStore) CancelReservation(ctx context.Context, code string, tgUserID i
 	return toBotReservation(r), toBotSeat(s), translateStoreErr(err)
 }
 
-func (b botStore) LinkReservationToTGChat(ctx context.Context, code string, tgUserID, tgChatID int64) (bot.Reservation, bot.Seat, error) {
-	r, s, err := b.s.LinkReservationToTGChat(ctx, code, tgUserID, tgChatID)
-	return toBotReservation(r), toBotSeat(s), translateStoreErr(err)
+func (b botStore) LinkOrderToTGChat(ctx context.Context, code string, tgUserID, tgChatID int64) (bot.Order, []bot.OrderItem, error) {
+	o, items, err := b.s.LinkOrderToTGChat(ctx, code, tgUserID, tgChatID)
+	if err != nil {
+		return bot.Order{}, nil, translateStoreErr(err)
+	}
+	botOrder := bot.Order{
+		ID: o.ID, Code: o.Code,
+		BuyerName: o.BuyerName, BuyerEmail: o.BuyerEmail,
+		TGChatID:    o.TGChatID,
+		ConfirmedAt: o.ConfirmedAt,
+	}
+	botItems := make([]bot.OrderItem, len(items))
+	for i, it := range items {
+		botItems[i] = bot.OrderItem{
+			Reservation: toBotReservation(it.Reservation),
+			Seat:        toBotSeat(it.Seat),
+		}
+	}
+	return botOrder, botItems, nil
 }
 
 func (b botStore) MyReservations(ctx context.Context, tgUserID int64) ([]bot.MyItem, error) {
@@ -713,30 +729,39 @@ func (w webStore) FindReservationByTicket(ctx context.Context, ticketID int64) (
 
 type payStore struct{ s *store.Store }
 
-func (p payStore) FindReservationByCode(ctx context.Context, code string) (pay.Reservation, pay.Seat, error) {
-	r, s, err := p.s.FindReservationByCode(ctx, code)
-	out := pay.Reservation{
-		ID:          r.ID,
-		TGChatID:    r.TGChatID,
-		BuyerName:   r.BuyerName,
-		BuyerEmail:  r.BuyerEmail,
-		ConfirmedAt: r.ConfirmedAt,
+func (p payStore) FindOrderByCode(ctx context.Context, code string) (pay.Order, []pay.OrderItem, error) {
+	o, items, err := p.s.FindOrderByCode(ctx, code)
+	payOrder := pay.Order{
+		ID: o.ID, Code: o.Code,
+		BuyerName:    o.BuyerName,
+		BuyerEmail:   o.BuyerEmail,
+		TGChatID:     o.TGChatID,
+		TotalKopecks: o.TotalKopecks,
+		ConfirmedAt:  o.ConfirmedAt,
 	}
-	seat := pay.Seat{ID: s.ID, Row: s.Row, Col: s.Col, Price: money.New(s.PriceKopecks, currency.UAH)}
-	switch err {
-	case nil:
-		return out, seat, nil
-	case store.ErrCodeNotFound:
-		return out, seat, pay.ErrCodeNotFound
-	case store.ErrAlreadyClosed:
-		return out, seat, pay.ErrAlreadyClosed
-	default:
-		return out, seat, err
+	switch {
+	case errors.Is(err, store.ErrCodeNotFound):
+		return payOrder, nil, pay.ErrCodeNotFound
+	case errors.Is(err, store.ErrAlreadyClosed):
+		return payOrder, nil, pay.ErrAlreadyClosed
+	case err != nil:
+		return payOrder, nil, err
 	}
+	payItems := make([]pay.OrderItem, len(items))
+	for i, it := range items {
+		payItems[i] = pay.OrderItem{
+			ReservationID: it.Reservation.ID,
+			Seat: pay.Seat{
+				ID: it.Seat.ID, Row: it.Seat.Row, Col: it.Seat.Col,
+				Price: money.New(it.Seat.PriceKopecks, currency.UAH),
+			},
+		}
+	}
+	return payOrder, payItems, nil
 }
 
-func (p payStore) Confirm(ctx context.Context, reservationID int64, qrPayload string) error {
-	_, err := p.s.Confirm(ctx, reservationID, qrPayload)
+func (p payStore) ConfirmOrder(ctx context.Context, orderID int64, qrPayloads map[int64]string) error {
+	_, err := p.s.ConfirmOrder(ctx, orderID, qrPayloads)
 	return err
 }
 
@@ -773,28 +798,50 @@ func (p payEmail) SendCancellationEmail(ctx context.Context, to, buyerName strin
 	})
 }
 
-func (p payEmail) SendTicketEmail(ctx context.Context, to, buyerName string, seat pay.Seat, show pay.Show, pdf []byte) error {
+func (p payEmail) SendTicketBatchEmail(ctx context.Context, to, buyerName string, items []pay.EmailItem, show pay.Show) error {
+	if len(items) == 0 {
+		return nil
+	}
+	var seatList strings.Builder
+	attachments := make([]email.Attachment, 0, len(items))
+	for _, it := range items {
+		fmt.Fprintf(&seatList, "<li>ряд %d · місце %d</li>", it.Seat.Row, it.Seat.Col)
+		attachments = append(attachments, email.Attachment{
+			Filename:    fmt.Sprintf("ticket-row-%d-seat-%d.pdf", it.Seat.Row, it.Seat.Col),
+			Body:        it.PDF,
+			ContentType: "application/pdf",
+		})
+	}
+	noun := "квиток"
+	if len(items) > 1 {
+		noun = fmt.Sprintf("квитки (%d шт.)", len(items))
+	}
 	body := fmt.Sprintf(`<!doctype html>
 <html><body style="font-family:system-ui,sans-serif;color:#111;line-height:1.5">
-<h2 style="margin:0 0 .5em">Твій квиток на «%s»</h2>
+<h2 style="margin:0 0 .5em">Твої %s на «%s»</h2>
 <p>Привіт, %s!<br>
-Оплата зарахована — квиток у вкладеному PDF.</p>
-<p><b>Місце:</b> ряд %d · %d<br>
-<b>Коли:</b> %s<br>
+Оплата зарахована — %s у вкладеннях.</p>
+<p><b>Місця:</b></p>
+<ul>%s</ul>
+<p><b>Коли:</b> %s<br>
 <b>Де:</b> %s</p>
 <p>На вході покажи QR з PDF — ми відскануємо.</p>
 <p style="color:#666;font-size:.875em">Питання? Просто дайте відповідь на цей лист.</p>
 </body></html>`,
-		htmlEscape(show.Title), htmlEscape(buyerName),
-		seat.Row, seat.Col,
+		htmlEscape(noun), htmlEscape(show.Title),
+		htmlEscape(buyerName), htmlEscape(noun),
+		seatList.String(),
 		timefmt.DateTime(show.StartsAt), htmlEscape(show.Venue))
 
+	subject := fmt.Sprintf("Твій квиток на «%s»", show.Title)
+	if len(items) > 1 {
+		subject = fmt.Sprintf("Твої квитки (%d) на «%s»", len(items), show.Title)
+	}
 	return p.sender.Send(ctx, email.Message{
-		To:             to,
-		Subject:        fmt.Sprintf("Твій квиток на «%s»", show.Title),
-		HTMLBody:       body,
-		AttachmentName: fmt.Sprintf("ticket-row-%d-seat-%d.pdf", seat.Row, seat.Col),
-		AttachmentBody: pdf,
+		To:          to,
+		Subject:     subject,
+		HTMLBody:    body,
+		Attachments: attachments,
 	})
 }
 

@@ -34,14 +34,22 @@ type Sender interface {
 	Send(ctx context.Context, msg Message) error
 }
 
-// Message describes one outbound email. AttachmentName is the filename the
-// recipient sees ("ticket.pdf"); AttachmentBody is the raw bytes.
+// Message describes one outbound email. Zero, one, or many attachments
+// are supported — buyer-side multi-seat orders need N PDFs in a single
+// message; cancellation emails carry none.
 type Message struct {
-	To             string
-	Subject        string
-	HTMLBody       string
-	AttachmentName string
-	AttachmentBody []byte
+	To          string
+	Subject     string
+	HTMLBody    string
+	Attachments []Attachment
+}
+
+// Attachment is one file payload inside a Message. ContentType defaults
+// to "application/octet-stream" when empty; for PDFs pass "application/pdf".
+type Attachment struct {
+	Filename    string
+	Body        []byte
+	ContentType string
 }
 
 // SMTPSender uses standard net/smtp. STARTTLS is upgraded automatically by
@@ -188,14 +196,22 @@ func BuildMessage(from string, msg Message) ([]byte, error) {
 	}
 	w("")
 
-	// PDF attachment — base64 with hard line breaks at 76 chars (RFC 2045).
-	if msg.AttachmentName != "" && len(msg.AttachmentBody) > 0 {
+	// Each attachment as its own multipart part — base64 body wrapped at
+	// 76 chars per RFC 2045.
+	for _, att := range msg.Attachments {
+		if att.Filename == "" || len(att.Body) == 0 {
+			continue
+		}
+		ct := att.ContentType
+		if ct == "" {
+			ct = "application/octet-stream"
+		}
 		w("--" + boundary)
-		w("Content-Type: application/pdf; name=" + quoteHeader(msg.AttachmentName))
+		w("Content-Type: " + ct + "; name=" + quoteHeader(att.Filename))
 		w("Content-Transfer-Encoding: base64")
-		w(`Content-Disposition: attachment; filename=` + quoteHeader(msg.AttachmentName))
+		w(`Content-Disposition: attachment; filename=` + quoteHeader(att.Filename))
 		w("")
-		writeBase64Wrapped(&buf, msg.AttachmentBody)
+		writeBase64Wrapped(&buf, att.Body)
 		w("")
 	}
 

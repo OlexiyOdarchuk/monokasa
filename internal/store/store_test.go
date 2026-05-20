@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -793,6 +794,152 @@ func TestAdminCancelReservationNotFound(t *testing.T) {
 	}
 }
 
+func TestCreateOrderMultiSeat(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	showID, _ := s.CreateShow(ctx, Show{Title: "T", StartsAt: time.Now()}, 1, 3, 250_00)
+	seats, _ := s.Seats(ctx, showID)
+
+	order, reservations, err := s.CreateOrder(
+		ctx, seats, 0, 0, "Buyer", "buyer@x.com", "abcd1234", 5*time.Minute,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if order.ID == 0 || order.Code != "abcd1234" {
+		t.Errorf("order = %+v", order)
+	}
+	if order.TotalKopecks != 250_00*3 {
+		t.Errorf("total = %d, want 75000", order.TotalKopecks)
+	}
+	if len(reservations) != 3 {
+		t.Fatalf("reservations = %d, want 3", len(reservations))
+	}
+	for i, r := range reservations {
+		want := fmt.Sprintf("abcd1234.%d", i+1)
+		if r.Code != want {
+			t.Errorf("reservation[%d].Code = %q, want %q", i, r.Code, want)
+		}
+	}
+}
+
+func TestCreateOrderSingleSeatKeepsBareCode(t *testing.T) {
+	// When the order has a single reservation, no ".1" suffix — keeps
+	// the legacy form so old display code stays correct.
+	s := newTestStore(t)
+	ctx := context.Background()
+	showID, _ := s.CreateShow(ctx, Show{Title: "T", StartsAt: time.Now()}, 1, 1, 100)
+	seats, _ := s.Seats(ctx, showID)
+
+	_, reservations, err := s.CreateOrder(ctx, seats, 0, 0, "X", "x@y.com", "solo1234", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reservations) != 1 || reservations[0].Code != "solo1234" {
+		t.Errorf("single-seat code = %q, want %q", reservations[0].Code, "solo1234")
+	}
+}
+
+func TestCreateOrderRefusesTakenSeat(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	showID, _ := s.CreateShow(ctx, Show{Title: "T", StartsAt: time.Now()}, 1, 2, 100)
+	seats, _ := s.Seats(ctx, showID)
+	// Pre-book seats[0] via single-seat Reserve, then try to include
+	// it in a multi-seat order — should fail atomically (no order row
+	// created).
+	if _, err := s.Reserve(ctx, seats[0], 1, 100, "A", "", "first123", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := s.CreateOrder(ctx, seats, 0, 0, "B", "b@x.com", "multi456", time.Minute)
+	if !errors.Is(err, ErrSeatTaken) {
+		t.Fatalf("got %v, want ErrSeatTaken", err)
+	}
+	// Make sure the order didn't sneak in.
+	if _, _, err := s.FindOrderByCode(ctx, "multi456"); !errors.Is(err, ErrCodeNotFound) {
+		t.Errorf("partial order row leaked: %v", err)
+	}
+}
+
+func TestFindOrderByCodeAndConfirmOrder(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	showID, _ := s.CreateShow(ctx, Show{Title: "T", StartsAt: time.Now()}, 1, 2, 100)
+	seats, _ := s.Seats(ctx, showID)
+
+	_, reservations, err := s.CreateOrder(ctx, seats, 0, 0, "Buyer", "b@x.com", "find1234", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	order, items, err := s.FindOrderByCode(ctx, "find1234")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if order.Code != "find1234" || len(items) != 2 {
+		t.Errorf("find: order=%+v items=%d", order, len(items))
+	}
+
+	// Confirm: QR payload per reservation id; ticket per reservation.
+	qrs := map[int64]string{
+		reservations[0].ID: "qr-1",
+		reservations[1].ID: "qr-2",
+	}
+	tickets, err := s.ConfirmOrder(ctx, order.ID, qrs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tickets) != 2 {
+		t.Errorf("tickets = %d, want 2", len(tickets))
+	}
+	// Re-confirm should fail.
+	if _, err := s.ConfirmOrder(ctx, order.ID, qrs); !errors.Is(err, ErrAlreadyPaid) {
+		t.Errorf("re-confirm: got %v, want ErrAlreadyPaid", err)
+	}
+}
+
+func TestLegacyReservationMigratedToOrder(t *testing.T) {
+	// Simulate a legacy database: a single-seat reservation created via
+	// the old Reserve method. After Open's migrations run, an orders
+	// row must exist for it with the same code, and reservation must
+	// be linked.
+	s := newTestStore(t)
+	ctx := context.Background()
+	showID, _ := s.CreateShow(ctx, Show{Title: "T", StartsAt: time.Now()}, 1, 1, 250_00)
+	seats, _ := s.Seats(ctx, showID)
+	_, err := s.Reserve(ctx, seats[0], 0, 0, "Legacy", "", "legacy12", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Pre-existing rows already migrated by Open's idempotent backfill,
+	// but the Reserve we just did doesn't go through it — verify the
+	// new-flow path (FindOrderByCode) still works for it. We backfill
+	// manually here, mirroring what Open() does on next start.
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT OR IGNORE INTO orders (code, buyer_name, buyer_email, tg_user_id, tg_chat_id, total_kopecks, created_at, expires_at, confirmed_at, cancelled_at, reminded_at)
+		SELECT r.code, r.buyer_name, r.buyer_email, r.tg_user_id, r.tg_chat_id,
+		       (SELECT price_kopecks FROM seats WHERE id = r.seat_id),
+		       r.created_at, r.expires_at, r.confirmed_at, r.cancelled_at, r.reminded_at
+		FROM reservations r WHERE r.order_id IS NULL`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE reservations SET order_id = (SELECT id FROM orders WHERE code = reservations.code) WHERE order_id IS NULL`); err != nil {
+		t.Fatal(err)
+	}
+
+	order, items, err := s.FindOrderByCode(ctx, "legacy12")
+	if err != nil {
+		t.Fatalf("find legacy order: %v", err)
+	}
+	if order.TotalKopecks != 250_00 {
+		t.Errorf("legacy total = %d, want 25000", order.TotalKopecks)
+	}
+	if len(items) != 1 {
+		t.Errorf("legacy items = %d, want 1", len(items))
+	}
+}
+
 func TestLinkReservationToTGChat(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
@@ -805,7 +952,7 @@ func TestLinkReservationToTGChat(t *testing.T) {
 	}
 
 	// Link to a TG chat.
-	linked, _, err := s.LinkReservationToTGChat(ctx, r.Code, 12345, 67890)
+	linked, _, err := s.LinkOrderToTGChat(ctx, r.Code, 12345, 67890)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -813,7 +960,7 @@ func TestLinkReservationToTGChat(t *testing.T) {
 		t.Errorf("link did not persist: %+v", linked)
 	}
 	// Re-link to a different chat is fine (latest wins).
-	relinked, _, err := s.LinkReservationToTGChat(ctx, r.Code, 99, 88)
+	relinked, _, err := s.LinkOrderToTGChat(ctx, r.Code, 99, 88)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -832,14 +979,14 @@ func TestLinkReservationCancelledFails(t *testing.T) {
 	if _, _, err := s.AdminCancelReservation(ctx, r.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.LinkReservationToTGChat(ctx, r.Code, 1, 2); !errors.Is(err, ErrAlreadyClosed) {
+	if _, _, err := s.LinkOrderToTGChat(ctx, r.Code, 1, 2); !errors.Is(err, ErrAlreadyClosed) {
 		t.Errorf("link cancelled: got %v, want ErrAlreadyClosed", err)
 	}
 }
 
 func TestLinkReservationNotFound(t *testing.T) {
 	s := newTestStore(t)
-	if _, _, err := s.LinkReservationToTGChat(context.Background(), "nosuchcd", 1, 2); !errors.Is(err, ErrCodeNotFound) {
+	if _, _, err := s.LinkOrderToTGChat(context.Background(), "nosuchcd", 1, 2); !errors.Is(err, ErrCodeNotFound) {
 		t.Errorf("got %v, want ErrCodeNotFound", err)
 	}
 }

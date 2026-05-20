@@ -43,13 +43,15 @@ func TestExtractCode(t *testing.T) {
 }
 
 // fakeStore is an in-memory implementation of Store for processor tests.
+// One known order keyed by `code`; lookups for any other code return
+// ErrCodeNotFound. ConfirmOrder flips the order to confirmed so a second
+// processTx sees the already-paid branch.
 type fakeStore struct {
-	mu          sync.Mutex
-	reservation Reservation
-	seat        Seat
-	codeKnown   string
+	mu    sync.Mutex
+	order Order
+	items []OrderItem
+	code  string
 
-	// failFind / failConfirm tag specific failure modes the test wants.
 	failFind    error
 	failConfirm error
 
@@ -57,34 +59,31 @@ type fakeStore struct {
 }
 
 type confirmCall struct {
-	reservationID int64
-	qrPayload     string
+	orderID    int64
+	qrPayloads map[int64]string
 }
 
-func (f *fakeStore) FindReservationByCode(_ context.Context, code string) (Reservation, Seat, error) {
+func (f *fakeStore) FindOrderByCode(_ context.Context, code string) (Order, []OrderItem, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.failFind != nil {
-		return Reservation{}, Seat{}, f.failFind
+		return Order{}, nil, f.failFind
 	}
-	if code != f.codeKnown {
-		return Reservation{}, Seat{}, ErrCodeNotFound
+	if code != f.code {
+		return Order{}, nil, ErrCodeNotFound
 	}
-	return f.reservation, f.seat, nil
+	return f.order, f.items, nil
 }
 
-func (f *fakeStore) Confirm(_ context.Context, reservationID int64, qrPayload string) error {
+func (f *fakeStore) ConfirmOrder(_ context.Context, orderID int64, qrPayloads map[int64]string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.confirmCalls = append(f.confirmCalls, confirmCall{reservationID, qrPayload})
+	f.confirmCalls = append(f.confirmCalls, confirmCall{orderID, qrPayloads})
 	if f.failConfirm != nil {
 		return f.failConfirm
 	}
-	// First successful confirm flips the in-memory reservation to confirmed,
-	// so a second processTx() under the same code sees the "already paid"
-	// branch and short-circuits.
 	now := time.Now()
-	f.reservation.ConfirmedAt = &now
+	f.order.ConfirmedAt = &now
 	return nil
 }
 
@@ -126,36 +125,40 @@ func newTestProcessor(store *fakeStore, notifier *fakeNotifier) *Processor {
 	}
 }
 
-// fakeEmail captures any EmailDelivery.SendTicketEmail calls so tests can
-// assert the web-buyer flow without standing up a real SMTP server.
+// fakeEmail captures every SendTicketBatchEmail call for assertion.
 type fakeEmail struct {
-	mu    sync.Mutex
-	calls []emailCall
-	err   error
+	mu       sync.Mutex
+	batches  [][]EmailItem
+	cancels  []cancelCall
+	err      error
+	cancelErr error
 }
 
-type emailCall struct {
+type cancelCall struct {
 	to        string
 	buyerName string
-	seatRow   int
-	seatCol   int
-	pdfLen    int
+	seat      Seat
 }
 
-func (f *fakeEmail) SendTicketEmail(_ context.Context, to, buyerName string, seat Seat, _ Show, pdf []byte) error {
+func (f *fakeEmail) SendTicketBatchEmail(_ context.Context, _ string, _ string, items []EmailItem, _ Show) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.err != nil {
 		return f.err
 	}
-	f.calls = append(f.calls, emailCall{to, buyerName, seat.Row, seat.Col, len(pdf)})
+	copyItems := make([]EmailItem, len(items))
+	copy(copyItems, items)
+	f.batches = append(f.batches, copyItems)
 	return nil
 }
 
-// SendCancellationEmail satisfies the interface for tests that don't
-// exercise the cancel flow — they only need the ticket path. Cancel-
-// flow tests can swap in a richer fake if needed.
-func (f *fakeEmail) SendCancellationEmail(_ context.Context, _ string, _ string, _ Seat, _ Show) error {
+func (f *fakeEmail) SendCancellationEmail(_ context.Context, to, name string, seat Seat, _ Show) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.cancelErr != nil {
+		return f.cancelErr
+	}
+	f.cancels = append(f.cancels, cancelCall{to, name, seat})
 	return nil
 }
 
@@ -167,93 +170,88 @@ func newTx(comment string, amount int64) bank.Transaction {
 	}
 }
 
-func TestProcessor_HappyPath(t *testing.T) {
-	st := &fakeStore{
-		codeKnown:   "abcdefgh",
-		reservation: Reservation{ID: 7, TGChatID: 42, BuyerName: "Анна"},
-		seat:        Seat{ID: 3, Row: 1, Col: 2, Price: money.New(25000, currency.UAH)},
+// --- test fixtures ---
+
+func singleSeatOrder(code string, chatID int64, email string) (Order, []OrderItem) {
+	order := Order{
+		ID: 7, Code: code,
+		BuyerName: "Анна", BuyerEmail: email, TGChatID: chatID,
+		TotalKopecks: 25000,
 	}
+	items := []OrderItem{
+		{ReservationID: 100, Seat: Seat{ID: 3, Row: 1, Col: 2, Price: money.New(25000, currency.UAH)}},
+	}
+	return order, items
+}
+
+func multiSeatOrder(code string, chatID int64, email string, n int) (Order, []OrderItem) {
+	items := make([]OrderItem, n)
+	var total int64
+	for i := range n {
+		items[i] = OrderItem{
+			ReservationID: int64(100 + i),
+			Seat:          Seat{ID: int64(10 + i), Row: 1, Col: i + 1, Price: money.New(25000, currency.UAH)},
+		}
+		total += 25000
+	}
+	order := Order{
+		ID: 8, Code: code,
+		BuyerName: "Мульти", BuyerEmail: email, TGChatID: chatID,
+		TotalKopecks: total,
+	}
+	return order, items
+}
+
+// --- tests ---
+
+func TestProcessor_HappyPath_SingleSeat(t *testing.T) {
+	order, items := singleSeatOrder("abcdefgh", 42, "")
+	st := &fakeStore{code: "abcdefgh", order: order, items: items}
 	notifier := &fakeNotifier{}
 	p := newTestProcessor(st, notifier)
 
-	err := p.Handle(context.Background(), &webhook.Response{
+	if err := p.Handle(context.Background(), &webhook.Response{
 		Data: webhook.Data{Transaction: newTx("payment abcdefgh", 25000)},
-	})
-	if err != nil {
-		t.Fatalf("Handle: %v", err)
+	}); err != nil {
+		t.Fatal(err)
 	}
 	if len(st.confirmCalls) != 1 {
-		t.Fatalf("Confirm calls = %d, want 1", len(st.confirmCalls))
+		t.Errorf("confirm calls = %d, want 1", len(st.confirmCalls))
 	}
 	if len(notifier.sends) != 1 {
-		t.Fatalf("notifier sends = %d, want 1", len(notifier.sends))
-	}
-	if notifier.sends[0].chatID != 42 {
-		t.Errorf("chat = %d, want 42", notifier.sends[0].chatID)
+		t.Errorf("notifier sends = %d, want 1", len(notifier.sends))
 	}
 }
 
-func TestProcessor_WebhookDeliveredTwiceIsIdempotent(t *testing.T) {
-	st := &fakeStore{
-		codeKnown:   "abcdefgh",
-		reservation: Reservation{ID: 7, TGChatID: 42, BuyerName: "Анна"},
-		seat:        Seat{ID: 3, Row: 1, Col: 2, Price: money.New(25000, currency.UAH)},
-	}
+func TestProcessor_HappyPath_MultiSeat(t *testing.T) {
+	order, items := multiSeatOrder("multi237", 42, "", 3)
+	st := &fakeStore{code: "multi237", order: order, items: items}
 	notifier := &fakeNotifier{}
 	p := newTestProcessor(st, notifier)
-	tx := newTx("payment abcdefgh", 25000)
 
-	if err := p.Handle(context.Background(), &webhook.Response{Data: webhook.Data{Transaction: tx}}); err != nil {
-		t.Fatalf("first: %v", err)
+	if err := p.Handle(context.Background(), &webhook.Response{
+		Data: webhook.Data{Transaction: newTx("payment multi237", 75000)},
+	}); err != nil {
+		t.Fatal(err)
 	}
-	if err := p.Handle(context.Background(), &webhook.Response{Data: webhook.Data{Transaction: tx}}); err != nil {
-		t.Fatalf("second: %v", err)
-	}
-	// First call confirmed; second call sees ConfirmedAt != nil and short-circuits
-	// before calling Confirm. So Confirm is called exactly once.
+	// One confirm for the order, N notifier sends — one PDF per seat.
 	if len(st.confirmCalls) != 1 {
-		t.Fatalf("Confirm calls = %d, want 1 (idempotent)", len(st.confirmCalls))
+		t.Errorf("confirm calls = %d, want 1", len(st.confirmCalls))
 	}
-	if len(notifier.sends) != 1 {
-		t.Fatalf("notifier sends = %d, want 1 (idempotent)", len(notifier.sends))
+	if got := len(st.confirmCalls[0].qrPayloads); got != 3 {
+		t.Errorf("qrs in confirm = %d, want 3", got)
 	}
-}
-
-func TestProcessor_ReconcileAfterWebhookIsIdempotent(t *testing.T) {
-	st := &fakeStore{
-		codeKnown:   "abcdefgh",
-		reservation: Reservation{ID: 7, TGChatID: 42, BuyerName: "Анна"},
-		seat:        Seat{ID: 3, Row: 1, Col: 2, Price: money.New(25000, currency.UAH)},
-	}
-	notifier := &fakeNotifier{}
-	p := newTestProcessor(st, notifier)
-	tx := newTx("payment abcdefgh", 25000)
-
-	if err := p.Handle(context.Background(), &webhook.Response{Data: webhook.Data{Transaction: tx}}); err != nil {
-		t.Fatal(err)
-	}
-	matched, err := p.ReconcileTx(context.Background(), tx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if matched {
-		t.Errorf("ReconcileTx after webhook returned matched=true, want false")
-	}
-	if len(notifier.sends) != 1 {
-		t.Errorf("notifier sends = %d, want 1 (no duplicate ticket)", len(notifier.sends))
+	if len(notifier.sends) != 3 {
+		t.Errorf("notifier sends = %d, want 3 (one per seat)", len(notifier.sends))
 	}
 }
 
 func TestProcessor_ShortAmountRejected(t *testing.T) {
-	st := &fakeStore{
-		codeKnown:   "abcdefgh",
-		reservation: Reservation{ID: 7, TGChatID: 42, BuyerName: "Анна"},
-		seat:        Seat{ID: 3, Row: 1, Col: 2, Price: money.New(25000, currency.UAH)},
-	}
+	order, items := singleSeatOrder("abcdefgh", 42, "")
+	st := &fakeStore{code: "abcdefgh", order: order, items: items}
 	notifier := &fakeNotifier{}
 	p := newTestProcessor(st, notifier)
 
-	// Paid 100.00 UAH on a 250.00 UAH seat — rejected, no confirm, no PDF.
 	if err := p.Handle(context.Background(), &webhook.Response{
 		Data: webhook.Data{Transaction: newTx("payment abcdefgh", 10000)},
 	}); err != nil {
@@ -267,224 +265,140 @@ func TestProcessor_ShortAmountRejected(t *testing.T) {
 	}
 }
 
-func TestProcessor_CheapSeatAcceptedRegardlessOfDefaults(t *testing.T) {
-	// Regression: the floor was previously a global Processor.MinPrice
-	// (taken from cfg.PriceKopecks); admins who priced balcony seats at
-	// 100 UAH while default was 250 UAH had those payments rejected.
-	// After the per-seat fix, the check is seat.Price; a 100 UAH payment
-	// on a 100 UAH seat must clear.
-	st := &fakeStore{
-		codeKnown:   "abcdefgh",
-		reservation: Reservation{ID: 7, TGChatID: 42, BuyerName: "Анна"},
-		seat:        Seat{ID: 3, Row: 1, Col: 2, Price: money.New(10000, currency.UAH)}, // 100 UAH
-	}
+func TestProcessor_OverpaymentAccepted(t *testing.T) {
+	order, items := singleSeatOrder("abcdefgh", 42, "")
+	st := &fakeStore{code: "abcdefgh", order: order, items: items}
 	notifier := &fakeNotifier{}
 	p := newTestProcessor(st, notifier)
 
-	// Pay exactly the seat's price.
 	if err := p.Handle(context.Background(), &webhook.Response{
-		Data: webhook.Data{Transaction: newTx("payment abcdefgh", 10000)},
+		Data: webhook.Data{Transaction: newTx("payment abcdefgh", 50000)},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if len(st.confirmCalls) != 1 {
-		t.Errorf("Confirm calls = %d, want 1 (cheap seat should be accepted)", len(st.confirmCalls))
+		t.Errorf("confirm calls = %d, want 1", len(st.confirmCalls))
+	}
+}
+
+func TestProcessor_WebhookReplayDoesNotDoubleIssue(t *testing.T) {
+	order, items := singleSeatOrder("replaycd", 42, "")
+	st := &fakeStore{code: "replaycd", order: order, items: items}
+	notifier := &fakeNotifier{}
+	p := newTestProcessor(st, notifier)
+
+	// First delivery confirms.
+	if err := p.Handle(context.Background(), &webhook.Response{
+		Data: webhook.Data{Transaction: newTx("payment replaycd", 25000)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Second delivery sees order.ConfirmedAt != nil, short-circuits.
+	if err := p.Handle(context.Background(), &webhook.Response{
+		Data: webhook.Data{Transaction: newTx("payment replaycd", 25000)},
+	}); err != nil {
+		t.Fatal(err)
 	}
 	if len(notifier.sends) != 1 {
-		t.Errorf("ticket sends = %d, want 1", len(notifier.sends))
+		t.Errorf("notifier sends = %d, want 1 (idempotent)", len(notifier.sends))
 	}
 }
 
 func TestProcessor_WebBuyerGetsEmailNoTelegram(t *testing.T) {
-	// Web-buyer reservation: TGChatID=0, BuyerEmail set. The processor
-	// should email the PDF and *not* try to ping a non-existent chat.
-	st := &fakeStore{
-		codeKnown: "abcdefgh",
-		reservation: Reservation{
-			ID: 7, TGChatID: 0, BuyerName: "Web Buyer",
-			BuyerEmail: "buyer@example.com",
-		},
-		seat: Seat{ID: 3, Row: 1, Col: 2, Price: money.New(25000, currency.UAH)},
-	}
+	order, items := singleSeatOrder("emailcde", 0, "buyer@example.com")
+	st := &fakeStore{code: "emailcde", order: order, items: items}
 	notifier := &fakeNotifier{}
 	mailer := &fakeEmail{}
 	p := newTestProcessor(st, notifier)
 	p.Email = mailer
 
 	if err := p.Handle(context.Background(), &webhook.Response{
-		Data: webhook.Data{Transaction: newTx("payment abcdefgh", 25000)},
+		Data: webhook.Data{Transaction: newTx("payment emailcde", 25000)},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if len(notifier.sends) != 0 {
-		t.Errorf("notifier should not fire for web buyer, got %d sends", len(notifier.sends))
+		t.Errorf("Telegram should NOT fire for web buyer (chatID=0), got %d", len(notifier.sends))
 	}
-	if len(mailer.calls) != 1 {
-		t.Fatalf("email calls = %d, want 1", len(mailer.calls))
-	}
-	if mailer.calls[0].to != "buyer@example.com" {
-		t.Errorf("to = %q", mailer.calls[0].to)
-	}
-	if mailer.calls[0].pdfLen == 0 {
-		t.Error("PDF body not passed through")
+	if len(mailer.batches) != 1 || len(mailer.batches[0]) != 1 {
+		t.Errorf("email batches = %v, want one with one item", mailer.batches)
 	}
 }
 
-func TestProcessor_BotBuyerGetsTelegramOnly(t *testing.T) {
-	// Bot-flow reservation: TGChatID set, BuyerEmail empty. Telegram fires;
-	// email path is skipped even if a mailer is configured.
-	st := &fakeStore{
-		codeKnown:   "abcdefgh",
-		reservation: Reservation{ID: 7, TGChatID: 42, BuyerName: "Bot Buyer", BuyerEmail: ""},
-		seat:        Seat{ID: 3, Row: 1, Col: 2, Price: money.New(25000, currency.UAH)},
-	}
-	notifier := &fakeNotifier{}
+func TestProcessor_MultiSeatEmailBatch(t *testing.T) {
+	order, items := multiSeatOrder("multim7r", 0, "buyer@x.com", 3)
+	st := &fakeStore{code: "multim7r", order: order, items: items}
 	mailer := &fakeEmail{}
+	notifier := &fakeNotifier{}
 	p := newTestProcessor(st, notifier)
 	p.Email = mailer
 
 	if err := p.Handle(context.Background(), &webhook.Response{
-		Data: webhook.Data{Transaction: newTx("payment abcdefgh", 25000)},
+		Data: webhook.Data{Transaction: newTx("payment multim7r", 75000)},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if len(notifier.sends) != 1 {
-		t.Errorf("notifier should fire for bot buyer, got %d", len(notifier.sends))
+	// One email with three attachments — not three emails.
+	if len(mailer.batches) != 1 {
+		t.Fatalf("emails sent = %d, want 1 batched message", len(mailer.batches))
 	}
-	if len(mailer.calls) != 0 {
-		t.Errorf("email should not fire when BuyerEmail empty, got %d", len(mailer.calls))
+	if got := len(mailer.batches[0]); got != 3 {
+		t.Errorf("attachments in batch = %d, want 3", got)
 	}
 }
 
 func TestProcessor_EmailFailureDoesNotBlockConfirm(t *testing.T) {
-	// Email provider misbehaving should not undo the confirmation —
-	// reservation stays paid, operator sees error in logs and can resend.
-	st := &fakeStore{
-		codeKnown: "abcdefgh",
-		reservation: Reservation{
-			ID: 7, TGChatID: 0, BuyerName: "Web", BuyerEmail: "b@x.com",
-		},
-		seat: Seat{ID: 3, Row: 1, Col: 2, Price: money.New(25000, currency.UAH)},
-	}
+	order, items := singleSeatOrder("failmail", 0, "buyer@x.com")
+	st := &fakeStore{code: "failmail", order: order, items: items}
 	notifier := &fakeNotifier{}
 	mailer := &fakeEmail{err: errors.New("smtp down")}
 	p := newTestProcessor(st, notifier)
 	p.Email = mailer
 
 	if err := p.Handle(context.Background(), &webhook.Response{
-		Data: webhook.Data{Transaction: newTx("payment abcdefgh", 25000)},
+		Data: webhook.Data{Transaction: newTx("payment failmail", 25000)},
 	}); err != nil {
-		t.Fatalf("Handle should not propagate SMTP failure: %v", err)
+		t.Fatalf("Handle should swallow SMTP failure: %v", err)
 	}
 	if len(st.confirmCalls) != 1 {
-		t.Errorf("Confirm calls = %d, want 1 (email failure must not block confirm)", len(st.confirmCalls))
+		t.Errorf("confirm calls = %d, want 1 (email failure must not block confirm)", len(st.confirmCalls))
 	}
 }
 
-func TestProcessor_OverpaymentAccepted(t *testing.T) {
-	st := &fakeStore{
-		codeKnown:   "abcdefgh",
-		reservation: Reservation{ID: 7, TGChatID: 42, BuyerName: "Анна"},
-		seat:        Seat{ID: 3, Row: 1, Col: 2, Price: money.New(25000, currency.UAH)},
+func TestProcessor_NoCodeInCommentIgnored(t *testing.T) {
+	st := &fakeStore{code: "abcdefgh"}
+	notifier := &fakeNotifier{}
+	p := newTestProcessor(st, notifier)
+	if err := p.Handle(context.Background(), &webhook.Response{
+		Data: webhook.Data{Transaction: newTx("just a transfer", 25000)},
+	}); err != nil {
+		t.Fatal(err)
 	}
+	if len(st.confirmCalls) != 0 {
+		t.Errorf("Confirm called for transaction without code")
+	}
+}
+
+func TestProcessor_ReconcileTxAfterWebhookIsNoOp(t *testing.T) {
+	order, items := singleSeatOrder("dblpay76", 42, "")
+	st := &fakeStore{code: "dblpay76", order: order, items: items}
 	notifier := &fakeNotifier{}
 	p := newTestProcessor(st, notifier)
 
-	// Paid 300.00 UAH on a 250.00 UAH seat — overpay is fine.
+	tx := newTx("payment dblpay76", 25000)
 	if err := p.Handle(context.Background(), &webhook.Response{
-		Data: webhook.Data{Transaction: newTx("payment abcdefgh", 30000)},
+		Data: webhook.Data{Transaction: tx},
 	}); err != nil {
 		t.Fatal(err)
+	}
+	matched, err := p.ReconcileTx(context.Background(), tx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if matched {
+		t.Errorf("ReconcileTx after webhook returned matched=true, want false")
 	}
 	if len(notifier.sends) != 1 {
-		t.Errorf("overpayment was not honoured")
-	}
-}
-
-func TestProcessor_CodeNotFoundIsNoOp(t *testing.T) {
-	st := &fakeStore{codeKnown: "abcdefgh"}
-	notifier := &fakeNotifier{}
-	p := newTestProcessor(st, notifier)
-
-	// Comment carries a code that doesn't map to any reservation.
-	if err := p.Handle(context.Background(), &webhook.Response{
-		Data: webhook.Data{Transaction: newTx("payment xxxxxxxx", 25000)},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if len(st.confirmCalls) != 0 || len(notifier.sends) != 0 {
-		t.Errorf("unknown code should be a no-op (confirms=%d sends=%d)",
-			len(st.confirmCalls), len(notifier.sends))
-	}
-}
-
-func TestProcessor_NoCodeInCommentIsNoOp(t *testing.T) {
-	st := &fakeStore{codeKnown: "abcdefgh"}
-	notifier := &fakeNotifier{}
-	p := newTestProcessor(st, notifier)
-
-	if err := p.Handle(context.Background(), &webhook.Response{
-		Data: webhook.Data{Transaction: newTx("just a comment, no code here", 25000)},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if len(st.confirmCalls) != 0 {
-		t.Errorf("Confirm called when no code was present in the comment")
-	}
-}
-
-func TestProcessor_OutflowIgnored(t *testing.T) {
-	st := &fakeStore{codeKnown: "abcdefgh"}
-	notifier := &fakeNotifier{}
-	p := newTestProcessor(st, notifier)
-
-	// Negative amount = outflow. Should be silently ignored.
-	if err := p.Handle(context.Background(), &webhook.Response{
-		Data: webhook.Data{Transaction: newTx("payment abcdefgh", -25000)},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if len(st.confirmCalls) != 0 {
-		t.Errorf("Confirm called on outflow")
-	}
-}
-
-func TestProcessor_AlreadyClosedReservationIsNoOp(t *testing.T) {
-	st := &fakeStore{
-		codeKnown: "abcdefgh",
-		failFind:  ErrAlreadyClosed,
-	}
-	notifier := &fakeNotifier{}
-	p := newTestProcessor(st, notifier)
-
-	if err := p.Handle(context.Background(), &webhook.Response{
-		Data: webhook.Data{Transaction: newTx("payment abcdefgh", 25000)},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if len(st.confirmCalls) != 0 || len(notifier.sends) != 0 {
-		t.Errorf("cancelled reservation should be a no-op")
-	}
-}
-
-func TestProcessor_StorePropagatesUnknownErrors(t *testing.T) {
-	boom := errors.New("db is on fire")
-	st := &fakeStore{
-		codeKnown:   "abcdefgh",
-		reservation: Reservation{ID: 7, TGChatID: 42, BuyerName: "Анна"},
-		seat:        Seat{ID: 3, Row: 1, Col: 2, Price: money.New(25000, currency.UAH)},
-		failConfirm: boom,
-	}
-	notifier := &fakeNotifier{}
-	p := newTestProcessor(st, notifier)
-
-	err := p.Handle(context.Background(), &webhook.Response{
-		Data: webhook.Data{Transaction: newTx("payment abcdefgh", 25000)},
-	})
-	if !errors.Is(err, boom) {
-		t.Fatalf("got err=%v, want propagated %q", err, boom)
-	}
-	if len(notifier.sends) != 0 {
-		t.Errorf("ticket was sent despite Confirm failing")
+		t.Errorf("notifier sends = %d, want 1 (no duplicate ticket)", len(notifier.sends))
 	}
 }
