@@ -22,6 +22,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -30,23 +31,25 @@ import (
 )
 
 // Show is the subset of show info the bot needs. Slug is used to build
-// the WebApp / public-link URLs the bot ships to buyers.
+// the WebApp / public-link URLs the bot ships to buyers; Description is
+// included in the show menu card.
 type Show struct {
-	ID       int64
-	Slug     string
-	Title    string
-	Venue    string
-	StartsAt time.Time
+	ID          int64
+	Slug        string
+	Title       string
+	Venue       string
+	StartsAt    time.Time
+	Description string
 }
 
-// Seat is the subset of seat info the bot needs (for reservation cards,
-// reminders, ticket captions). The map-pick UI doesn't live in the bot
-// any more — only delivery and admin commands surface seat info.
+// Seat is the subset of seat info the bot needs (reservation cards,
+// reminders, ticket captions, and the inline-keyboard picker).
 type Seat struct {
 	ID       int64
 	ShowID   int64
 	Row, Col int
 	Price    money.Money
+	Sellable bool
 }
 
 // Reservation mirrors a stored reservation row.
@@ -88,12 +91,19 @@ const (
 
 // Domain errors the bot expects the Store to return.
 var (
+	ErrSeatTaken      = errors.New("seat already taken")
+	ErrSeatNotFound   = errors.New("seat not found")
 	ErrCodeNotFound   = errors.New("reservation code not found")
 	ErrAlreadyPaid    = errors.New("reservation already confirmed")
 	ErrAlreadyClosed  = errors.New("reservation already closed")
 	ErrNotYourBooking = errors.New("reservation belongs to another user")
 	ErrShowNotFound   = errors.New("show not found")
 )
+
+// Coder mints the short reservation code.
+type Coder interface {
+	NewCode() (string, error)
+}
 
 // Store is the persistence behavior the bot needs.
 type Store interface {
@@ -103,6 +113,13 @@ type Store interface {
 	// FindShowBySlug resolves a slug from a "show:<slug>" callback into
 	// the full Show record.
 	FindShowBySlug(ctx context.Context, slug string) (Show, error)
+	// Seats / SeatStatuses / FindFreeSeat / Reserve power the inline-
+	// keyboard seat picker — the in-chat alternative to the WebApp Mini
+	// App for buyers who prefer to never leave Telegram.
+	Seats(ctx context.Context, showID int64) ([]Seat, error)
+	SeatStatuses(ctx context.Context, showID int64) (map[int64]SeatStatus, error)
+	FindFreeSeat(ctx context.Context, showID int64, row, col int) (Seat, error)
+	Reserve(ctx context.Context, seat Seat, tgUserID, tgChatID int64, buyerName, code string, hold time.Duration) (Reservation, error)
 	CancelReservation(ctx context.Context, code string, tgUserID int64) (Reservation, Seat, error)
 	MyReservations(ctx context.Context, tgUserID int64) ([]MyItem, error)
 	Stats(ctx context.Context, showID int64) (Stats, error)
@@ -146,22 +163,37 @@ type ShowFn func(ctx context.Context) (Show, error)
 type Bot struct {
 	tb         *tele.Bot
 	store      Store
+	coder      Coder
 	baseURL    string // e.g. https://monokasa.app — used for WebApp deep links
 	jarLink    string
+	hold       time.Duration
 	adminTGID  int64
 	reconciler Reconciler // optional — nil if MONO_TOKEN missing
 	jar        JarLookup  // optional — nil if jar link unparseable
 	showFn     ShowFn
 
-	done chan struct{}
+	// pending tracks chat users mid-name-input after picking a seat
+	// inline. Key = tg user id; value = pendingPick. A periodic sweep
+	// drops entries past Until so abandoned picks don't pile up.
+	pending sync.Map
+	done    chan struct{}
+}
+
+type pendingPick struct {
+	ShowID int64
+	Row    int
+	Col    int
+	Until  time.Time
 }
 
 type Options struct {
 	Token      string
 	Store      Store
+	Coder      Coder
 	ShowFn     ShowFn
-	BaseURL    string // optional; without it WebApp buttons fall back to plain URL share
+	BaseURL    string        // optional; without it WebApp buttons fall back to plain URL share
 	JarLink    string
+	Hold       time.Duration // how long a pre-paid hold lives
 	AdminTGID  int64
 	Reconciler Reconciler // optional
 	Jar        JarLookup  // optional
@@ -176,15 +208,41 @@ func New(opts Options) (*Bot, error) {
 		return nil, err
 	}
 	b := &Bot{
-		tb: tb, store: opts.Store, showFn: opts.ShowFn,
+		tb: tb, store: opts.Store, coder: opts.Coder, showFn: opts.ShowFn,
 		baseURL: strings.TrimRight(opts.BaseURL, "/"),
-		jarLink: opts.JarLink, adminTGID: opts.AdminTGID,
+		jarLink: opts.JarLink, hold: opts.Hold, adminTGID: opts.AdminTGID,
 		reconciler: opts.Reconciler, jar: opts.Jar,
 		done: make(chan struct{}),
 	}
 	b.routes()
+	go b.sweepPending(time.Minute)
 	return b, nil
 }
+
+// sweepPending drops pending picks whose TTL has lapsed.
+func (b *Bot) sweepPending(every time.Duration) {
+	tick := time.NewTicker(every)
+	defer tick.Stop()
+	for {
+		select {
+		case <-b.done:
+			return
+		case now := <-tick.C:
+			b.pending.Range(func(k, v any) bool {
+				if p, ok := v.(pendingPick); ok && now.After(p.Until) {
+					b.pending.Delete(k)
+				}
+				return true
+			})
+		}
+	}
+}
+
+// pendingTTL bounds how long a user has to type their name after
+// picking a seat from the inline keyboard. Same value the old PR #1 bot
+// used; long enough to switch apps and come back, short enough to free
+// the mental hold.
+const pendingTTL = 10 * time.Minute
 
 func (b *Bot) Start() { b.tb.Start() }
 
@@ -214,6 +272,18 @@ func (b *Bot) SendTicket(chatID int64, seat Seat, pdf []byte) error {
 	return err
 }
 
+// SendCancellation pings a buyer that the admin force-cancelled their
+// reservation. Best-effort: any send error gets logged by the caller —
+// the DB row is already cancelled, the message is courtesy.
+func (b *Bot) SendCancellation(chatID int64, seat Seat) error {
+	_, err := b.tb.Send(tele.ChatID(chatID), fmt.Sprintf(
+		"❌ Твою бронь скасовано адміністратором.\nРяд %d, місце %d.\n"+
+			"Якщо оплата вже пройшла — гроші повернуть руками через моно. "+
+			"Питання — напиши організатору.",
+		seat.Row, seat.Col))
+	return err
+}
+
 // NotifyShowSoon pings a buyer about the upcoming show. Title is fetched
 // fresh so an admin rename right before show-time lands in the reminder.
 func (b *Bot) NotifyShowSoon(chatID int64, seat Seat, when time.Time) error {
@@ -238,6 +308,7 @@ func (b *Bot) routes() {
 	b.tb.Handle("/stats", b.handleStats)
 	b.tb.Handle("/reconcile", b.handleReconcile)
 	b.tb.Handle("/jar", b.handleJar)
+	b.tb.Handle(tele.OnText, b.handleText)
 	b.tb.Handle(tele.OnCallback, b.handleCallback)
 }
 
@@ -296,6 +367,10 @@ func (b *Bot) handleCallback(c tele.Context) error {
 	switch {
 	case strings.HasPrefix(cb.Data, "\fshow|"):
 		return b.callbackShow(c, cb)
+	case strings.HasPrefix(cb.Data, "\fpick|"):
+		return b.callbackPick(c, cb)
+	case strings.HasPrefix(cb.Data, "\fseat|"):
+		return b.callbackSeat(c, cb)
 	case strings.HasPrefix(cb.Data, "\fcancel|"):
 		return b.callbackCancel(c, cb)
 	case strings.HasPrefix(cb.Data, "\fevents|"):
@@ -324,38 +399,223 @@ func (b *Bot) callbackShow(c tele.Context, cb *tele.Callback) error {
 	}
 	_ = c.Respond(&tele.CallbackResponse{})
 
+	// Two ways to pick: inline keyboard (default, never leaves chat)
+	// and — if BASE_URL is set — WebApp button that opens the SVG map
+	// as a Mini App for users who prefer the visual experience.
 	markup := &tele.ReplyMarkup{}
-	pickRow := []tele.InlineButton{}
+	rows := [][]tele.InlineButton{
+		{{Unique: "pick", Text: "📋 Обрати місце", Data: sh.Slug}},
+	}
 	if b.baseURL != "" {
-		pickRow = append(pickRow, tele.InlineButton{
-			Text:   "📍 Обрати місце",
+		rows = append(rows, []tele.InlineButton{{
+			Text:   "🗺 Відкрити мапу залу",
 			WebApp: &tele.WebApp{URL: fmt.Sprintf("%s/event/%s", b.baseURL, sh.Slug)},
-		})
+		}})
 	}
-	markup.InlineKeyboard = [][]tele.InlineButton{
-		pickRow,
-		{{Unique: "events", Text: "↩ До списку", Data: "back"}},
-	}
-	if len(pickRow) == 0 {
-		// No BASE_URL — share the URL anyway so the user can open it
-		// manually in a browser. Better than a dead-end card.
-		markup.InlineKeyboard = [][]tele.InlineButton{
-			{{Unique: "events", Text: "↩ До списку", Data: "back"}},
-		}
-	}
+	rows = append(rows, []tele.InlineButton{
+		{Unique: "events", Text: "↩ До списку", Data: "back"},
+	})
+	markup.InlineKeyboard = rows
 
 	text := fmt.Sprintf("🎭 *%s*\n📅 %s\n",
 		escapeMarkdown(sh.Title), formatDateTime(sh.StartsAt))
 	if sh.Venue != "" {
 		text += "📍 " + escapeMarkdown(sh.Venue) + "\n"
 	}
-	if b.baseURL == "" {
-		text += fmt.Sprintf("\nЩоб обрати місце — відкрий у браузері:\nmonokasa/event/%s",
-			escapeMarkdown(sh.Slug))
-	} else {
-		text += "\nТицяй *📍 Обрати місце* — відкриється мапа залу."
+	if sh.Description != "" {
+		text += "\n" + escapeMarkdown(sh.Description) + "\n"
 	}
 	return c.Send(text, tele.ModeMarkdown, markup)
+}
+
+// callbackPick handles the "📋 Обрати місце" tap from the show menu —
+// renders the seat grid as an inline keyboard. The grid uses the same
+// row/col layout the admin set up; free seats show their col number,
+// held are "…", sold are "✖".
+func (b *Bot) callbackPick(c tele.Context, cb *tele.Callback) error {
+	slug := strings.TrimPrefix(cb.Data, "\fpick|")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	sh, err := b.store.FindShowBySlug(ctx, slug)
+	if errors.Is(err, ErrShowNotFound) {
+		return c.Respond(&tele.CallbackResponse{Text: "Подію не знайдено"})
+	}
+	if err != nil {
+		slog.Error("pick: find show", "slug", slug, "err", err)
+		return c.Respond(&tele.CallbackResponse{Text: "Помилка"})
+	}
+	seats, err := b.store.Seats(ctx, sh.ID)
+	if err != nil {
+		return c.Respond(&tele.CallbackResponse{Text: "storage error"})
+	}
+	status, err := b.store.SeatStatuses(ctx, sh.ID)
+	if err != nil {
+		return c.Respond(&tele.CallbackResponse{Text: "storage error"})
+	}
+	_ = c.Respond(&tele.CallbackResponse{})
+
+	rowMap := make(map[int][]Seat)
+	maxRow := 0
+	for _, s := range seats {
+		if !s.Sellable {
+			continue
+		}
+		rowMap[s.Row] = append(rowMap[s.Row], s)
+		if s.Row > maxRow {
+			maxRow = s.Row
+		}
+	}
+	if maxRow == 0 {
+		return c.Send("Зала ще не налаштована. Спробуй пізніше.")
+	}
+
+	kb := make([][]tele.InlineButton, 0, maxRow+1)
+	for r := 1; r <= maxRow; r++ {
+		rowSeats := rowMap[r]
+		btns := make([]tele.InlineButton, 0, len(rowSeats))
+		for _, s := range rowSeats {
+			label := strconv.Itoa(s.Col)
+			switch status[s.ID] {
+			case SeatSold:
+				label = "✖"
+			case SeatHeld:
+				label = "…"
+			}
+			btns = append(btns, tele.InlineButton{
+				Unique: "seat",
+				Text:   label,
+				Data:   fmt.Sprintf("%s:%d:%d", sh.Slug, s.Row, s.Col),
+			})
+		}
+		kb = append(kb, btns)
+	}
+	kb = append(kb, []tele.InlineButton{
+		{Unique: "show", Text: "↩ Назад", Data: sh.Slug},
+	})
+	markup := &tele.ReplyMarkup{InlineKeyboard: kb}
+
+	priceLine := ""
+	if len(seats) > 0 {
+		priceLine = "\nЦіна вказана у редакторі залу адміном."
+	}
+	header := "🎭 ━━━━━ СЦЕНА ━━━━━ 🎭\n               ▲ ближче до сцени\n\n"
+	return c.Send(
+		fmt.Sprintf("%sРяд 1 — найближче до сцени.\nНатисни вільне місце, щоб забронювати.%s",
+			header, priceLine),
+		markup)
+}
+
+// callbackSeat handles a tap on one of the seat buttons. Stores the
+// (showID, row, col) tuple in pending, asks for the buyer's name with
+// ForceReply, and waits for handleText to pick it up.
+func (b *Bot) callbackSeat(c tele.Context, cb *tele.Callback) error {
+	data := strings.TrimPrefix(cb.Data, "\fseat|")
+	parts := strings.SplitN(data, ":", 3)
+	if len(parts) != 3 {
+		return c.Respond(&tele.CallbackResponse{Text: "bad seat"})
+	}
+	slug := parts[0]
+	row, err1 := strconv.Atoi(parts[1])
+	col, err2 := strconv.Atoi(parts[2])
+	if err1 != nil || err2 != nil {
+		return c.Respond(&tele.CallbackResponse{Text: "bad seat"})
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	sh, err := b.store.FindShowBySlug(ctx, slug)
+	if err != nil {
+		return c.Respond(&tele.CallbackResponse{Text: "Подію не знайдено"})
+	}
+	// Pre-check that the seat is still free so the name prompt isn't a
+	// dead end. Re-checked atomically inside Reserve.
+	seat, err := b.store.FindFreeSeat(ctx, sh.ID, row, col)
+	if err != nil {
+		return c.Respond(&tele.CallbackResponse{Text: friendly(err)})
+	}
+	b.pending.Store(cb.Sender.ID, pendingPick{
+		ShowID: sh.ID, Row: row, Col: col,
+		Until: time.Now().Add(pendingTTL),
+	})
+	_ = c.Respond(&tele.CallbackResponse{Text: "Введи ім'я"})
+	_, err = b.tb.Send(cb.Sender, fmt.Sprintf(
+		"Місце ряд %d · %d, ціна %s.\nВведи ім'я та прізвище — будуть надруковані на квитку:",
+		seat.Row, seat.Col, seat.Price),
+		&tele.ReplyMarkup{ForceReply: true, Selective: true})
+	return err
+}
+
+func (b *Bot) handleText(c tele.Context) error {
+	sender := c.Sender()
+	if sender == nil {
+		return nil
+	}
+	raw, ok := b.pending.Load(sender.ID)
+	if !ok {
+		return nil // user typed text but isn't in name-input mode
+	}
+	pick, ok := raw.(pendingPick)
+	if !ok {
+		b.pending.Delete(sender.ID)
+		return nil
+	}
+	if time.Now().After(pick.Until) {
+		b.pending.Delete(sender.ID)
+		return c.Send("Час на введення імені вийшов. Тицьни /events і вибери місце ще раз.")
+	}
+
+	name, err := normalizeName(c.Text())
+	if err != nil {
+		return c.Send(err.Error() + "\nСпробуй ще раз:")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	seat, err := b.store.FindFreeSeat(ctx, pick.ShowID, pick.Row, pick.Col)
+	if err != nil {
+		b.pending.Delete(sender.ID)
+		return c.Send(friendly(err))
+	}
+	code, err := b.coder.NewCode()
+	if err != nil {
+		return c.Send("Внутрішня помилка, спробуй пізніше")
+	}
+	r, err := b.store.Reserve(ctx, seat, sender.ID, c.Chat().ID, name, code, b.hold)
+	if err != nil {
+		b.pending.Delete(sender.ID)
+		return c.Send(friendly(err))
+	}
+	b.pending.Delete(sender.ID)
+
+	payURL := jarPrefillURL(b.jarLink, seat.Price, r.Code)
+	payBtn := tele.InlineButton{Text: "💳 Оплатити", URL: payURL}
+	cancelBtn := tele.InlineButton{Unique: "cancel", Text: "✖ Скасувати бронь", Data: r.Code}
+	markup := &tele.ReplyMarkup{InlineKeyboard: [][]tele.InlineButton{{payBtn}, {cancelBtn}}}
+
+	return c.Send(fmt.Sprintf(
+		"Місце забронювано: ряд %d, місце %d.\n"+
+			"На квитку буде: *%s*\n\n"+
+			"💳 Натисни *Оплатити* — сума й коментар вже вписані.\n"+
+			"Код у коментарі — `%s`.\n"+
+			"Бронювання дійсне до %s. Після оплати бот сам пришле PDF.",
+		seat.Row, seat.Col, name, r.Code, formatClock(r.ExpiresAt)),
+		tele.ModeMarkdown,
+		&tele.SendOptions{DisableWebPagePreview: true},
+		markup)
+}
+
+// friendly turns store-side errors into user-facing Ukrainian.
+func friendly(err error) string {
+	switch {
+	case errors.Is(err, ErrSeatTaken):
+		return "Це місце вже зайняте"
+	case errors.Is(err, ErrSeatNotFound):
+		return "Такого місця нема"
+	default:
+		return "Помилка"
+	}
 }
 
 func (b *Bot) callbackCancel(c tele.Context, cb *tele.Callback) error {

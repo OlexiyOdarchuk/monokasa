@@ -152,6 +152,13 @@ func (f *fakeEmail) SendTicketEmail(_ context.Context, to, buyerName string, sea
 	return nil
 }
 
+// SendCancellationEmail satisfies the interface for tests that don't
+// exercise the cancel flow — they only need the ticket path. Cancel-
+// flow tests can swap in a richer fake if needed.
+func (f *fakeEmail) SendCancellationEmail(_ context.Context, _ string, _ string, _ Seat, _ Show) error {
+	return nil
+}
+
 func newTx(comment string, amount int64) bank.Transaction {
 	return bank.Transaction{
 		ID:      "tx-1",

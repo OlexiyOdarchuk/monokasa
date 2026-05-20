@@ -12,6 +12,7 @@
 package admin
 
 import (
+	"context"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
@@ -25,16 +26,28 @@ import (
 	"github.com/OlexiyOdarchuk/monokasa/internal/store"
 )
 
+// CancelNotifier is called after admin.cancelReservation succeeds. The
+// handler doesn't care where the notification goes (Telegram, email,
+// both) — main.go composes a function that does the right thing for the
+// reservation's contact details. Errors get logged but don't fail the
+// admin response: the DB cancel is already durable.
+type CancelNotifier func(ctx context.Context, res store.Reservation, seat store.Seat)
+
 // Handler aggregates the admin endpoints. Pass *store.Store directly — the
 // admin package is internal infrastructure, no reason to plumb yet another
 // interface tier.
 type Handler struct {
-	st *store.Store
+	st       *store.Store
+	onCancel CancelNotifier // optional; nil is a no-op
 }
 
 func NewHandler(st *store.Store) *Handler {
 	return &Handler{st: st}
 }
+
+// SetCancelNotifier wires the post-cancel notification hook. Optional;
+// when nil the cancel endpoint just updates the DB.
+func (h *Handler) SetCancelNotifier(fn CancelNotifier) { h.onCancel = fn }
 
 // Register wires every endpoint onto the given mux. The mux is meant to
 // be wrapped by auth.RequireAuth at the call site, not by this package.
@@ -523,6 +536,11 @@ func (h *Handler) cancelReservation(w http.ResponseWriter, r *http.Request) {
 	case err != nil:
 		writeInternal(w, "admin cancel", err)
 		return
+	}
+	// Best-effort fan-out to TG/email. Run async so admin doesn't wait
+	// for SMTP — failures get logged inside the notifier.
+	if h.onCancel != nil {
+		go h.onCancel(context.Background(), res, seat)
 	}
 	writeJSON(w, http.StatusOK, toGuestResponse(store.MyItem{Reservation: res, Seat: seat}, time.Now()))
 }

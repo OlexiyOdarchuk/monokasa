@@ -70,6 +70,10 @@ type Notifier interface {
 // body and ship the PDF as an attachment.
 type EmailDelivery interface {
 	SendTicketEmail(ctx context.Context, to, buyerName string, seat Seat, show Show, pdf []byte) error
+	// SendCancellationEmail notifies the buyer that admin cancelled
+	// their reservation. Best-effort — caller logs failures but doesn't
+	// propagate them; the cancel succeeded in the DB regardless.
+	SendCancellationEmail(ctx context.Context, to, buyerName string, seat Seat, show Show) error
 }
 
 // Renderer turns a confirmed reservation into a printable PDF.

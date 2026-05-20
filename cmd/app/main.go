@@ -107,9 +107,11 @@ func main() {
 	tg, err := bot.New(bot.Options{
 		Token:     cfg.TGToken,
 		Store:     botStore{st},
+		Coder:     coder,
 		ShowFn:    botShowFn,
 		BaseURL:   cfg.BaseURL,
 		JarLink:   cfg.JarLink,
+		Hold:      cfg.HoldDuration,
 		AdminTGID: cfg.AdminTGID,
 	})
 	if err != nil {
@@ -218,7 +220,31 @@ func main() {
 	// Admin API gets its own sub-mux so we can wrap the whole thing in
 	// auth.RequireAuth once, rather than decorating every endpoint.
 	adminMux := http.NewServeMux()
-	admin.NewHandler(st).Register(adminMux)
+	adminH := admin.NewHandler(st)
+	// Best-effort notification fan-out: when admin force-cancels a
+	// reservation, ping the buyer through whichever channels are
+	// attached to their row. Failures get logged inside; the cancel
+	// itself is already durable in the DB.
+	adminH.SetCancelNotifier(func(ctx context.Context, res store.Reservation, seat store.Seat) {
+		if res.TGChatID != 0 {
+			if err := tg.SendCancellation(res.TGChatID, toBotSeat(seat)); err != nil {
+				slog.Warn("cancel notify: telegram", "chatId", res.TGChatID, "err", err)
+			}
+		}
+		if res.BuyerEmail != "" && emailDelivery != nil {
+			sh, err := payShowFn(ctx)
+			if err != nil {
+				slog.Warn("cancel notify: resolve show", "err", err)
+				return
+			}
+			paySeat := pay.Seat{ID: seat.ID, Row: seat.Row, Col: seat.Col,
+				Price: money.New(seat.PriceKopecks, currency.UAH)}
+			if err := emailDelivery.SendCancellationEmail(ctx, res.BuyerEmail, res.BuyerName, paySeat, sh); err != nil {
+				slog.Warn("cancel notify: email", "to", res.BuyerEmail, "err", err)
+			}
+		}
+	})
+	adminH.Register(adminMux)
 
 	publicHandler := public.NewHandler(public.Config{
 		Store:       st,
@@ -485,18 +511,66 @@ type botStore struct{ s *store.Store }
 
 func toBotSeat(s store.Seat) bot.Seat {
 	return bot.Seat{
-		ID:     s.ID,
-		ShowID: s.ShowID,
-		Row:    s.Row,
-		Col:    s.Col,
-		Price:  money.New(s.PriceKopecks, currency.UAH),
+		ID:       s.ID,
+		ShowID:   s.ShowID,
+		Row:      s.Row,
+		Col:      s.Col,
+		Price:    money.New(s.PriceKopecks, currency.UAH),
+		Sellable: s.Sellable,
+	}
+}
+
+func fromBotSeat(s bot.Seat) store.Seat {
+	return store.Seat{
+		ID: s.ID, ShowID: s.ShowID, Row: s.Row, Col: s.Col,
+		PriceKopecks: s.Price.Minor, Sellable: s.Sellable,
 	}
 }
 
 func toBotShow(s store.Show) bot.Show {
 	return bot.Show{
-		ID: s.ID, Slug: s.Slug, Title: s.Title, Venue: s.Venue, StartsAt: s.StartsAt,
+		ID: s.ID, Slug: s.Slug, Title: s.Title, Venue: s.Venue,
+		StartsAt: s.StartsAt, Description: s.Description,
 	}
+}
+
+func (b botStore) Seats(ctx context.Context, showID int64) ([]bot.Seat, error) {
+	seats, err := b.s.Seats(ctx, showID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]bot.Seat, len(seats))
+	for i, s := range seats {
+		out[i] = toBotSeat(s)
+	}
+	return out, nil
+}
+
+func (b botStore) SeatStatuses(ctx context.Context, showID int64) (map[int64]bot.SeatStatus, error) {
+	in, err := b.s.SeatStatuses(ctx, showID)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[int64]bot.SeatStatus, len(in))
+	for id, st := range in {
+		out[id] = bot.SeatStatus(st)
+	}
+	return out, nil
+}
+
+func (b botStore) FindFreeSeat(ctx context.Context, showID int64, row, col int) (bot.Seat, error) {
+	s, err := b.s.FindFreeSeat(ctx, showID, row, col)
+	return toBotSeat(s), translateStoreErr(err)
+}
+
+func (b botStore) Reserve(
+	ctx context.Context, seat bot.Seat, tgUserID, tgChatID int64,
+	buyerName, code string, hold time.Duration,
+) (bot.Reservation, error) {
+	// Bot users get tickets via Telegram → no email channel involved,
+	// buyer_email column stays empty.
+	r, err := b.s.Reserve(ctx, fromBotSeat(seat), tgUserID, tgChatID, buyerName, "", code, hold)
+	return toBotReservation(r), translateStoreErr(err)
 }
 
 // Shows lists non-archived shows — same predicate the public landing
@@ -580,8 +654,14 @@ func translateStoreErr(err error) error {
 	switch err {
 	case nil:
 		return nil
-	case store.ErrCodeNotFound, store.ErrShowNotFound:
+	case store.ErrCodeNotFound:
 		return bot.ErrCodeNotFound
+	case store.ErrShowNotFound:
+		return bot.ErrShowNotFound
+	case store.ErrSeatTaken:
+		return bot.ErrSeatTaken
+	case store.ErrSeatNotFound, store.ErrSeatNotSellable:
+		return bot.ErrSeatNotFound
 	case store.ErrAlreadyPaid:
 		return bot.ErrAlreadyPaid
 	case store.ErrAlreadyClosed:
@@ -663,6 +743,24 @@ func (p payNotifier) SendTicket(chatID int64, seat pay.Seat, pdf []byte) error {
 type payEmail struct {
 	sender *email.SMTPSender
 	from   string
+}
+
+func (p payEmail) SendCancellationEmail(ctx context.Context, to, buyerName string, seat pay.Seat, show pay.Show) error {
+	body := fmt.Sprintf(`<!doctype html>
+<html><body style="font-family:system-ui,sans-serif;color:#111;line-height:1.5">
+<h2 style="margin:0 0 .5em">Бронь на «%s» скасована</h2>
+<p>Привіт, %s.<br>
+Адміністратор скасував бронь на місце <b>ряд %d · %d</b> для події «%s» (%s).</p>
+<p>Якщо оплата вже пройшла — повернення грошей буде вручну через monobank. Питання — дай відповідь на цей лист.</p>
+</body></html>`,
+		htmlEscape(show.Title), htmlEscape(buyerName),
+		seat.Row, seat.Col,
+		htmlEscape(show.Title), timefmt.DateTime(show.StartsAt))
+	return p.sender.Send(ctx, email.Message{
+		To:       to,
+		Subject:  fmt.Sprintf("Бронь скасована · «%s»", show.Title),
+		HTMLBody: body,
+	})
 }
 
 func (p payEmail) SendTicketEmail(ctx context.Context, to, buyerName string, seat pay.Seat, show pay.Show, pdf []byte) error {
