@@ -97,7 +97,10 @@ func Load() (Config, error) {
 	c.SMTPImplicitTLS = envBool("SMTP_IMPLICIT_TLS", false)
 	c.BotUsername = strings.TrimPrefix(os.Getenv("BOT_USERNAME"), "@")
 	c.BaseURL = strings.TrimRight(os.Getenv("BASE_URL"), "/")
-	c.PostersDir = env("POSTERS_DIR", "/data/posters")
+	// Default is relative ("./posters") so local `go run` / `make` works
+	// out of the box without root. Docker compose explicitly sets
+	// POSTERS_DIR=/data/posters where the named volume lives.
+	c.PostersDir = env("POSTERS_DIR", "posters")
 
 	if c.TGToken == "" {
 		return c, errors.New("TG_TOKEN is required")

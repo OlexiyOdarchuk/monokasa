@@ -22,6 +22,10 @@ services:
       WEBHOOK_URL: ${WEBHOOK_URL:-}
       HTTP_ADDR: ":8093"
       DB_PATH: /data/tix.db
+      # Posters live next to the SQLite file on the named volume so the
+      # data is one rsync/backup target. Default ("./posters") would land
+      # in /posters and fail under distroless-nonroot.
+      POSTERS_DIR: /data/posters
       SHOW_TITLE: ${SHOW_TITLE:-Моя вистава}
       SHOW_VENUE: ${SHOW_VENUE:-Театральна площа}
       SHOW_STARTS_AT: ${SHOW_STARTS_AT:-2026-06-01T19:00:00+03:00}

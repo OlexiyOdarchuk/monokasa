@@ -150,7 +150,7 @@ godotenv підхопить.
 | `SECURE_COOKIES` | `false` | `true` форсує `Secure` cookie у проді (за HTTPS) |
 | `HOLD` | `15m` | скільки бронь живе до оплати |
 | `REMIND_BEFORE` | `1h` | за скільки до старту слати нагадування |
-| `POSTERS_DIR` | `/data/posters` | де лежать завантажені афіші |
+| `POSTERS_DIR` | `posters` (locally) / `/data/posters` (Docker compose) | де лежать завантажені афіші |
 | `BACKEND_HOST_PORT` | `8093` | published port на хості (docker compose) |
 | `CLOUDFLARED_TOKEN` | (порожньо) | токен Cloudflare Tunnel; активний лише з `--profile tunnel` |
 
