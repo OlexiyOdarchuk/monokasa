@@ -1,10 +1,11 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { api, type Show, type CreateShowInput, ApiError } from '$lib/api';
+	import DateTimePicker from '$lib/DateTimePicker.svelte';
 
 	let title = $state('');
 	let venue = $state('');
-	let startsAtLocal = $state(''); // datetime-local format: YYYY-MM-DDTHH:mm
+	let startsAtISO = $state(''); // RFC3339 UTC, populated by DateTimePicker
 	let rows = $state(5);
 	let cols = $state(6);
 	let priceUAH = $state('250');
@@ -21,19 +22,15 @@
 			error = 'Ціна виглядає дивно — введи число у гривнях, напр. 250.00';
 			return;
 		}
-		if (!startsAtLocal) {
+		if (!startsAtISO) {
 			error = 'Заповни дату та час початку';
 			return;
 		}
 
-		// datetime-local has no timezone; treat the input as the user's
-		// local time and convert to RFC3339 UTC for the API.
-		const startsAt = new Date(startsAtLocal).toISOString();
-
 		const input: CreateShowInput = {
 			title: title.trim(),
 			venue: venue.trim(),
-			starts_at: startsAt,
+			starts_at: startsAtISO,
 			rows,
 			cols,
 			price_kopecks: priceKopecks
@@ -86,13 +83,9 @@
 
 	<div>
 		<label for="startsAt" class="block text-sm text-neutral-400">Початок (твоя локальна зона)</label>
-		<input
-			id="startsAt"
-			type="datetime-local"
-			bind:value={startsAtLocal}
-			required
-			class="mt-1 w-full rounded-md border border-neutral-800 bg-neutral-900 px-3 py-2 text-neutral-100 focus:border-neutral-600 focus:outline-none"
-		/>
+		<div class="mt-1">
+			<DateTimePicker bind:value={startsAtISO} id="startsAt" required />
+		</div>
 	</div>
 
 	<div class="grid grid-cols-2 gap-4">

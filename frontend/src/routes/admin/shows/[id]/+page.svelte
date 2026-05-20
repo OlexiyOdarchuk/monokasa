@@ -2,6 +2,7 @@
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
 	import { api, type Show, type UpdateShowInput, ApiError } from '$lib/api';
+	import DateTimePicker from '$lib/DateTimePicker.svelte';
 
 	const id = $derived(Number(page.params.id));
 
@@ -12,7 +13,7 @@
 	// Edit form state (mirrors show fields; populated when show loads).
 	let editTitle = $state('');
 	let editVenue = $state('');
-	let editStartsAt = $state(''); // datetime-local
+	let editStartsAt = $state(''); // RFC3339 UTC, two-way bound to DateTimePicker
 	let saving = $state(false);
 	let savedAt = $state<Date | null>(null);
 
@@ -23,7 +24,7 @@
 			show = await api.get<Show>(`/api/admin/shows/${id}`);
 			editTitle = show.title;
 			editVenue = show.venue;
-			editStartsAt = toLocalInput(show.starts_at);
+			editStartsAt = show.starts_at;
 		} catch (e) {
 			if (e instanceof ApiError) error = e.detail || e.code;
 			else error = String(e);
@@ -47,8 +48,7 @@
 		const patch: UpdateShowInput = {};
 		if (editTitle !== show.title) patch.title = editTitle.trim();
 		if (editVenue !== show.venue) patch.venue = editVenue.trim();
-		const newStartsAt = new Date(editStartsAt).toISOString();
-		if (newStartsAt !== show.starts_at) patch.starts_at = newStartsAt;
+		if (editStartsAt !== show.starts_at) patch.starts_at = editStartsAt;
 
 		if (Object.keys(patch).length === 0) {
 			saving = false;
@@ -60,7 +60,7 @@
 			show = await api.patch<Show>(`/api/admin/shows/${id}`, patch);
 			editTitle = show.title;
 			editVenue = show.venue;
-			editStartsAt = toLocalInput(show.starts_at);
+			editStartsAt = show.starts_at;
 			savedAt = new Date();
 		} catch (e) {
 			if (e instanceof ApiError) error = e.detail || e.code;
@@ -81,15 +81,6 @@
 			else error = String(e);
 			archiving = false;
 		}
-	}
-
-	// toLocalInput: RFC3339 from server → "YYYY-MM-DDTHH:mm" for
-	// <input type="datetime-local">. The browser shows it in the user's
-	// local zone, which is exactly what the form expects.
-	function toLocalInput(iso: string): string {
-		const d = new Date(iso);
-		const pad = (n: number) => n.toString().padStart(2, '0');
-		return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 	}
 
 	function formatDate(iso: string): string {
@@ -202,13 +193,9 @@
 		</div>
 		<div>
 			<label for="s" class="block text-sm text-neutral-400">Початок</label>
-			<input
-				id="s"
-				type="datetime-local"
-				bind:value={editStartsAt}
-				required
-				class="mt-1 w-full rounded-md border border-neutral-800 bg-neutral-900 px-3 py-2 focus:border-neutral-600 focus:outline-none"
-			/>
+			<div class="mt-1">
+				<DateTimePicker bind:value={editStartsAt} id="s" required disabled={!!show.archived_at} />
+			</div>
 		</div>
 
 		{#if error}
