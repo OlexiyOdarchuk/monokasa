@@ -329,10 +329,10 @@ func TestListGuestsIncludesAllStates(t *testing.T) {
 	seats := mustGetSeats(t, h, showID)
 
 	// 1 paid, 1 held, 1 cancelled
-	r1, _ := h.st.Reserve(context.Background(), seats[0], 1, 100, "Paid Buyer", "code0001", 5*time.Minute)
+	r1, _ := h.st.Reserve(context.Background(), seats[0], 1, 100, "Paid Buyer", "", "code0001", 5*time.Minute)
 	_, _ = h.st.Confirm(context.Background(), r1.ID, "qr1")
-	_, _ = h.st.Reserve(context.Background(), seats[1], 2, 200, "Held Buyer", "code0002", 5*time.Minute)
-	r3, _ := h.st.Reserve(context.Background(), seats[2], 3, 300, "Cancelled Buyer", "code0003", 5*time.Minute)
+	_, _ = h.st.Reserve(context.Background(), seats[1], 2, 200, "Held Buyer", "", "code0002", 5*time.Minute)
+	r3, _ := h.st.Reserve(context.Background(), seats[2], 3, 300, "Cancelled Buyer", "", "code0003", 5*time.Minute)
 	_, _, _ = h.st.CancelReservation(context.Background(), r3.Code, 3)
 
 	resp := h.do(http.MethodGet, fmt.Sprintf("/api/admin/shows/%d/guests", showID), nil)
@@ -364,7 +364,7 @@ func TestCancelReservation(t *testing.T) {
 	h := setup(t)
 	showID := mustCreateShow(t, h, 1, 1)
 	seats := mustGetSeats(t, h, showID)
-	r, _ := h.st.Reserve(context.Background(), seats[0], 1, 100, "X", "code0001", 5*time.Minute)
+	r, _ := h.st.Reserve(context.Background(), seats[0], 1, 100, "X", "", "code0001", 5*time.Minute)
 	_, _ = h.st.Confirm(context.Background(), r.ID, "qr1")
 
 	resp := h.do(http.MethodPost, fmt.Sprintf("/api/admin/reservations/%d/cancel", r.ID), nil)
@@ -394,7 +394,7 @@ func TestExportGuestsCSV(t *testing.T) {
 	h := setup(t)
 	showID := mustCreateShow(t, h, 1, 1)
 	seats := mustGetSeats(t, h, showID)
-	r, _ := h.st.Reserve(context.Background(), seats[0], 1, 100, "Тест Імʼя", "code0001", 5*time.Minute)
+	r, _ := h.st.Reserve(context.Background(), seats[0], 1, 100, "Тест Імʼя", "", "code0001", 5*time.Minute)
 	_, _ = h.st.Confirm(context.Background(), r.ID, "qr1")
 
 	resp := h.do(http.MethodGet, fmt.Sprintf("/api/admin/shows/%d/guests.csv", showID), nil)

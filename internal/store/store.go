@@ -18,12 +18,14 @@ import (
 const schema = `
 CREATE TABLE IF NOT EXISTS shows (
     id           INTEGER PRIMARY KEY,
+    slug         TEXT NOT NULL DEFAULT '',
     title        TEXT NOT NULL,
     venue        TEXT NOT NULL,
     starts_at    INTEGER NOT NULL,
     created_at   INTEGER NOT NULL DEFAULT 0,
     archived_at  INTEGER
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_shows_slug ON shows(slug);
 
 CREATE TABLE IF NOT EXISTS seats (
     id              INTEGER PRIMARY KEY,
@@ -50,6 +52,7 @@ CREATE TABLE IF NOT EXISTS reservations (
     confirmed_at    INTEGER,
     cancelled_at    INTEGER,
     buyer_name      TEXT NOT NULL DEFAULT '',
+    buyer_email     TEXT NOT NULL DEFAULT '',
     reminded_at     INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_res_code ON reservations(code);
@@ -95,14 +98,23 @@ var migrations = []string{
 	`ALTER TABLE reservations ADD COLUMN cancelled_at INTEGER`,
 	`ALTER TABLE reservations ADD COLUMN buyer_name TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE reservations ADD COLUMN reminded_at INTEGER`,
+	`ALTER TABLE reservations ADD COLUMN buyer_email TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE shows ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE shows ADD COLUMN archived_at INTEGER`,
+	`ALTER TABLE shows ADD COLUMN slug TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE seats ADD COLUMN x REAL NOT NULL DEFAULT 0`,
 	`ALTER TABLE seats ADD COLUMN y REAL NOT NULL DEFAULT 0`,
 	`ALTER TABLE seats ADD COLUMN label TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE seats ADD COLUMN category TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE seats ADD COLUMN sellable INTEGER NOT NULL DEFAULT 1`,
 	`UPDATE seats SET x = (col - 1) * 100.0 + 50.0, y = (row - 1) * 100.0 + 50.0 WHERE x = 0 AND y = 0`,
+	// Backfill slugs for any pre-slug shows. Idempotent: on a second run
+	// every show already has a non-empty slug so the WHERE skips them.
+	`UPDATE shows SET slug = 'show-' || id WHERE slug = ''`,
+	// And finally apply the unique index after backfill — ALTER TABLE ADD
+	// COLUMN can't include UNIQUE, so we declare it here. CREATE INDEX is
+	// idempotent via IF NOT EXISTS.
+	`CREATE UNIQUE INDEX IF NOT EXISTS idx_shows_slug ON shows(slug)`,
 }
 
 // Errors.
@@ -154,12 +166,12 @@ func (s *Store) Ping(ctx context.Context) error {
 
 // --- shows ---
 
-const showCols = `id, title, venue, starts_at, created_at, archived_at`
+const showCols = `id, slug, title, venue, starts_at, created_at, archived_at`
 
 func scanShow(row interface{ Scan(...any) error }, sh *Show) error {
 	var startsAt, createdAt int64
 	var archivedAt sql.NullInt64
-	if err := row.Scan(&sh.ID, &sh.Title, &sh.Venue, &startsAt, &createdAt, &archivedAt); err != nil {
+	if err := row.Scan(&sh.ID, &sh.Slug, &sh.Title, &sh.Venue, &startsAt, &createdAt, &archivedAt); err != nil {
 		return err
 	}
 	sh.StartsAt = time.Unix(startsAt, 0)
@@ -175,7 +187,8 @@ func scanShow(row interface{ Scan(...any) error }, sh *Show) error {
 
 // CreateShow inserts a new show with rows×cols seats at the given price.
 // Seats are auto-laid-out on a default grid so the visual editor has
-// something to start from.
+// something to start from. Slug is auto-derived from Title when blank,
+// with a numeric suffix appended if the resulting slug collides.
 func (s *Store) CreateShow(ctx context.Context, show Show, rows, cols int, priceKopecks int64) (int64, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -187,10 +200,20 @@ func (s *Store) CreateShow(ctx context.Context, show Show, rows, cols int, price
 	if show.CreatedAt.IsZero() {
 		show.CreatedAt = time.Unix(now, 0)
 	}
+	if show.Slug == "" {
+		slug, err := s.uniqueSlugTx(ctx, tx, Slugify(show.Title))
+		if err != nil {
+			return 0, err
+		}
+		show.Slug = slug
+	}
 	res, err := tx.ExecContext(ctx,
-		`INSERT INTO shows(title, venue, starts_at, created_at) VALUES (?, ?, ?, ?)`,
-		show.Title, show.Venue, show.StartsAt.Unix(), show.CreatedAt.Unix())
+		`INSERT INTO shows(slug, title, venue, starts_at, created_at) VALUES (?, ?, ?, ?, ?)`,
+		show.Slug, show.Title, show.Venue, show.StartsAt.Unix(), show.CreatedAt.Unix())
 	if err != nil {
+		if isUniqueErr(err) {
+			return 0, fmt.Errorf("slug %q already exists", show.Slug)
+		}
 		return 0, err
 	}
 	showID, _ := res.LastInsertId()
@@ -235,6 +258,81 @@ func (s *Store) LoadShow(ctx context.Context, id int64) (Show, error) {
 		return sh, ErrShowNotFound
 	}
 	return sh, err
+}
+
+// LoadShowBySlug looks the show up by its URL-safe handle. Used by the
+// public buyer flow where IDs leak too much (e.g., "we have 17 shows so
+// far"). Returns ErrShowNotFound for misses and for archived shows so
+// stale links can't be ressurected by mistake.
+func (s *Store) LoadShowBySlug(ctx context.Context, slug string) (Show, error) {
+	var sh Show
+	err := scanShow(
+		s.db.QueryRowContext(ctx, `SELECT `+showCols+` FROM shows WHERE slug = ?`, slug),
+		&sh)
+	if errors.Is(err, sql.ErrNoRows) {
+		return sh, ErrShowNotFound
+	}
+	if err != nil {
+		return sh, err
+	}
+	if sh.ArchivedAt != nil {
+		return sh, ErrShowNotFound
+	}
+	return sh, nil
+}
+
+// uniqueSlugTx tries `base`, then `base-2`, `base-3`, … until it finds a
+// slug that doesn't already exist within the transaction. The search is
+// bounded so a runaway loop on a misconfigured slug pattern doesn't hang.
+func (s *Store) uniqueSlugTx(ctx context.Context, tx *sql.Tx, base string) (string, error) {
+	if base == "" {
+		base = "show"
+	}
+	for i := range 1000 {
+		candidate := base
+		if i > 0 {
+			candidate = fmt.Sprintf("%s-%d", base, i+1)
+		}
+		var n int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM shows WHERE slug = ?`, candidate).Scan(&n); err != nil {
+			return "", err
+		}
+		if n == 0 {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("could not find a unique slug after 1000 attempts from base %q", base)
+}
+
+// Slugify produces a URL-safe slug from a free-form title. Lowercases
+// ASCII letters, drops anything that isn't a letter/digit, collapses
+// separators into single hyphens. Non-ASCII letters (Ukrainian Cyrillic,
+// emoji, etc.) are dropped — the resulting slug may be empty for
+// titles that are entirely Cyrillic, in which case CreateShow falls back
+// to "show-<id>" via uniqueSlugTx.
+//
+// Future: add transliteration for Cyrillic so "Незвідана Зоря" →
+// "nezvidana-zorya". For now empty-and-suffix is acceptable.
+func Slugify(s string) string {
+	out := make([]rune, 0, len(s))
+	prevHyphen := false
+	for _, r := range strings.ToLower(s) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			out = append(out, r)
+			prevHyphen = false
+		default:
+			if !prevHyphen && len(out) > 0 {
+				out = append(out, '-')
+				prevHyphen = true
+			}
+		}
+	}
+	// Trim trailing hyphen if any.
+	for len(out) > 0 && out[len(out)-1] == '-' {
+		out = out[:len(out)-1]
+	}
+	return string(out)
 }
 
 // ListShows returns all shows, archived or not, newest start first.
@@ -424,9 +522,12 @@ func (s *Store) FindFreeSeat(ctx context.Context, showID int64, row, col int) (S
 }
 
 // Reserve atomically claims a seat for the user. Refuses non-sellable seats.
+// buyerEmail is the optional email channel for ticket delivery — empty when
+// the reservation comes through Telegram (delivered via the bot) and set
+// when the buyer comes through the public web checkout.
 func (s *Store) Reserve(
 	ctx context.Context, seat Seat, tgUserID, tgChatID int64,
-	buyerName, code string, hold time.Duration,
+	buyerName, buyerEmail, code string, hold time.Duration,
 ) (Reservation, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -464,9 +565,9 @@ func (s *Store) Reserve(
 
 	expires := now.Add(hold)
 	res, err := tx.ExecContext(ctx, `
-		INSERT INTO reservations(seat_id, tg_user_id, tg_chat_id, buyer_name, code, created_at, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		seat.ID, tgUserID, tgChatID, buyerName, code, now.Unix(), expires.Unix())
+		INSERT INTO reservations(seat_id, tg_user_id, tg_chat_id, buyer_name, buyer_email, code, created_at, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		seat.ID, tgUserID, tgChatID, buyerName, buyerEmail, code, now.Unix(), expires.Unix())
 	if err != nil {
 		return Reservation{}, err
 	}
@@ -476,7 +577,8 @@ func (s *Store) Reserve(
 	}
 	return Reservation{
 		ID: id, SeatID: seat.ID, TGUserID: tgUserID, TGChatID: tgChatID,
-		BuyerName: buyerName, Code: code, CreatedAt: now, ExpiresAt: expires,
+		BuyerName: buyerName, BuyerEmail: buyerEmail,
+		Code: code, CreatedAt: now, ExpiresAt: expires,
 	}, nil
 }
 
@@ -591,7 +693,7 @@ func (s *Store) RemoveSeat(ctx context.Context, seatID int64) error {
 
 // --- reservations & tickets ---
 
-const resCols = `r.id, r.seat_id, r.tg_user_id, r.tg_chat_id, r.buyer_name, r.code,
+const resCols = `r.id, r.seat_id, r.tg_user_id, r.tg_chat_id, r.buyer_name, r.buyer_email, r.code,
 	r.created_at, r.expires_at, r.confirmed_at`
 
 // scanReservationWithSeat scans the union of resCols + cancelled_at + seatCols
@@ -602,7 +704,7 @@ func scanReservationWithSeat(row interface{ Scan(...any) error }, r *Reservation
 	var conf, cancelled sql.NullInt64
 	var sellable int
 	if err := row.Scan(
-		&r.ID, &r.SeatID, &r.TGUserID, &r.TGChatID, &r.BuyerName, &r.Code,
+		&r.ID, &r.SeatID, &r.TGUserID, &r.TGChatID, &r.BuyerName, &r.BuyerEmail, &r.Code,
 		scanTime(&r.CreatedAt), scanTime(&r.ExpiresAt), &conf, &cancelled,
 		&seat.ID, &seat.ShowID, &seat.Row, &seat.Col, &seat.X, &seat.Y,
 		&seat.Label, &seat.Category, &seat.PriceKopecks, &sellable,
@@ -830,7 +932,7 @@ func (s *Store) AdminCancelReservation(ctx context.Context, reservationID int64)
 func (s *Store) MyReservations(ctx context.Context, tgUserID int64) ([]MyItem, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+resCols+`,
-		       s.id, s.show_id, s.row, s.col, s.x, s.y, s.label, s.category, s.price_kopecks, s.sellable
+			s.id, s.show_id, s.row, s.col, s.x, s.y, s.label, s.category, s.price_kopecks, s.sellable
 		FROM reservations r
 		JOIN seats s ON s.id = r.seat_id
 		WHERE r.tg_user_id = ? AND r.cancelled_at IS NULL
@@ -847,7 +949,7 @@ func (s *Store) MyReservations(ctx context.Context, tgUserID int64) ([]MyItem, e
 		var conf sql.NullInt64
 		var sellable int
 		if err := rows.Scan(
-			&r.ID, &r.SeatID, &r.TGUserID, &r.TGChatID, &r.BuyerName, &r.Code,
+			&r.ID, &r.SeatID, &r.TGUserID, &r.TGChatID, &r.BuyerName, &r.BuyerEmail, &r.Code,
 			scanTime(&r.CreatedAt), scanTime(&r.ExpiresAt), &conf,
 			&seat.ID, &seat.ShowID, &seat.Row, &seat.Col, &seat.X, &seat.Y,
 			&seat.Label, &seat.Category, &seat.PriceKopecks, &sellable,
@@ -894,7 +996,7 @@ func (s *Store) Stats(ctx context.Context, showID int64) (Stats, error) {
 func (s *Store) ConfirmedNotYetReminded(ctx context.Context, showID int64) ([]MyItem, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+resCols+`,
-		       s.id, s.show_id, s.row, s.col, s.x, s.y, s.label, s.category, s.price_kopecks, s.sellable
+			s.id, s.show_id, s.row, s.col, s.x, s.y, s.label, s.category, s.price_kopecks, s.sellable
 		FROM reservations r
 		JOIN seats s ON s.id = r.seat_id
 		WHERE s.show_id = ?
@@ -912,7 +1014,7 @@ func (s *Store) ConfirmedNotYetReminded(ctx context.Context, showID int64) ([]My
 		var conf sql.NullInt64
 		var sellable int
 		if err := rows.Scan(
-			&r.ID, &r.SeatID, &r.TGUserID, &r.TGChatID, &r.BuyerName, &r.Code,
+			&r.ID, &r.SeatID, &r.TGUserID, &r.TGChatID, &r.BuyerName, &r.BuyerEmail, &r.Code,
 			scanTime(&r.CreatedAt), scanTime(&r.ExpiresAt), &conf,
 			&seat.ID, &seat.ShowID, &seat.Row, &seat.Col, &seat.X, &seat.Y,
 			&seat.Label, &seat.Category, &seat.PriceKopecks, &sellable,

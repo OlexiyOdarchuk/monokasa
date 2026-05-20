@@ -167,7 +167,7 @@ func (h *harness) reserveSeat(row, col int, code string) store.Reservation {
 	if err != nil {
 		h.t.Fatalf("FindFreeSeat: %v", err)
 	}
-	r, err := h.store.Reserve(ctx, seat, 1001, 9001, "Олексій Одарчук", code, 15*time.Minute)
+	r, err := h.store.Reserve(ctx, seat, 1001, 9001, "Олексій Одарчук", "", code, 15*time.Minute)
 	if err != nil {
 		h.t.Fatalf("Reserve: %v", err)
 	}

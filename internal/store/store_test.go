@@ -62,10 +62,10 @@ func TestReserveTwiceFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Reserve(ctx, seat, 1, 100, "Anna", "code0001", 5*time.Minute); err != nil {
+	if _, err := s.Reserve(ctx, seat, 1, 100, "Anna", "", "code0001", 5*time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	_, err = s.Reserve(ctx, seat, 2, 200, "Bob", "code0002", 5*time.Minute)
+	_, err = s.Reserve(ctx, seat, 2, 200, "Bob", "", "code0002", 5*time.Minute)
 	if !errors.Is(err, ErrSeatTaken) {
 		t.Fatalf("got %v, want ErrSeatTaken", err)
 	}
@@ -76,7 +76,7 @@ func TestCancelFreesSeat(t *testing.T) {
 	showID := seedShow(t, s)
 	ctx := context.Background()
 	seat, _ := s.FindFreeSeat(ctx, showID, 1, 1)
-	r, err := s.Reserve(ctx, seat, 1, 100, "A", "code0001", 5*time.Minute)
+	r, err := s.Reserve(ctx, seat, 1, 100, "A", "", "code0001", 5*time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +93,7 @@ func TestCancelByOtherUserFails(t *testing.T) {
 	showID := seedShow(t, s)
 	ctx := context.Background()
 	seat, _ := s.FindFreeSeat(ctx, showID, 1, 1)
-	r, _ := s.Reserve(ctx, seat, 1, 100, "A", "code0001", 5*time.Minute)
+	r, _ := s.Reserve(ctx, seat, 1, 100, "A", "", "code0001", 5*time.Minute)
 	if _, _, err := s.CancelReservation(ctx, r.Code, 999); !errors.Is(err, ErrNotYourBooking) {
 		t.Fatalf("got %v, want ErrNotYourBooking", err)
 	}
@@ -104,7 +104,7 @@ func TestConfirmTwiceFails(t *testing.T) {
 	showID := seedShow(t, s)
 	ctx := context.Background()
 	seat, _ := s.FindFreeSeat(ctx, showID, 1, 1)
-	r, _ := s.Reserve(ctx, seat, 1, 100, "A", "code0001", 5*time.Minute)
+	r, _ := s.Reserve(ctx, seat, 1, 100, "A", "", "code0001", 5*time.Minute)
 	if _, err := s.Confirm(ctx, r.ID, "qr-1"); err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +118,7 @@ func TestUseTicketTwiceFails(t *testing.T) {
 	showID := seedShow(t, s)
 	ctx := context.Background()
 	seat, _ := s.FindFreeSeat(ctx, showID, 1, 1)
-	r, _ := s.Reserve(ctx, seat, 1, 100, "A", "code0001", 5*time.Minute)
+	r, _ := s.Reserve(ctx, seat, 1, 100, "A", "", "code0001", 5*time.Minute)
 	if _, err := s.Confirm(ctx, r.ID, "qr-xyz"); err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,7 @@ func TestSeatStatusesTransition(t *testing.T) {
 		t.Fatalf("before reserve: got %s, want SeatFree", st[seat.ID])
 	}
 
-	r, _ := s.Reserve(ctx, seat, 1, 100, "A", "code0001", 5*time.Minute)
+	r, _ := s.Reserve(ctx, seat, 1, 100, "A", "", "code0001", 5*time.Minute)
 	st, _ = s.SeatStatuses(ctx, showID)
 	if st[seat.ID] != SeatHeld {
 		t.Fatalf("after reserve: got %s, want SeatHeld", st[seat.ID])
@@ -162,13 +162,13 @@ func TestStats(t *testing.T) {
 	ctx := context.Background()
 
 	seat1, _ := s.FindFreeSeat(ctx, showID, 1, 1)
-	r1, _ := s.Reserve(ctx, seat1, 1, 100, "A", "code0001", 5*time.Minute)
+	r1, _ := s.Reserve(ctx, seat1, 1, 100, "A", "", "code0001", 5*time.Minute)
 	if _, err := s.Confirm(ctx, r1.ID, "qr1"); err != nil {
 		t.Fatal(err)
 	}
 
 	seat2, _ := s.FindFreeSeat(ctx, showID, 1, 2)
-	if _, err := s.Reserve(ctx, seat2, 2, 200, "B", "code0002", 5*time.Minute); err != nil {
+	if _, err := s.Reserve(ctx, seat2, 2, 200, "B", "", "code0002", 5*time.Minute); err != nil {
 		t.Fatal(err)
 	}
 
@@ -199,11 +199,11 @@ func TestMyReservationsExcludesCancelled(t *testing.T) {
 	ctx := context.Background()
 
 	seat1, _ := s.FindFreeSeat(ctx, showID, 1, 1)
-	if _, err := s.Reserve(ctx, seat1, 42, 100, "A", "code0001", 5*time.Minute); err != nil {
+	if _, err := s.Reserve(ctx, seat1, 42, 100, "A", "", "code0001", 5*time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	seat2, _ := s.FindFreeSeat(ctx, showID, 1, 2)
-	r2, _ := s.Reserve(ctx, seat2, 42, 100, "A", "code0002", 5*time.Minute)
+	r2, _ := s.Reserve(ctx, seat2, 42, 100, "A", "", "code0002", 5*time.Minute)
 	if _, _, err := s.CancelReservation(ctx, r2.Code, 42); err != nil {
 		t.Fatal(err)
 	}
@@ -233,17 +233,17 @@ func TestSweepExpiredHolds(t *testing.T) {
 
 	// Expired and unpaid → swept.
 	seat1, _ := s.FindFreeSeat(ctx, showID, 1, 1)
-	if _, err := s.Reserve(ctx, seat1, 1, 100, "A", "code0001", -1*time.Minute); err != nil {
+	if _, err := s.Reserve(ctx, seat1, 1, 100, "A", "", "code0001", -1*time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	// Live hold → untouched.
 	seat2, _ := s.FindFreeSeat(ctx, showID, 1, 2)
-	if _, err := s.Reserve(ctx, seat2, 2, 200, "B", "code0002", 5*time.Minute); err != nil {
+	if _, err := s.Reserve(ctx, seat2, 2, 200, "B", "", "code0002", 5*time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	// Expired but paid → untouched.
 	seat3, _ := s.FindFreeSeat(ctx, showID, 1, 3)
-	r3, _ := s.Reserve(ctx, seat3, 3, 300, "C", "code0003", -1*time.Minute)
+	r3, _ := s.Reserve(ctx, seat3, 3, 300, "C", "", "code0003", -1*time.Minute)
 	if _, err := s.Confirm(ctx, r3.ID, "qr3"); err != nil {
 		t.Fatal(err)
 	}
@@ -432,7 +432,7 @@ func TestReserveNonSellableRejected(t *testing.T) {
 	// And so does Reserve directly (caller bypasses FindFreeSeat).
 	stale := seats[0]
 	stale.Sellable = true // pretend caller has stale data
-	if _, err := s.Reserve(ctx, stale, 1, 100, "X", "code0001", time.Minute); !errors.Is(err, ErrSeatNotSellable) {
+	if _, err := s.Reserve(ctx, stale, 1, 100, "X", "", "code0001", time.Minute); !errors.Is(err, ErrSeatNotSellable) {
 		t.Fatalf("Reserve on non-sellable: got %v, want ErrSeatNotSellable", err)
 	}
 }
@@ -448,7 +448,7 @@ func TestRemoveSeatRequiresClean(t *testing.T) {
 		t.Fatalf("RemoveSeat clean: %v", err)
 	}
 	// Seat with even a cancelled reservation — not removable (history matters).
-	r, _ := s.Reserve(ctx, seats[1], 1, 100, "A", "code0001", time.Minute)
+	r, _ := s.Reserve(ctx, seats[1], 1, 100, "A", "", "code0001", time.Minute)
 	if _, _, err := s.CancelReservation(ctx, r.Code, 1); err != nil {
 		t.Fatal(err)
 	}
@@ -606,6 +606,112 @@ func TestSweepExpiredSessions(t *testing.T) {
 	}
 }
 
+func TestCreateShowAutogeneratesSlug(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	id, err := s.CreateShow(ctx, Show{Title: "Hello World", StartsAt: time.Now()}, 1, 1, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sh, _ := s.LoadShow(ctx, id)
+	if sh.Slug != "hello-world" {
+		t.Errorf("Slug = %q, want hello-world", sh.Slug)
+	}
+}
+
+func TestCreateShowSlugCollisionAppendsSuffix(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	a, _ := s.CreateShow(ctx, Show{Title: "Show", StartsAt: time.Now()}, 1, 1, 100)
+	b, _ := s.CreateShow(ctx, Show{Title: "Show", StartsAt: time.Now()}, 1, 1, 100)
+	shA, _ := s.LoadShow(ctx, a)
+	shB, _ := s.LoadShow(ctx, b)
+	if shA.Slug != "show" {
+		t.Errorf("first slug = %q, want show", shA.Slug)
+	}
+	if shB.Slug != "show-2" {
+		t.Errorf("second slug = %q, want show-2", shB.Slug)
+	}
+}
+
+func TestCreateShowEmptySlugFromCyrillicTitle(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	// Slugify drops non-ASCII → empty base → uniqueSlugTx falls back to "show".
+	id, err := s.CreateShow(ctx, Show{Title: "Незвідана Зоря", StartsAt: time.Now()}, 1, 1, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sh, _ := s.LoadShow(ctx, id)
+	if sh.Slug != "show" {
+		t.Errorf("Slug = %q, want fallback show", sh.Slug)
+	}
+}
+
+func TestLoadShowBySlug(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	id, _ := s.CreateShow(ctx, Show{Title: "My Event", StartsAt: time.Now()}, 1, 1, 100)
+	sh, err := s.LoadShowBySlug(ctx, "my-event")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sh.ID != id {
+		t.Errorf("ID = %d, want %d", sh.ID, id)
+	}
+}
+
+func TestLoadShowBySlugHidesArchived(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	id, _ := s.CreateShow(ctx, Show{Title: "Old Event", StartsAt: time.Now()}, 1, 1, 100)
+	if err := s.ArchiveShow(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.LoadShowBySlug(ctx, "old-event"); !errors.Is(err, ErrShowNotFound) {
+		t.Errorf("archived show via slug: got %v, want ErrShowNotFound", err)
+	}
+}
+
+func TestReserveStoresBuyerEmail(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	showID, _ := s.CreateShow(ctx, Show{Title: "T", StartsAt: time.Now()}, 1, 1, 100)
+	seats, _ := s.Seats(ctx, showID)
+	r, err := s.Reserve(ctx, seats[0], 0, 0, "Web Buyer", "buyer@example.com", "codeweb01", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.BuyerEmail != "buyer@example.com" {
+		t.Errorf("BuyerEmail = %q, want buyer@example.com", r.BuyerEmail)
+	}
+	// Round-trip via FindReservationByCode too.
+	got, _, err := s.FindReservationByCode(ctx, r.Code)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.BuyerEmail != "buyer@example.com" {
+		t.Errorf("after roundtrip email = %q", got.BuyerEmail)
+	}
+}
+
+func TestSlugify(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"Hello World", "hello-world"},
+		{"  multi   spaces  ", "multi-spaces"},
+		{"Punct! Show?", "punct-show"},
+		{"Tabs\tand\nnewlines", "tabs-and-newlines"},
+		{"Незвідана Зоря", ""}, // Cyrillic stripped — caller adds fallback
+		{"123 abc!", "123-abc"},
+		{"ALL-CAPS", "all-caps"},
+	}
+	for _, tt := range tests {
+		if got := Slugify(tt.in); got != tt.want {
+			t.Errorf("Slugify(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
 func TestListReservationsIncludesCancelled(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
@@ -613,12 +719,12 @@ func TestListReservationsIncludesCancelled(t *testing.T) {
 	seats, _ := s.Seats(ctx, showID)
 
 	// 1 paid, 1 held, 1 cancelled.
-	r1, _ := s.Reserve(ctx, seats[0], 1, 100, "A", "code0001", 5*time.Minute)
+	r1, _ := s.Reserve(ctx, seats[0], 1, 100, "A", "", "code0001", 5*time.Minute)
 	if _, err := s.Confirm(ctx, r1.ID, "qr1"); err != nil {
 		t.Fatal(err)
 	}
-	_, _ = s.Reserve(ctx, seats[1], 2, 200, "B", "code0002", 5*time.Minute)
-	r3, _ := s.Reserve(ctx, seats[2], 3, 300, "C", "code0003", 5*time.Minute)
+	_, _ = s.Reserve(ctx, seats[1], 2, 200, "B", "", "code0002", 5*time.Minute)
+	r3, _ := s.Reserve(ctx, seats[2], 3, 300, "C", "", "code0003", 5*time.Minute)
 	if _, _, err := s.CancelReservation(ctx, r3.Code, 3); err != nil {
 		t.Fatal(err)
 	}
@@ -647,7 +753,7 @@ func TestAdminCancelReservationWorksOnPaid(t *testing.T) {
 	ctx := context.Background()
 	showID, _ := s.CreateShow(ctx, Show{Title: "T", StartsAt: time.Now()}, 1, 1, 100)
 	seats, _ := s.Seats(ctx, showID)
-	r, _ := s.Reserve(ctx, seats[0], 1, 100, "A", "code0001", 5*time.Minute)
+	r, _ := s.Reserve(ctx, seats[0], 1, 100, "A", "", "code0001", 5*time.Minute)
 	if _, err := s.Confirm(ctx, r.ID, "qr1"); err != nil {
 		t.Fatal(err)
 	}
@@ -670,7 +776,7 @@ func TestAdminCancelReservationDoubleFails(t *testing.T) {
 	ctx := context.Background()
 	showID, _ := s.CreateShow(ctx, Show{Title: "T", StartsAt: time.Now()}, 1, 1, 100)
 	seats, _ := s.Seats(ctx, showID)
-	r, _ := s.Reserve(ctx, seats[0], 1, 100, "A", "code0001", 5*time.Minute)
+	r, _ := s.Reserve(ctx, seats[0], 1, 100, "A", "", "code0001", 5*time.Minute)
 
 	if _, _, err := s.AdminCancelReservation(ctx, r.ID); err != nil {
 		t.Fatal(err)
@@ -692,7 +798,7 @@ func TestRemindFlow(t *testing.T) {
 	showID := seedShow(t, s)
 	ctx := context.Background()
 	seat, _ := s.FindFreeSeat(ctx, showID, 1, 1)
-	r, _ := s.Reserve(ctx, seat, 1, 100, "A", "code0001", 5*time.Minute)
+	r, _ := s.Reserve(ctx, seat, 1, 100, "A", "", "code0001", 5*time.Minute)
 	if _, err := s.Confirm(ctx, r.ID, "qr"); err != nil {
 		t.Fatal(err)
 	}

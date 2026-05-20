@@ -96,6 +96,7 @@ export interface Stats {
 
 export interface Show {
 	id: number;
+	slug: string;
 	title: string;
 	venue: string;
 	starts_at: string; // RFC3339

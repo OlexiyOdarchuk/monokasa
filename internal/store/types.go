@@ -4,9 +4,12 @@ import "time"
 
 // Show is one performance with a date/venue. CreatedAt/ArchivedAt are
 // populated for shows created through the multi-show API; legacy shows
-// migrated from earlier schemas may have a zero CreatedAt.
+// migrated from earlier schemas may have a zero CreatedAt. Slug is the
+// URL-safe handle used in public-side links (`/event/<slug>`); unique
+// across the install.
 type Show struct {
 	ID         int64
+	Slug       string
 	Title      string
 	Venue      string
 	StartsAt   time.Time
@@ -36,12 +39,15 @@ type Seat struct {
 // ticket once ConfirmedAt is set. CancelledAt is populated on soft-delete
 // (user cancel, sweeper expiry, admin force-cancel) and surfaced through
 // admin queries so the dashboard can show cancellation history.
+// BuyerEmail is set only for web-buyer reservations (PR #5); bot
+// reservations leave it empty and rely on Telegram for delivery.
 type Reservation struct {
 	ID          int64
 	SeatID      int64
 	TGUserID    int64
 	TGChatID    int64
 	BuyerName   string
+	BuyerEmail  string
 	Code        string
 	CreatedAt   time.Time
 	ExpiresAt   time.Time

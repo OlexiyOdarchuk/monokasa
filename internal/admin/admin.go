@@ -79,6 +79,7 @@ func (h *Handler) me(w http.ResponseWriter, r *http.Request) {
 
 type showResponse struct {
 	ID         int64      `json:"id"`
+	Slug       string     `json:"slug"`
 	Title      string     `json:"title"`
 	Venue      string     `json:"venue"`
 	StartsAt   time.Time  `json:"starts_at"`
@@ -97,7 +98,7 @@ type statsBody struct {
 
 func toShowResponse(s store.Show, stats *statsBody) showResponse {
 	return showResponse{
-		ID: s.ID, Title: s.Title, Venue: s.Venue,
+		ID: s.ID, Slug: s.Slug, Title: s.Title, Venue: s.Venue,
 		StartsAt: s.StartsAt, CreatedAt: s.CreatedAt, ArchivedAt: s.ArchivedAt,
 		Stats: stats,
 	}

@@ -32,6 +32,7 @@ import (
 	"github.com/OlexiyOdarchuk/monokasa/internal/config"
 	"github.com/OlexiyOdarchuk/monokasa/internal/metrics"
 	"github.com/OlexiyOdarchuk/monokasa/internal/pay"
+	"github.com/OlexiyOdarchuk/monokasa/internal/public"
 	"github.com/OlexiyOdarchuk/monokasa/internal/store"
 	"github.com/OlexiyOdarchuk/monokasa/internal/ticket"
 	"github.com/OlexiyOdarchuk/monokasa/internal/timefmt"
@@ -186,10 +187,19 @@ func main() {
 	adminMux := http.NewServeMux()
 	admin.NewHandler(st).Register(adminMux)
 
+	publicHandler := public.NewHandler(public.Config{
+		Store:    st,
+		Coder:    coder,
+		JarLink:  cfg.JarLink,
+		Hold:     cfg.HoldDuration,
+		MinPrice: cfg.PriceKopecks,
+	})
+
 	mux := http.NewServeMux()
 	mux.Handle("/webhook", hook)
 	mux.Handle("/debug/vars", expvar.Handler())
 	mux.Handle("/api/admin/", authHandler.RequireAuth(adminMux))
+	publicHandler.Register(mux)
 	authHandler.Register(mux)
 	scanner.Register(mux)
 	// SPA on "/" is the catch-all — http.ServeMux picks the longest pattern
@@ -495,7 +505,9 @@ func (b botStore) Reserve(
 	ctx context.Context, seat bot.Seat, tgUserID, tgChatID int64,
 	buyerName, code string, hold time.Duration,
 ) (bot.Reservation, error) {
-	r, err := b.s.Reserve(ctx, fromBotSeat(seat), tgUserID, tgChatID, buyerName, code, hold)
+	// Bot users get their tickets through Telegram; no email channel
+	// involved, so the buyer_email column stays empty for these rows.
+	r, err := b.s.Reserve(ctx, fromBotSeat(seat), tgUserID, tgChatID, buyerName, "", code, hold)
 	return toBotReservation(r), translateStoreErr(err)
 }
 
