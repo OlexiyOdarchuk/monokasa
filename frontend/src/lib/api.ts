@@ -196,6 +196,10 @@ export interface ReservationResponse {
 	seat: PublicSeat;
 	buyer_name: string;
 	buyer_email: string;
+	// Present when the server has BOT_USERNAME configured. The frontend
+	// shows a "Connect Telegram" button that deep-links into the bot's
+	// /start handler, attaching this reservation to that chat.
+	tg_deep_link?: string;
 }
 
 // publicApi mirrors api.* but does NOT auto-redirect to /admin/login on

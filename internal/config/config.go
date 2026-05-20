@@ -47,6 +47,13 @@ type Config struct {
 	SMTPPass        string
 	SMTPFrom        string
 	SMTPImplicitTLS bool
+
+	// BotUsername is the @-handle of the Telegram bot (without "@").
+	// When set, the public buyer page renders a "Connect Telegram"
+	// button on the success screen, deep-linking t.me/<BotUsername>?
+	// start=res_<code>. Without it, the button is hidden — bot still
+	// works for /seats users.
+	BotUsername string
 }
 
 func Load() (Config, error) {
@@ -77,6 +84,7 @@ func Load() (Config, error) {
 	c.SMTPPass = os.Getenv("SMTP_PASS")
 	c.SMTPFrom = os.Getenv("SMTP_FROM")
 	c.SMTPImplicitTLS = envBool("SMTP_IMPLICIT_TLS", false)
+	c.BotUsername = strings.TrimPrefix(os.Getenv("BOT_USERNAME"), "@")
 
 	if c.TGToken == "" {
 		return c, errors.New("TG_TOKEN is required")

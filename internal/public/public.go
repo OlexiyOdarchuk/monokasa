@@ -26,28 +26,31 @@ import (
 
 // Handler is the buyer-side API surface.
 type Handler struct {
-	st       *store.Store
-	coder    *token.Coder
-	jarLink  string // monobank jar URL; pay link is jarLink?a=…&t=…
-	hold     time.Duration
-	priceMin int64 // minimum price kopecks; reservations below this are rejected
+	st          *store.Store
+	coder       *token.Coder
+	jarLink     string // monobank jar URL; pay link is jarLink?a=…&t=…
+	hold        time.Duration
+	priceMin    int64  // minimum price kopecks; reservations below this are rejected
+	botUsername string // optional; when set, ReservationResponse carries a TG deep link
 }
 
 type Config struct {
-	Store    *store.Store
-	Coder    *token.Coder
-	JarLink  string
-	Hold     time.Duration
-	MinPrice int64
+	Store       *store.Store
+	Coder       *token.Coder
+	JarLink     string
+	Hold        time.Duration
+	MinPrice    int64
+	BotUsername string // optional Telegram bot @-handle (no leading "@")
 }
 
 func NewHandler(c Config) *Handler {
 	return &Handler{
-		st:       c.Store,
-		coder:    c.Coder,
-		jarLink:  c.JarLink,
-		hold:     c.Hold,
-		priceMin: c.MinPrice,
+		st:          c.Store,
+		coder:       c.Coder,
+		jarLink:     c.JarLink,
+		hold:        c.Hold,
+		priceMin:    c.MinPrice,
+		botUsername: c.BotUsername,
 	}
 }
 
@@ -133,12 +136,16 @@ type createReservationRequest struct {
 }
 
 type createReservationResponse struct {
-	Code       string    `json:"code"`
-	ExpiresAt  time.Time `json:"expires_at"`
-	PayURL     string    `json:"pay_url"`
+	Code       string     `json:"code"`
+	ExpiresAt  time.Time  `json:"expires_at"`
+	PayURL     string     `json:"pay_url"`
 	Seat       publicSeat `json:"seat"`
-	BuyerName  string    `json:"buyer_name"`
-	BuyerEmail string    `json:"buyer_email"`
+	BuyerName  string     `json:"buyer_name"`
+	BuyerEmail string     `json:"buyer_email"`
+	// TGDeepLink is t.me/<bot>?start=res_<code> when the host has a
+	// BOT_USERNAME configured. Empty otherwise — frontend hides the
+	// "Connect Telegram" button when this is missing.
+	TGDeepLink string `json:"tg_deep_link,omitempty"`
 }
 
 func (h *Handler) createReservation(w http.ResponseWriter, r *http.Request) {
@@ -228,6 +235,11 @@ func (h *Handler) createReservation(w http.ResponseWriter, r *http.Request) {
 		"code", res.Code, "slug", show.Slug, "seatId", target.ID,
 		"buyer", name, "email", email)
 
+	var tgLink string
+	if h.botUsername != "" {
+		tgLink = fmt.Sprintf("https://t.me/%s?start=res_%s", h.botUsername, res.Code)
+	}
+
 	writeJSON(w, http.StatusCreated, createReservationResponse{
 		Code: res.Code, ExpiresAt: res.ExpiresAt,
 		PayURL: payURL,
@@ -238,6 +250,7 @@ func (h *Handler) createReservation(w http.ResponseWriter, r *http.Request) {
 		},
 		BuyerName:  name,
 		BuyerEmail: email,
+		TGDeepLink: tgLink,
 	})
 }
 

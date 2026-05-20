@@ -163,6 +163,20 @@
 				💳 Сплатити через monobank →
 			</a>
 
+			{#if success.tg_deep_link}
+				<a
+					href={success.tg_deep_link}
+					target="_blank"
+					rel="noopener"
+					class="mt-3 block w-full rounded-lg border border-sky-700 bg-sky-950/40 px-4 py-3 text-sm text-sky-200 hover:bg-sky-950/70"
+				>
+					💬 Підключити Telegram (квиток ще й сюди)
+				</a>
+				<p class="mt-2 text-xs text-neutral-500">
+					Опційно. Якщо підключиш — після оплати PDF прийде і на email, і в Telegram.
+				</p>
+			{/if}
+
 			<p class="mt-4 text-xs text-neutral-500">
 				Після оплати квиток із QR прийде на <b>{success.buyer_email}</b>
 				(потерпи кілька хвилин на доставку).

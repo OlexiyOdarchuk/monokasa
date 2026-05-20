@@ -793,6 +793,57 @@ func TestAdminCancelReservationNotFound(t *testing.T) {
 	}
 }
 
+func TestLinkReservationToTGChat(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	showID, _ := s.CreateShow(ctx, Show{Title: "T", StartsAt: time.Now()}, 1, 1, 100)
+	seats, _ := s.Seats(ctx, showID)
+	// Simulate a web-buyer reservation (TGChatID=0, BuyerEmail set).
+	r, err := s.Reserve(ctx, seats[0], 0, 0, "Web", "web@example.com", "codelink1", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Link to a TG chat.
+	linked, _, err := s.LinkReservationToTGChat(ctx, r.Code, 12345, 67890)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if linked.TGUserID != 12345 || linked.TGChatID != 67890 {
+		t.Errorf("link did not persist: %+v", linked)
+	}
+	// Re-link to a different chat is fine (latest wins).
+	relinked, _, err := s.LinkReservationToTGChat(ctx, r.Code, 99, 88)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if relinked.TGChatID != 88 {
+		t.Errorf("relink TGChatID = %d, want 88", relinked.TGChatID)
+	}
+}
+
+func TestLinkReservationCancelledFails(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	showID, _ := s.CreateShow(ctx, Show{Title: "T", StartsAt: time.Now()}, 1, 1, 100)
+	seats, _ := s.Seats(ctx, showID)
+	r, _ := s.Reserve(ctx, seats[0], 0, 0, "Web", "web@x.com", "codelink2", time.Minute)
+	// Force-cancel as admin.
+	if _, _, err := s.AdminCancelReservation(ctx, r.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.LinkReservationToTGChat(ctx, r.Code, 1, 2); !errors.Is(err, ErrAlreadyClosed) {
+		t.Errorf("link cancelled: got %v, want ErrAlreadyClosed", err)
+	}
+}
+
+func TestLinkReservationNotFound(t *testing.T) {
+	s := newTestStore(t)
+	if _, _, err := s.LinkReservationToTGChat(context.Background(), "nosuchcd", 1, 2); !errors.Is(err, ErrCodeNotFound) {
+		t.Errorf("got %v, want ErrCodeNotFound", err)
+	}
+}
+
 func TestRemindFlow(t *testing.T) {
 	s := newTestStore(t)
 	showID := seedShow(t, s)

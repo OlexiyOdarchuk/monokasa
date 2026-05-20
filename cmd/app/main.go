@@ -222,11 +222,12 @@ func main() {
 	admin.NewHandler(st).Register(adminMux)
 
 	publicHandler := public.NewHandler(public.Config{
-		Store:    st,
-		Coder:    coder,
-		JarLink:  cfg.JarLink,
-		Hold:     cfg.HoldDuration,
-		MinPrice: cfg.PriceKopecks,
+		Store:       st,
+		Coder:       coder,
+		JarLink:     cfg.JarLink,
+		Hold:        cfg.HoldDuration,
+		MinPrice:    cfg.PriceKopecks,
+		BotUsername: cfg.BotUsername,
 	})
 
 	mux := http.NewServeMux()
@@ -558,6 +559,11 @@ func (b botStore) Reserve(
 
 func (b botStore) CancelReservation(ctx context.Context, code string, tgUserID int64) (bot.Reservation, bot.Seat, error) {
 	r, s, err := b.s.CancelReservation(ctx, code, tgUserID)
+	return toBotReservation(r), toBotSeat(s), translateStoreErr(err)
+}
+
+func (b botStore) LinkReservationToTGChat(ctx context.Context, code string, tgUserID, tgChatID int64) (bot.Reservation, bot.Seat, error) {
+	r, s, err := b.s.LinkReservationToTGChat(ctx, code, tgUserID, tgChatID)
 	return toBotReservation(r), toBotSeat(s), translateStoreErr(err)
 }
 

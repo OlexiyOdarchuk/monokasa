@@ -928,6 +928,53 @@ func (s *Store) AdminCancelReservation(ctx context.Context, reservationID int64)
 	return r, seat, nil
 }
 
+// LinkReservationToTGChat associates a web-buyer reservation with a
+// Telegram chat so the bot can deliver the PDF after payment in addition
+// to (or instead of) the email channel. Idempotent: re-linking the same
+// chat is a no-op; linking a different chat overwrites — the most recent
+// /start wins, which matches the user-facing expectation ("the bot I'm
+// chatting with now is the one that should get my ticket").
+//
+// Returns ErrCodeNotFound for missing codes, ErrAlreadyClosed for
+// cancelled reservations. Already-confirmed reservations link fine but
+// the caller (bot) should warn the user that the PDF won't auto-resend
+// — it was sent via email at confirm-time.
+func (s *Store) LinkReservationToTGChat(ctx context.Context, code string, tgUserID, tgChatID int64) (Reservation, Seat, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Reservation{}, Seat{}, err
+	}
+	defer tx.Rollback()
+
+	var r Reservation
+	var seat Seat
+	err = scanReservationWithSeat(tx.QueryRowContext(ctx, `
+		SELECT `+reservationJoinSeat+`
+		FROM reservations r JOIN seats s ON s.id = r.seat_id
+		WHERE r.code = ?`, code), &r, &seat)
+	if errors.Is(err, sql.ErrNoRows) {
+		return r, seat, ErrCodeNotFound
+	}
+	if err != nil {
+		return r, seat, err
+	}
+	if r.CancelledAt != nil {
+		return r, seat, ErrAlreadyClosed
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE reservations SET tg_user_id = ?, tg_chat_id = ? WHERE id = ?`,
+		tgUserID, tgChatID, r.ID); err != nil {
+		return r, seat, err
+	}
+	if err := tx.Commit(); err != nil {
+		return r, seat, err
+	}
+	r.TGUserID = tgUserID
+	r.TGChatID = tgChatID
+	return r, seat, nil
+}
+
 // MyReservations returns the user's bookings, newest first.
 func (s *Store) MyReservations(ctx context.Context, tgUserID int64) ([]MyItem, error) {
 	rows, err := s.db.QueryContext(ctx, `
