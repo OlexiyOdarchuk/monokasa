@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { page } from '$app/state';
+	import { SvelteSet } from 'svelte/reactivity';
 	import { api, type Seat, type Show, ApiError } from '$lib/api';
 
 	const showId = $derived(Number(page.params.id));
@@ -8,11 +9,15 @@
 	let seats = $state<Seat[]>([]);
 	let loaded = $state(false);
 	let error = $state('');
+	// One-shot toast for save success/fail. Self-clears after ~3s; the
+	// dismiss button kills it sooner. Replaces silent failures that made
+	// users think the editor wasn't persisting at all.
+	let toast = $state<{ kind: 'ok' | 'err'; msg: string } | null>(null);
 
-	// Map of seat id → "dirty" flag. When non-empty, "Save" is enabled.
-	// Add and remove operations hit the API immediately (no need to track
-	// them here); only x/y/label/category/price/sellable batch through.
-	let dirty = $state<Set<number>>(new Set());
+	// Set of seat ids with unsaved local edits. SvelteSet from svelte/
+	// reactivity guarantees .add()/.delete()/.clear() trigger reactivity
+	// — plain $state(new Set()) behaviour varies across Svelte 5 minors.
+	const dirty = new SvelteSet<number>();
 
 	let selectedId = $state<number | null>(null);
 	let saving = $state(false);
@@ -84,7 +89,14 @@
 
 	function markDirty(id: number) {
 		dirty.add(id);
-		dirty = dirty; // notify Svelte 5 of mutation
+	}
+
+	function flashToast(kind: 'ok' | 'err', msg: string) {
+		toast = { kind, msg };
+		// Auto-dismiss; user can also click the toast itself.
+		setTimeout(() => {
+			if (toast?.msg === msg) toast = null;
+		}, 4000);
 	}
 
 	function patchSeat(id: number, patch: Partial<Seat>) {
@@ -163,15 +175,20 @@
 				price_kopecks: s.price_kopecks,
 				sellable: s.sellable
 			}));
+		console.log('[seat-editor] saving', patches.length, 'patches', patches);
 		saving = true;
 		error = '';
+		const n = patches.length;
 		try {
 			await api.patch('/api/admin/seats', patches);
-			dirty = new Set();
+			dirty.clear();
 			savedAt = new Date();
+			flashToast('ok', `Збережено · ${n} ${n === 1 ? 'місце' : 'місць'}`);
 		} catch (e) {
-			if (e instanceof ApiError) error = e.detail || e.code;
-			else error = String(e);
+			const msg = e instanceof ApiError ? `${e.code}: ${e.detail || 'без деталей'}` : String(e);
+			console.error('[seat-editor] save failed', e);
+			error = msg;
+			flashToast('err', `Не зберіглось: ${msg}`);
 		} finally {
 			saving = false;
 		}
@@ -233,7 +250,6 @@
 			await api.del(`/api/admin/seats/${selected.id}`);
 			seats = seats.filter((s) => s.id !== selected!.id);
 			dirty.delete(selected.id);
-			dirty = dirty;
 			selectedId = null;
 		} catch (e) {
 			if (e instanceof ApiError) error = e.detail || e.code;
@@ -284,6 +300,18 @@
 	<div class="mt-3 rounded-md border border-red-900 bg-red-950/50 p-3 text-sm text-red-300">
 		{error}
 	</div>
+{/if}
+
+{#if toast}
+	<button
+		type="button"
+		onclick={() => (toast = null)}
+		class="fixed bottom-6 right-6 z-50 rounded-md border px-4 py-3 text-sm shadow-lg {toast.kind === 'ok'
+			? 'border-emerald-800 bg-emerald-950 text-emerald-200'
+			: 'border-red-800 bg-red-950 text-red-200'}"
+	>
+		{toast.kind === 'ok' ? '✓' : '✗'} {toast.msg}
+	</button>
 {/if}
 
 {#if !loaded}
