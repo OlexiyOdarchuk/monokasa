@@ -1,16 +1,16 @@
 // Package bot is the Telegram side of the ticket app.
 //
-// UX model (PR #5f1):
-//   - /start без deep-link: показуємо афішу — inline keyboard з усіма
-//     актуальними подіями.
-//   - Тап події → меню події з кнопками "📍 Обрати місце" (WebApp →
-//     /event/<slug>), "🎟 Мої бронювання", "↩ До списку".
-//   - /start res_<code>: deep link з public web-flow; прив'язує цей
-//     чат до резервації, щоб PDF прийшов сюди після оплати.
-//
-// Map-pick через inline kb (старий 5×6 grid) прибрано — мапа місць
-// тепер живе у Telegram Mini App (/event/<slug>). Це уніфікує UX
-// з вебом і знімає обмеження на ~8 кнопок у рядок.
+// UX model:
+//   - /start без deep-link → афіша подій як inline keyboard.
+//   - Тап події → меню з кнопками "📋 Обрати місце" (in-chat multi-pick),
+//     "🗺 Відкрити мапу залу" (Telegram WebApp → /event/<slug>, лише
+//     якщо заданий BASE_URL) і "↩ До списку".
+//   - In-chat picker: тап місця додає його в кошик (✓ маркер), тап ще
+//     раз — прибирає. Footer "✅ Завершити (N · сума)" і "🧹 Очистити".
+//     Після Завершити — питає ім'я (ForceReply), створює один order на
+//     всі обрані місця.
+//   - /start res_<code> deep link з public web-flow: прив'язує цей чат
+//     до order'а, щоб PDF'и прийшли сюди після оплати.
 package bot
 
 import (
@@ -233,7 +233,7 @@ type Options struct {
 	Store      Store
 	Coder      Coder
 	ShowFn     ShowFn
-	BaseURL    string        // optional; without it WebApp buttons fall back to plain URL share
+	BaseURL    string // optional; without it WebApp buttons fall back to plain URL share
 	JarLink    string
 	Hold       time.Duration // how long a pre-paid hold lives
 	AdminTGID  int64
@@ -495,11 +495,13 @@ func (b *Bot) callbackPick(c tele.Context, cb *tele.Callback) error {
 	}
 	seats, err := b.store.Seats(ctx, sh.ID)
 	if err != nil {
-		return c.Respond(&tele.CallbackResponse{Text: "storage error"})
+		slog.Error("pick: list seats", "showId", sh.ID, "err", err)
+		return c.Respond(&tele.CallbackResponse{Text: "Помилка"})
 	}
 	status, err := b.store.SeatStatuses(ctx, sh.ID)
 	if err != nil {
-		return c.Respond(&tele.CallbackResponse{Text: "storage error"})
+		slog.Error("pick: seat statuses", "showId", sh.ID, "err", err)
+		return c.Respond(&tele.CallbackResponse{Text: "Помилка"})
 	}
 	_ = c.Respond(&tele.CallbackResponse{})
 
@@ -551,10 +553,10 @@ func renderPickBoard(slug string, seats []Seat, status map[int64]SeatStatus, pic
 		btns := make([]tele.InlineButton, 0, len(rowSeats))
 		for _, s := range rowSeats {
 			label := strconv.Itoa(s.Col)
-			switch {
-			case status[s.ID] == SeatSold:
+			switch status[s.ID] {
+			case SeatSold:
 				label = "✖"
-			case status[s.ID] == SeatHeld:
+			case SeatHeld:
 				if _, ok := pickedSet[s.ID]; !ok {
 					label = "…"
 				}
@@ -880,11 +882,13 @@ func (b *Bot) editPickBoard(c tele.Context, sh Show, picked []pickedSeat) error 
 	defer cancel()
 	seats, err := b.store.Seats(ctx, sh.ID)
 	if err != nil {
-		return c.Send("storage error")
+		slog.Error("editPickBoard: list seats", "showId", sh.ID, "err", err)
+		return c.Send("Внутрішня помилка, спробуй ще раз пізніше.")
 	}
 	status, err := b.store.SeatStatuses(ctx, sh.ID)
 	if err != nil {
-		return c.Send("storage error")
+		slog.Error("editPickBoard: seat statuses", "showId", sh.ID, "err", err)
+		return c.Send("Внутрішня помилка, спробуй ще раз пізніше.")
 	}
 	text, markup := renderPickBoard(sh.Slug, seats, status, picked)
 	if editErr := c.Edit(text, markup); editErr != nil {
@@ -1008,7 +1012,8 @@ func (b *Bot) handleMy(c tele.Context) error {
 
 	items, err := b.store.MyReservations(ctx, c.Sender().ID)
 	if err != nil {
-		return c.Send("storage error: " + err.Error())
+		slog.Error("/my: list reservations", "tgUserId", c.Sender().ID, "err", err)
+		return c.Send("Внутрішня помилка, спробуй ще раз пізніше.")
 	}
 	if len(items) == 0 {
 		return c.Send("У тебе ще немає бронювань. /events — афіша.")
@@ -1046,7 +1051,8 @@ func (b *Bot) handleStats(c tele.Context) error {
 	}
 	st, err := b.store.Stats(ctx, show.ID)
 	if err != nil {
-		return c.Send("storage error: " + err.Error())
+		slog.Error("/stats: load", "showId", show.ID, "err", err)
+		return c.Send("Внутрішня помилка, спробуй ще раз пізніше.")
 	}
 	return c.Send(fmt.Sprintf(
 		"📊 *%s*\n"+

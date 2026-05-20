@@ -127,10 +127,10 @@ func newTestProcessor(store *fakeStore, notifier *fakeNotifier) *Processor {
 
 // fakeEmail captures every SendTicketBatchEmail call for assertion.
 type fakeEmail struct {
-	mu       sync.Mutex
-	batches  [][]EmailItem
-	cancels  []cancelCall
-	err      error
+	mu        sync.Mutex
+	batches   [][]EmailItem
+	cancels   []cancelCall
+	err       error
 	cancelErr error
 }
 

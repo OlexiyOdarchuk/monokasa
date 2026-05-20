@@ -39,12 +39,12 @@ type Seat struct {
 	Sellable     bool
 }
 
-// Reservation is a hold placed on a seat by a Telegram user. It becomes a
-// ticket once ConfirmedAt is set. CancelledAt is populated on soft-delete
-// (user cancel, sweeper expiry, admin force-cancel) and surfaced through
+// Reservation is a hold placed on a seat. It becomes a ticket once
+// ConfirmedAt is set. CancelledAt is populated on soft-delete (user
+// cancel, sweeper expiry, admin force-cancel) and surfaced through
 // admin queries so the dashboard can show cancellation history.
-// BuyerEmail is set only for web-buyer reservations (PR #5); bot
-// reservations leave it empty and rely on Telegram for delivery.
+// BuyerEmail is set for web-buyer reservations only; bot reservations
+// leave it empty and rely on Telegram for delivery.
 type Reservation struct {
 	ID         int64
 	SeatID     int64
@@ -81,18 +81,18 @@ type Ticket struct {
 // Single-seat reservations created before multi-seat were migrated into
 // 1-row orders so the rest of the code can treat everything uniformly.
 type Order struct {
-	ID            int64
-	Code          string
-	BuyerName     string
-	BuyerEmail    string
-	TGUserID      int64
-	TGChatID      int64
-	TotalKopecks  int64
-	CreatedAt     time.Time
-	ExpiresAt     time.Time
-	ConfirmedAt   *time.Time
-	CancelledAt   *time.Time
-	RemindedAt    *time.Time
+	ID           int64
+	Code         string
+	BuyerName    string
+	BuyerEmail   string
+	TGUserID     int64
+	TGChatID     int64
+	TotalKopecks int64
+	CreatedAt    time.Time
+	ExpiresAt    time.Time
+	ConfirmedAt  *time.Time
+	CancelledAt  *time.Time
+	RemindedAt   *time.Time
 }
 
 // SeatStatus is one of "free", "held", "sold".

@@ -1561,7 +1561,8 @@ func (s *Store) SweepExpiredSessions(ctx context.Context) (int64, error) {
 // isUniqueErr peeks at the SQLite error string to detect UNIQUE-constraint
 // violations. modernc/sqlite doesn't expose a typed error here, so this is
 // the pragmatic option. Surface looks like:
-//   "constraint failed: UNIQUE constraint failed: users.email (2067)"
+//
+//	"constraint failed: UNIQUE constraint failed: users.email (2067)"
 func isUniqueErr(err error) bool {
 	if err == nil {
 		return false
