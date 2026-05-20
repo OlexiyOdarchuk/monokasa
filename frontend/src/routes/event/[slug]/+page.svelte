@@ -185,11 +185,24 @@
 	</main>
 {:else if show}
 	<main class="mx-auto max-w-3xl p-4 sm:p-6">
+		{#if show.poster_url}
+			<div class="mb-4 overflow-hidden rounded-xl border border-neutral-800 bg-neutral-950">
+				<img
+					src={show.poster_url}
+					alt={show.title}
+					class="aspect-[16/9] w-full object-cover"
+					onerror={(e: Event) => ((e.target as HTMLImageElement).style.display = 'none')}
+				/>
+			</div>
+		{/if}
 		<header class="mb-4">
 			<h1 class="text-2xl font-semibold tracking-tight sm:text-3xl">{show.title}</h1>
 			<p class="mt-1 text-sm text-neutral-400">{startsAtText(show.starts_at)}</p>
 			{#if show.venue}
 				<p class="text-sm text-neutral-400">📍 {show.venue}</p>
+			{/if}
+			{#if show.description}
+				<p class="mt-3 whitespace-pre-line text-sm text-neutral-300">{show.description}</p>
 			{/if}
 		</header>
 

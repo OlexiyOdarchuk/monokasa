@@ -64,12 +64,14 @@ func (h *Handler) Register(mux *http.ServeMux) {
 // --- GET /api/public/shows ---
 
 type publicShowSummary struct {
-	Slug      string    `json:"slug"`
-	Title     string    `json:"title"`
-	Venue     string    `json:"venue"`
-	StartsAt  time.Time `json:"starts_at"`
-	SeatsFree int       `json:"seats_free"`
-	SeatsTotal int      `json:"seats_total"`
+	Slug        string    `json:"slug"`
+	Title       string    `json:"title"`
+	Venue       string    `json:"venue"`
+	StartsAt    time.Time `json:"starts_at"`
+	Description string    `json:"description"`
+	PosterURL   string    `json:"poster_url"`
+	SeatsFree   int       `json:"seats_free"`
+	SeatsTotal  int       `json:"seats_total"`
 }
 
 func (h *Handler) listShows(w http.ResponseWriter, r *http.Request) {
@@ -97,9 +99,11 @@ func (h *Handler) listShows(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, publicShowSummary{
 			Slug: sh.Slug, Title: sh.Title, Venue: sh.Venue,
-			StartsAt:   sh.StartsAt,
-			SeatsFree:  st.Free,
-			SeatsTotal: st.Total,
+			StartsAt:    sh.StartsAt,
+			Description: sh.Description,
+			PosterURL:   sh.PosterURL,
+			SeatsFree:   st.Free,
+			SeatsTotal:  st.Total,
 		})
 	}
 	// Sort by start, soonest first.
@@ -110,11 +114,13 @@ func (h *Handler) listShows(w http.ResponseWriter, r *http.Request) {
 // --- GET /api/public/shows/{slug} ---
 
 type publicShow struct {
-	Slug     string      `json:"slug"`
-	Title    string      `json:"title"`
-	Venue    string      `json:"venue"`
-	StartsAt time.Time   `json:"starts_at"`
-	Seats    []publicSeat `json:"seats"`
+	Slug        string       `json:"slug"`
+	Title       string       `json:"title"`
+	Venue       string       `json:"venue"`
+	StartsAt    time.Time    `json:"starts_at"`
+	Description string       `json:"description"`
+	PosterURL   string       `json:"poster_url"`
+	Seats       []publicSeat `json:"seats"`
 }
 
 type publicSeat struct {
@@ -159,8 +165,10 @@ func (h *Handler) getShow(w http.ResponseWriter, r *http.Request) {
 
 	out := publicShow{
 		Slug: show.Slug, Title: show.Title, Venue: show.Venue,
-		StartsAt: show.StartsAt,
-		Seats:    make([]publicSeat, 0, len(seats)),
+		StartsAt:    show.StartsAt,
+		Description: show.Description,
+		PosterURL:   show.PosterURL,
+		Seats:       make([]publicSeat, 0, len(seats)),
 	}
 	for _, s := range seats {
 		taken := statuses[s.ID] != store.SeatFree

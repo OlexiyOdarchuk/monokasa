@@ -78,14 +78,16 @@ func (h *Handler) me(w http.ResponseWriter, r *http.Request) {
 // --- shows ---
 
 type showResponse struct {
-	ID         int64      `json:"id"`
-	Slug       string     `json:"slug"`
-	Title      string     `json:"title"`
-	Venue      string     `json:"venue"`
-	StartsAt   time.Time  `json:"starts_at"`
-	CreatedAt  time.Time  `json:"created_at"`
-	ArchivedAt *time.Time `json:"archived_at,omitempty"`
-	Stats      *statsBody `json:"stats,omitempty"`
+	ID          int64      `json:"id"`
+	Slug        string     `json:"slug"`
+	Title       string     `json:"title"`
+	Venue       string     `json:"venue"`
+	StartsAt    time.Time  `json:"starts_at"`
+	Description string     `json:"description"`
+	PosterURL   string     `json:"poster_url"`
+	CreatedAt   time.Time  `json:"created_at"`
+	ArchivedAt  *time.Time `json:"archived_at,omitempty"`
+	Stats       *statsBody `json:"stats,omitempty"`
 }
 
 type statsBody struct {
@@ -99,7 +101,8 @@ type statsBody struct {
 func toShowResponse(s store.Show, stats *statsBody) showResponse {
 	return showResponse{
 		ID: s.ID, Slug: s.Slug, Title: s.Title, Venue: s.Venue,
-		StartsAt: s.StartsAt, CreatedAt: s.CreatedAt, ArchivedAt: s.ArchivedAt,
+		StartsAt: s.StartsAt, Description: s.Description, PosterURL: s.PosterURL,
+		CreatedAt: s.CreatedAt, ArchivedAt: s.ArchivedAt,
 		Stats: stats,
 	}
 }
@@ -177,9 +180,11 @@ func (h *Handler) getShow(w http.ResponseWriter, r *http.Request) {
 }
 
 type updateShowRequest struct {
-	Title    *string    `json:"title"`
-	Venue    *string    `json:"venue"`
-	StartsAt *time.Time `json:"starts_at"`
+	Title       *string    `json:"title"`
+	Venue       *string    `json:"venue"`
+	StartsAt    *time.Time `json:"starts_at"`
+	Description *string    `json:"description"`
+	PosterURL   *string    `json:"poster_url"`
 }
 
 func (h *Handler) updateShow(w http.ResponseWriter, r *http.Request) {
@@ -211,6 +216,12 @@ func (h *Handler) updateShow(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.StartsAt != nil {
 		merged.StartsAt = *req.StartsAt
+	}
+	if req.Description != nil {
+		merged.Description = *req.Description
+	}
+	if req.PosterURL != nil {
+		merged.PosterURL = *req.PosterURL
 	}
 	if err := h.st.UpdateShow(r.Context(), merged); err != nil {
 		writeInternal(w, "update show", err)

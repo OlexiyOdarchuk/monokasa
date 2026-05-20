@@ -14,6 +14,8 @@
 	let editTitle = $state('');
 	let editVenue = $state('');
 	let editStartsAt = $state(''); // RFC3339 UTC, two-way bound to DateTimePicker
+	let editDescription = $state('');
+	let editPosterURL = $state('');
 	let saving = $state(false);
 	let savedAt = $state<Date | null>(null);
 
@@ -25,6 +27,8 @@
 			editTitle = show.title;
 			editVenue = show.venue;
 			editStartsAt = show.starts_at;
+			editDescription = show.description;
+			editPosterURL = show.poster_url;
 		} catch (e) {
 			if (e instanceof ApiError) error = e.detail || e.code;
 			else error = String(e);
@@ -49,6 +53,8 @@
 		if (editTitle !== show.title) patch.title = editTitle.trim();
 		if (editVenue !== show.venue) patch.venue = editVenue.trim();
 		if (editStartsAt !== show.starts_at) patch.starts_at = editStartsAt;
+		if (editDescription !== show.description) patch.description = editDescription;
+		if (editPosterURL !== show.poster_url) patch.poster_url = editPosterURL.trim();
 
 		if (Object.keys(patch).length === 0) {
 			saving = false;
@@ -61,6 +67,8 @@
 			editTitle = show.title;
 			editVenue = show.venue;
 			editStartsAt = show.starts_at;
+			editDescription = show.description;
+			editPosterURL = show.poster_url;
 			savedAt = new Date();
 		} catch (e) {
 			if (e instanceof ApiError) error = e.detail || e.code;
@@ -196,6 +204,29 @@
 			<div class="mt-1">
 				<DateTimePicker bind:value={editStartsAt} id="s" required disabled={!!show.archived_at} />
 			</div>
+		</div>
+		<div>
+			<label for="poster" class="block text-sm text-neutral-400">Постер (URL картинки, https://…)</label>
+			<input
+				id="poster"
+				type="url"
+				bind:value={editPosterURL}
+				placeholder="https://example.com/poster.jpg"
+				class="mt-1 w-full rounded-md border border-neutral-800 bg-neutral-900 px-3 py-2 focus:border-neutral-600 focus:outline-none"
+			/>
+			{#if editPosterURL}
+				<img src={editPosterURL} alt="Прев'ю постера" class="mt-2 max-h-48 rounded-md border border-neutral-800" onerror={(e: Event) => ((e.target as HTMLImageElement).style.display = 'none')} />
+			{/if}
+		</div>
+		<div>
+			<label for="desc" class="block text-sm text-neutral-400">Опис події</label>
+			<textarea
+				id="desc"
+				bind:value={editDescription}
+				rows="5"
+				placeholder="Розкажи гостям, що це за подія. Можна без форматування."
+				class="mt-1 w-full rounded-md border border-neutral-800 bg-neutral-900 px-3 py-2 focus:border-neutral-600 focus:outline-none"
+			></textarea>
 		</div>
 
 		{#if error}

@@ -22,6 +22,8 @@ CREATE TABLE IF NOT EXISTS shows (
     title        TEXT NOT NULL,
     venue        TEXT NOT NULL,
     starts_at    INTEGER NOT NULL,
+    description  TEXT NOT NULL DEFAULT '',
+    poster_url   TEXT NOT NULL DEFAULT '',
     created_at   INTEGER NOT NULL DEFAULT 0,
     archived_at  INTEGER
 );
@@ -115,6 +117,8 @@ var migrations = []string{
 	// COLUMN can't include UNIQUE, so we declare it here. CREATE INDEX is
 	// idempotent via IF NOT EXISTS.
 	`CREATE UNIQUE INDEX IF NOT EXISTS idx_shows_slug ON shows(slug)`,
+	`ALTER TABLE shows ADD COLUMN description TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE shows ADD COLUMN poster_url TEXT NOT NULL DEFAULT ''`,
 }
 
 // Errors.
@@ -166,12 +170,13 @@ func (s *Store) Ping(ctx context.Context) error {
 
 // --- shows ---
 
-const showCols = `id, slug, title, venue, starts_at, created_at, archived_at`
+const showCols = `id, slug, title, venue, starts_at, description, poster_url, created_at, archived_at`
 
 func scanShow(row interface{ Scan(...any) error }, sh *Show) error {
 	var startsAt, createdAt int64
 	var archivedAt sql.NullInt64
-	if err := row.Scan(&sh.ID, &sh.Slug, &sh.Title, &sh.Venue, &startsAt, &createdAt, &archivedAt); err != nil {
+	if err := row.Scan(&sh.ID, &sh.Slug, &sh.Title, &sh.Venue, &startsAt,
+		&sh.Description, &sh.PosterURL, &createdAt, &archivedAt); err != nil {
 		return err
 	}
 	sh.StartsAt = time.Unix(startsAt, 0)
@@ -208,8 +213,10 @@ func (s *Store) CreateShow(ctx context.Context, show Show, rows, cols int, price
 		show.Slug = slug
 	}
 	res, err := tx.ExecContext(ctx,
-		`INSERT INTO shows(slug, title, venue, starts_at, created_at) VALUES (?, ?, ?, ?, ?)`,
-		show.Slug, show.Title, show.Venue, show.StartsAt.Unix(), show.CreatedAt.Unix())
+		`INSERT INTO shows(slug, title, venue, starts_at, description, poster_url, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		show.Slug, show.Title, show.Venue, show.StartsAt.Unix(),
+		show.Description, show.PosterURL, show.CreatedAt.Unix())
 	if err != nil {
 		if isUniqueErr(err) {
 			return 0, fmt.Errorf("slug %q already exists", show.Slug)
@@ -380,12 +387,13 @@ func (s *Store) ActiveShow(ctx context.Context) (Show, error) {
 	return sh, err
 }
 
-// UpdateShow rewrites the editable fields of an existing show. ID, created_at
-// and archived_at are not touched.
+// UpdateShow rewrites the editable fields of an existing show. ID, slug,
+// created_at and archived_at are not touched — slug is set once at create
+// and changing it would break shared links.
 func (s *Store) UpdateShow(ctx context.Context, sh Show) error {
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE shows SET title=?, venue=?, starts_at=? WHERE id=?`,
-		sh.Title, sh.Venue, sh.StartsAt.Unix(), sh.ID)
+		`UPDATE shows SET title=?, venue=?, starts_at=?, description=?, poster_url=? WHERE id=?`,
+		sh.Title, sh.Venue, sh.StartsAt.Unix(), sh.Description, sh.PosterURL, sh.ID)
 	if err != nil {
 		return err
 	}

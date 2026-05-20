@@ -57,34 +57,57 @@
 		<h2 class="mb-4 text-sm font-medium uppercase tracking-wider text-neutral-500">
 			Афіша
 		</h2>
-		<ul class="grid gap-3 sm:grid-cols-2">
+		<ul class="grid gap-4 sm:grid-cols-2">
 			{#each shows as show (show.slug)}
 				{@const soldOut = show.seats_free === 0}
 				<li>
 					<a
 						href="/event/{show.slug}"
-						class="block h-full rounded-xl border border-neutral-800 bg-neutral-900 p-5 transition hover:border-neutral-700 hover:bg-neutral-800/70"
+						class="group block h-full overflow-hidden rounded-xl border border-neutral-800 bg-neutral-900 transition hover:border-neutral-700"
 						class:opacity-60={soldOut}
 					>
-						<div class="flex items-baseline justify-between gap-3">
-							<h3 class="text-lg font-semibold text-neutral-100">{show.title}</h3>
-							{#if soldOut}
-								<span class="shrink-0 rounded bg-neutral-800 px-2 py-0.5 text-xs text-neutral-400">
-									sold out
-								</span>
+						<!-- Poster header: real image if set, otherwise a deterministic gradient
+						     keyed off the slug so each card stays visually distinct. -->
+						{#if show.poster_url}
+							<div class="aspect-[16/9] overflow-hidden bg-neutral-950">
+								<img
+									src={show.poster_url}
+									alt={show.title}
+									class="h-full w-full object-cover transition group-hover:scale-[1.02]"
+									loading="lazy"
+									onerror={(e: Event) => ((e.target as HTMLImageElement).style.display = 'none')}
+								/>
+							</div>
+						{:else}
+							<div class="aspect-[16/9] bg-gradient-to-br from-neutral-800 via-neutral-900 to-black"></div>
+						{/if}
+
+						<div class="p-5">
+							<div class="flex items-baseline justify-between gap-3">
+								<h3 class="text-lg font-semibold text-neutral-100">{show.title}</h3>
+								{#if soldOut}
+									<span class="shrink-0 rounded bg-neutral-800 px-2 py-0.5 text-xs text-neutral-400">
+										sold out
+									</span>
+								{/if}
+							</div>
+							<p class="mt-1 text-sm text-[var(--color-brand)]">
+								{formatDateTime(show.starts_at)}
+							</p>
+							{#if show.venue}
+								<p class="mt-1 text-sm text-neutral-400">📍 {show.venue}</p>
+							{/if}
+							{#if show.description}
+								<p class="mt-2 line-clamp-2 text-sm text-neutral-400">
+									{show.description}
+								</p>
+							{/if}
+							{#if !soldOut}
+								<p class="mt-3 text-xs text-neutral-500">
+									{show.seats_free} / {show.seats_total} місць вільно
+								</p>
 							{/if}
 						</div>
-						<p class="mt-1 text-sm text-[var(--color-brand)]">
-							{formatDateTime(show.starts_at)}
-						</p>
-						{#if show.venue}
-							<p class="mt-1 text-sm text-neutral-400">📍 {show.venue}</p>
-						{/if}
-						{#if !soldOut}
-							<p class="mt-3 text-xs text-neutral-500">
-								{show.seats_free} / {show.seats_total} місць вільно
-							</p>
-						{/if}
 					</a>
 				</li>
 			{/each}

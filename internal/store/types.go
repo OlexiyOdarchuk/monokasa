@@ -6,15 +6,19 @@ import "time"
 // populated for shows created through the multi-show API; legacy shows
 // migrated from earlier schemas may have a zero CreatedAt. Slug is the
 // URL-safe handle used in public-side links (`/event/<slug>`); unique
-// across the install.
+// across the install. Description is free-form text shown to buyers on
+// the public event page. PosterURL is a https://... image link used as
+// landing card background and event hero — empty falls back to gradient.
 type Show struct {
-	ID         int64
-	Slug       string
-	Title      string
-	Venue      string
-	StartsAt   time.Time
-	CreatedAt  time.Time
-	ArchivedAt *time.Time
+	ID          int64
+	Slug        string
+	Title       string
+	Venue       string
+	StartsAt    time.Time
+	Description string
+	PosterURL   string
+	CreatedAt   time.Time
+	ArchivedAt  *time.Time
 }
 
 // Seat is one location in a hall. Row/Col stay the human-friendly grid

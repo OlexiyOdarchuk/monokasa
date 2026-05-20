@@ -100,6 +100,8 @@ export interface Show {
 	title: string;
 	venue: string;
 	starts_at: string; // RFC3339
+	description: string;
+	poster_url: string;
 	created_at: string;
 	archived_at?: string | null;
 	stats?: Stats | null;
@@ -157,6 +159,8 @@ export interface UpdateShowInput {
 	title?: string;
 	venue?: string;
 	starts_at?: string;
+	description?: string;
+	poster_url?: string;
 }
 
 // ---- public-side (anonymous buyer) shapes ----
@@ -166,6 +170,8 @@ export interface PublicShowSummary {
 	title: string;
 	venue: string;
 	starts_at: string;
+	description: string;
+	poster_url: string;
 	seats_free: number;
 	seats_total: number;
 }
@@ -189,6 +195,8 @@ export interface PublicShow {
 	title: string;
 	venue: string;
 	starts_at: string;
+	description: string;
+	poster_url: string;
 	seats: PublicSeat[];
 }
 
