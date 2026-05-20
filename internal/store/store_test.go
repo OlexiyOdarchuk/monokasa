@@ -801,7 +801,7 @@ func TestCreateOrderMultiSeat(t *testing.T) {
 	seats, _ := s.Seats(ctx, showID)
 
 	order, reservations, err := s.CreateOrder(
-		ctx, seats, 0, 0, "Buyer", "buyer@x.com", "abcd1234", 5*time.Minute,
+		ctx, seats, 0, 0, "Buyer", "buyer@x.com", nil, "abcd1234", 5*time.Minute,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -823,6 +823,59 @@ func TestCreateOrderMultiSeat(t *testing.T) {
 	}
 }
 
+func TestCreateOrderAttendeeNames(t *testing.T) {
+	// Each row should land the matching attendee_name; empty strings
+	// inside the slice store as "" so the render-time fallback applies.
+	s := newTestStore(t)
+	ctx := context.Background()
+	showID, _ := s.CreateShow(ctx, Show{Title: "T", StartsAt: time.Now()}, 1, 3, 100)
+	seats, _ := s.Seats(ctx, showID)
+
+	attendees := []string{"Анна", "", "Богдан"}
+	_, reservations, err := s.CreateOrder(
+		ctx, seats, 0, 0, "Buyer", "b@x.com", attendees, "att12345", time.Minute,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"Анна", "", "Богдан"}
+	for i, r := range reservations {
+		if r.AttendeeName != want[i] {
+			t.Errorf("reservations[%d].AttendeeName = %q, want %q",
+				i, r.AttendeeName, want[i])
+		}
+	}
+
+	// Round-trip: FindOrderByCode should re-hydrate AttendeeName from disk.
+	_, items, err := s.FindOrderByCode(ctx, "att12345")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, it := range items {
+		if it.Reservation.AttendeeName != want[i] {
+			t.Errorf("items[%d].Reservation.AttendeeName = %q, want %q",
+				i, it.Reservation.AttendeeName, want[i])
+		}
+	}
+}
+
+func TestCreateOrderAttendeeLenMismatch(t *testing.T) {
+	// Wrong-length slice is a programmer error — refuse loudly so a
+	// silently truncated/padded list never reaches the DB.
+	s := newTestStore(t)
+	ctx := context.Background()
+	showID, _ := s.CreateShow(ctx, Show{Title: "T", StartsAt: time.Now()}, 1, 2, 100)
+	seats, _ := s.Seats(ctx, showID)
+
+	_, _, err := s.CreateOrder(
+		ctx, seats, 0, 0, "Buyer", "b@x.com",
+		[]string{"only one"}, "len12345", time.Minute,
+	)
+	if err == nil {
+		t.Fatal("expected error for len mismatch")
+	}
+}
+
 func TestCreateOrderSingleSeatKeepsBareCode(t *testing.T) {
 	// When the order has a single reservation, no ".1" suffix — keeps
 	// the legacy form so old display code stays correct.
@@ -831,7 +884,7 @@ func TestCreateOrderSingleSeatKeepsBareCode(t *testing.T) {
 	showID, _ := s.CreateShow(ctx, Show{Title: "T", StartsAt: time.Now()}, 1, 1, 100)
 	seats, _ := s.Seats(ctx, showID)
 
-	_, reservations, err := s.CreateOrder(ctx, seats, 0, 0, "X", "x@y.com", "solo1234", time.Minute)
+	_, reservations, err := s.CreateOrder(ctx, seats, 0, 0, "X", "x@y.com", nil, "solo1234", time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -851,7 +904,7 @@ func TestCreateOrderRefusesTakenSeat(t *testing.T) {
 	if _, err := s.Reserve(ctx, seats[0], 1, 100, "A", "", "first123", time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	_, _, err := s.CreateOrder(ctx, seats, 0, 0, "B", "b@x.com", "multi456", time.Minute)
+	_, _, err := s.CreateOrder(ctx, seats, 0, 0, "B", "b@x.com", nil, "multi456", time.Minute)
 	if !errors.Is(err, ErrSeatTaken) {
 		t.Fatalf("got %v, want ErrSeatTaken", err)
 	}
@@ -867,7 +920,7 @@ func TestFindOrderByCodeAndConfirmOrder(t *testing.T) {
 	showID, _ := s.CreateShow(ctx, Show{Title: "T", StartsAt: time.Now()}, 1, 2, 100)
 	seats, _ := s.Seats(ctx, showID)
 
-	_, reservations, err := s.CreateOrder(ctx, seats, 0, 0, "Buyer", "b@x.com", "find1234", time.Minute)
+	_, reservations, err := s.CreateOrder(ctx, seats, 0, 0, "Buyer", "b@x.com", nil, "find1234", time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}

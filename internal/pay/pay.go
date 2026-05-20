@@ -49,8 +49,11 @@ type Order struct {
 
 // OrderItem is one seat inside an order. ReservationID is what we mint
 // the QR payload for (each PDF carries one reservation's QR).
+// AttendeeName is the per-ticket name (empty → fall back to the order's
+// BuyerName at render time).
 type OrderItem struct {
 	ReservationID int64
+	AttendeeName  string
 	Seat          Seat
 }
 
@@ -180,7 +183,15 @@ func (p *Processor) processTx(ctx context.Context, t bank.Transaction) (bool, er
 	// continue — the rest of the order shouldn't be held hostage.
 	pdfs := make([][]byte, 0, len(items))
 	for _, it := range items {
-		pdf, err := p.Renderer(show, it.Seat, order.BuyerName, qrs[it.ReservationID])
+		// Per-ticket attendee wins; empty attendee falls back to the
+		// order's buyer name. Multi-seat web flow is the only path that
+		// fills AttendeeName today — bot/single-seat both leave it ""
+		// and end up printing BuyerName.
+		name := it.AttendeeName
+		if name == "" {
+			name = order.BuyerName
+		}
+		pdf, err := p.Renderer(show, it.Seat, name, qrs[it.ReservationID])
 		if err != nil {
 			slog.Error("render pdf",
 				"code", code, "seatId", it.Seat.ID, "err", err)

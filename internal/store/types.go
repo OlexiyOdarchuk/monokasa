@@ -46,17 +46,22 @@ type Seat struct {
 // BuyerEmail is set only for web-buyer reservations (PR #5); bot
 // reservations leave it empty and rely on Telegram for delivery.
 type Reservation struct {
-	ID          int64
-	SeatID      int64
-	TGUserID    int64
-	TGChatID    int64
-	BuyerName   string
-	BuyerEmail  string
-	Code        string
-	CreatedAt   time.Time
-	ExpiresAt   time.Time
-	ConfirmedAt *time.Time
-	CancelledAt *time.Time
+	ID         int64
+	SeatID     int64
+	TGUserID   int64
+	TGChatID   int64
+	BuyerName  string
+	BuyerEmail string
+	// AttendeeName is the optional per-ticket name shown on the PDF. Empty
+	// means "same as BuyerName" — the renderer falls back accordingly.
+	// Only the multi-seat web flow lets buyers fill this in; the bot and
+	// single-seat web both leave it empty.
+	AttendeeName string
+	Code         string
+	CreatedAt    time.Time
+	ExpiresAt    time.Time
+	ConfirmedAt  *time.Time
+	CancelledAt  *time.Time
 }
 
 // Ticket is the QR-bearing artifact issued after a confirmed payment.

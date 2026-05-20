@@ -150,6 +150,10 @@ var migrations = []string{
 		FROM reservations r
 		WHERE r.order_id IS NULL`,
 	`UPDATE reservations SET order_id = (SELECT id FROM orders WHERE code = reservations.code) WHERE order_id IS NULL`,
+	// Per-ticket attendee name. Empty means "use the order's buyer name on
+	// the PDF" — the renderer falls back accordingly. Only the multi-seat
+	// web flow lets buyers fill these; bot and single-seat leave it empty.
+	`ALTER TABLE reservations ADD COLUMN attendee_name TEXT NOT NULL DEFAULT ''`,
 }
 
 // Errors.
@@ -567,7 +571,7 @@ func (s *Store) Reserve(
 	ctx context.Context, seat Seat, tgUserID, tgChatID int64,
 	buyerName, buyerEmail, code string, hold time.Duration,
 ) (Reservation, error) {
-	_, reservations, err := s.CreateOrder(ctx, []Seat{seat}, tgUserID, tgChatID, buyerName, buyerEmail, code, hold)
+	_, reservations, err := s.CreateOrder(ctx, []Seat{seat}, tgUserID, tgChatID, buyerName, buyerEmail, nil, code, hold)
 	if err != nil {
 		return Reservation{}, err
 	}
@@ -685,7 +689,8 @@ func (s *Store) RemoveSeat(ctx context.Context, seatID int64) error {
 
 // --- reservations & tickets ---
 
-const resCols = `r.id, r.seat_id, r.tg_user_id, r.tg_chat_id, r.buyer_name, r.buyer_email, r.code,
+const resCols = `r.id, r.seat_id, r.tg_user_id, r.tg_chat_id, r.buyer_name, r.buyer_email,
+	r.attendee_name, r.code,
 	r.created_at, r.expires_at, r.confirmed_at`
 
 // scanReservationWithSeat scans the union of resCols + cancelled_at + seatCols
@@ -696,7 +701,8 @@ func scanReservationWithSeat(row interface{ Scan(...any) error }, r *Reservation
 	var conf, cancelled sql.NullInt64
 	var sellable int
 	if err := row.Scan(
-		&r.ID, &r.SeatID, &r.TGUserID, &r.TGChatID, &r.BuyerName, &r.BuyerEmail, &r.Code,
+		&r.ID, &r.SeatID, &r.TGUserID, &r.TGChatID, &r.BuyerName, &r.BuyerEmail,
+		&r.AttendeeName, &r.Code,
 		scanTime(&r.CreatedAt), scanTime(&r.ExpiresAt), &conf, &cancelled,
 		&seat.ID, &seat.ShowID, &seat.Row, &seat.Col, &seat.X, &seat.Y,
 		&seat.Label, &seat.Category, &seat.PriceKopecks, &sellable,
@@ -959,12 +965,23 @@ func (s *Store) AdminCancelReservation(ctx context.Context, reservationID int64)
 //
 // All seats must belong to the same show and be free + sellable. Any
 // violation rolls back the entire transaction.
+//
+// attendeeNames is optional: pass nil (every ticket prints the buyer
+// name) or a slice of len(seats) where each entry is the per-seat
+// attendee. Empty strings inside the slice are treated the same as
+// nil — that ticket falls back to buyerName at render time.
 func (s *Store) CreateOrder(
 	ctx context.Context, seats []Seat, tgUserID, tgChatID int64,
-	buyerName, buyerEmail, code string, hold time.Duration,
+	buyerName, buyerEmail string, attendeeNames []string,
+	code string, hold time.Duration,
 ) (Order, []Reservation, error) {
 	if len(seats) == 0 {
 		return Order{}, nil, errors.New("CreateOrder: empty seats")
+	}
+	if attendeeNames != nil && len(attendeeNames) != len(seats) {
+		return Order{}, nil, fmt.Errorf(
+			"CreateOrder: attendeeNames len %d != seats len %d",
+			len(attendeeNames), len(seats))
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1022,19 +1039,25 @@ func (s *Store) CreateOrder(
 		if len(seats) > 1 {
 			subcode = fmt.Sprintf("%s.%d", code, i+1)
 		}
+		var attendee string
+		if attendeeNames != nil {
+			attendee = strings.TrimSpace(attendeeNames[i])
+		}
 		resRes, err := tx.ExecContext(ctx, `
 			INSERT INTO reservations(order_id, seat_id, tg_user_id, tg_chat_id,
-			                         buyer_name, buyer_email, code, created_at, expires_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			                         buyer_name, buyer_email, attendee_name, code,
+			                         created_at, expires_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			orderID, seat.ID, tgUserID, tgChatID, buyerName, buyerEmail,
-			subcode, now.Unix(), expires.Unix())
+			attendee, subcode, now.Unix(), expires.Unix())
 		if err != nil {
 			return Order{}, nil, err
 		}
 		resID, _ := resRes.LastInsertId()
 		reservations = append(reservations, Reservation{
 			ID: resID, SeatID: seat.ID, TGUserID: tgUserID, TGChatID: tgChatID,
-			BuyerName: buyerName, BuyerEmail: buyerEmail, Code: subcode,
+			BuyerName: buyerName, BuyerEmail: buyerEmail, AttendeeName: attendee,
+			Code:      subcode,
 			CreatedAt: now, ExpiresAt: expires,
 		})
 	}
@@ -1297,7 +1320,8 @@ func (s *Store) MyReservations(ctx context.Context, tgUserID int64) ([]MyItem, e
 		var conf sql.NullInt64
 		var sellable int
 		if err := rows.Scan(
-			&r.ID, &r.SeatID, &r.TGUserID, &r.TGChatID, &r.BuyerName, &r.BuyerEmail, &r.Code,
+			&r.ID, &r.SeatID, &r.TGUserID, &r.TGChatID, &r.BuyerName, &r.BuyerEmail,
+			&r.AttendeeName, &r.Code,
 			scanTime(&r.CreatedAt), scanTime(&r.ExpiresAt), &conf,
 			&seat.ID, &seat.ShowID, &seat.Row, &seat.Col, &seat.X, &seat.Y,
 			&seat.Label, &seat.Category, &seat.PriceKopecks, &sellable,
@@ -1362,7 +1386,8 @@ func (s *Store) ConfirmedNotYetReminded(ctx context.Context, showID int64) ([]My
 		var conf sql.NullInt64
 		var sellable int
 		if err := rows.Scan(
-			&r.ID, &r.SeatID, &r.TGUserID, &r.TGChatID, &r.BuyerName, &r.BuyerEmail, &r.Code,
+			&r.ID, &r.SeatID, &r.TGUserID, &r.TGChatID, &r.BuyerName, &r.BuyerEmail,
+			&r.AttendeeName, &r.Code,
 			scanTime(&r.CreatedAt), scanTime(&r.ExpiresAt), &conf,
 			&seat.ID, &seat.ShowID, &seat.Row, &seat.Col, &seat.X, &seat.Y,
 			&seat.Label, &seat.Category, &seat.PriceKopecks, &sellable,

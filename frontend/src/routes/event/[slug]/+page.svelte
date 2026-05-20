@@ -31,6 +31,11 @@
 
 	let buyerName = $state('');
 	let buyerEmail = $state('');
+	// Optional attendee name per seat, keyed by seat id. Empty/whitespace
+	// falls back to buyerName at render time. Only sent when at least one
+	// entry is non-empty — otherwise the request omits the field entirely.
+	let attendeeNames = $state<Record<number, string>>({});
+	let showAttendees = $state(false);
 	let submitting = $state(false);
 	let success = $state<CreateOrderResponse | null>(null);
 
@@ -116,12 +121,18 @@
 		if (!show || selectedSeats.length === 0) return;
 		submitting = true;
 		error = '';
+		// Build the attendee_names slice 1:1 with selected seats. Skip
+		// the field entirely when every entry is empty so older code
+		// paths (server logs, single-seat alias) stay clean.
+		const attendees = selectedSeats.map((s) => (attendeeNames[s.id] ?? '').trim());
+		const anyFilled = attendees.some((n) => n.length > 0);
 		try {
 			success = await publicApi.post<CreateOrderResponse>('/api/public/orders', {
 				slug: show.slug,
 				seat_ids: selectedSeats.map((s) => s.id),
 				buyer_name: buyerName.trim(),
-				buyer_email: buyerEmail.trim()
+				buyer_email: buyerEmail.trim(),
+				...(anyFilled ? { attendee_names: attendees } : {})
 			});
 			payStatus = 'held';
 		} catch (e) {
@@ -428,26 +439,52 @@
 							Обрано {selectedSeats.length}
 							{selectedSeats.length === 1 ? 'місце' : selectedSeats.length < 5 ? 'місця' : 'місць'}
 						</div>
-						<ul class="mt-2 space-y-1 text-sm">
+						<ul class="mt-2 space-y-2 text-sm">
 							{#each selectedSeats as s (s.id)}
-								<li class="flex items-center justify-between gap-2">
-									<span class="truncate">
-										{seatLabel(s)}{s.category ? ` · ${s.category}` : ''}
-									</span>
-									<span class="flex items-center gap-2 text-neutral-500">
-										<span>{formatUAH(s.price_kopecks)}</span>
-										<button
-											type="button"
-											aria-label="Прибрати місце ряд {s.row} місце {s.col}"
-											onclick={() => selectedIds.delete(s.id)}
-											class="rounded px-1.5 text-neutral-500 hover:bg-neutral-800 hover:text-neutral-200"
-										>
-											✕
-										</button>
-									</span>
+								<li class="space-y-1">
+									<div class="flex items-center justify-between gap-2">
+										<span class="truncate">
+											{seatLabel(s)}{s.category ? ` · ${s.category}` : ''}
+										</span>
+										<span class="flex items-center gap-2 text-neutral-500">
+											<span>{formatUAH(s.price_kopecks)}</span>
+											<button
+												type="button"
+												aria-label="Прибрати місце ряд {s.row} місце {s.col}"
+												onclick={() => selectedIds.delete(s.id)}
+												class="rounded px-1.5 text-neutral-500 hover:bg-neutral-800 hover:text-neutral-200"
+											>
+												✕
+											</button>
+										</span>
+									</div>
+									{#if showAttendees && selectedSeats.length > 1}
+										<input
+											type="text"
+											maxlength="60"
+											value={attendeeNames[s.id] ?? ''}
+											oninput={(e: Event) => {
+												attendeeNames[s.id] = (e.target as HTMLInputElement).value;
+											}}
+											placeholder={buyerName.trim() || "ім'я на квитку"}
+											aria-label="Ім'я на квитку ряд {s.row} місце {s.col}"
+											class="w-full rounded-md border border-neutral-800 bg-neutral-950 px-2 py-1 text-sm focus:border-neutral-600 focus:outline-none"
+										/>
+									{/if}
 								</li>
 							{/each}
 						</ul>
+						{#if selectedSeats.length > 1}
+							<button
+								type="button"
+								onclick={() => (showAttendees = !showAttendees)}
+								class="mt-2 text-xs text-neutral-400 hover:text-neutral-200"
+							>
+								{showAttendees
+									? '— Один на всіх квитках'
+									: '✏️ Підписати квитки на різні імена'}
+							</button>
+						{/if}
 					</div>
 					<div class="shrink-0 text-right">
 						<div class="text-xs text-neutral-500">До оплати</div>

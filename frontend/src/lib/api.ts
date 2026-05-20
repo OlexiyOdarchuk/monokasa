@@ -237,6 +237,11 @@ export interface CreateOrderInput {
 	seat_ids: number[];
 	buyer_name: string;
 	buyer_email: string;
+	// Optional per-ticket attendee names. If present, must align 1:1 with
+	// seat_ids — empty strings inside the slice fall back to buyer_name
+	// at render time. Omit (or pass an empty slice) to use buyer_name for
+	// every ticket in the order.
+	attendee_names?: string[];
 }
 
 export interface OrderItem {

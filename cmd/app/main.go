@@ -594,7 +594,9 @@ func (b botStore) CreateOrder(
 	for i, s := range seats {
 		storeSeats[i] = fromBotSeat(s)
 	}
-	o, reservations, err := b.s.CreateOrder(ctx, storeSeats, tgUserID, tgChatID, buyerName, "", code, hold)
+	// Bot multi-seat doesn't collect per-attendee names today — every PDF
+	// prints the buyer's name. Pass nil so all rows fall back at render.
+	o, reservations, err := b.s.CreateOrder(ctx, storeSeats, tgUserID, tgChatID, buyerName, "", nil, code, hold)
 	if err != nil {
 		return bot.Order{}, nil, translateStoreErr(err)
 	}
@@ -782,6 +784,7 @@ func (p payStore) FindOrderByCode(ctx context.Context, code string) (pay.Order, 
 	for i, it := range items {
 		payItems[i] = pay.OrderItem{
 			ReservationID: it.Reservation.ID,
+			AttendeeName:  it.Reservation.AttendeeName,
 			Seat: pay.Seat{
 				ID: it.Seat.ID, Row: it.Seat.Row, Col: it.Seat.Col,
 				Price: money.New(it.Seat.PriceKopecks, currency.UAH),

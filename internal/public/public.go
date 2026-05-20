@@ -320,7 +320,10 @@ func (h *Handler) createReservation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	order, _, err := h.st.CreateOrder(r.Context(), []store.Seat{target}, 0, 0, name, email, code, h.hold)
+	// Single-seat alias never collects an attendee name — every PDF
+	// prints the buyer name. Multi-seat endpoint below threads the
+	// optional attendee_names slice.
+	order, _, err := h.st.CreateOrder(r.Context(), []store.Seat{target}, 0, 0, name, email, nil, code, h.hold)
 	switch {
 	case errors.Is(err, store.ErrSeatTaken):
 		writeError(w, http.StatusConflict, "seat_taken", "")
@@ -364,6 +367,11 @@ type createOrderRequest struct {
 	SeatIDs    []int64 `json:"seat_ids"`
 	BuyerName  string  `json:"buyer_name"`
 	BuyerEmail string  `json:"buyer_email"`
+	// AttendeeNames is optional. If present, must align 1:1 with SeatIDs
+	// — each entry is the name printed on that ticket. Empty strings
+	// inside fall back to BuyerName at render time. Omit the field
+	// entirely (or pass an empty slice) to use BuyerName for every ticket.
+	AttendeeNames []string `json:"attendee_names,omitempty"`
 }
 
 type orderItemResponse struct {
@@ -406,6 +414,32 @@ func (h *Handler) createOrder(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "too_many_seats",
 			"максимум 20 місць за одну покупку")
 		return
+	}
+	// AttendeeNames are optional. Accept either omitted/empty (every
+	// ticket prints BuyerName) or a slice matching SeatIDs 1:1.
+	var attendees []string
+	if len(req.AttendeeNames) > 0 {
+		if len(req.AttendeeNames) != len(req.SeatIDs) {
+			writeError(w, http.StatusBadRequest, "invalid_input",
+				"attendee_names length must match seat_ids")
+			return
+		}
+		attendees = make([]string, len(req.AttendeeNames))
+		for i, n := range req.AttendeeNames {
+			n = strings.TrimSpace(n)
+			if n == "" {
+				// Empty entry — fall back to buyer name at render time.
+				attendees[i] = ""
+				continue
+			}
+			normalized, err := normalizeName(n)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "invalid_attendee_name",
+					fmt.Sprintf("seat %d: %s", i+1, err.Error()))
+				return
+			}
+			attendees[i] = normalized
+		}
 	}
 
 	show, err := h.st.LoadShowBySlug(r.Context(), req.Slug)
@@ -460,7 +494,7 @@ func (h *Handler) createOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	order, _, err := h.st.CreateOrder(r.Context(), targets, 0, 0, name, email, code, h.hold)
+	order, _, err := h.st.CreateOrder(r.Context(), targets, 0, 0, name, email, attendees, code, h.hold)
 	switch {
 	case errors.Is(err, store.ErrSeatTaken):
 		writeError(w, http.StatusConflict, "seat_taken", "одне з місць щойно зайняли")
