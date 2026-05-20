@@ -139,6 +139,11 @@ type Store interface {
 	SeatStatuses(ctx context.Context, showID int64) (map[int64]SeatStatus, error)
 	FindFreeSeat(ctx context.Context, showID int64, row, col int) (Seat, error)
 	Reserve(ctx context.Context, seat Seat, tgUserID, tgChatID int64, buyerName, code string, hold time.Duration) (Reservation, error)
+	// CreateOrder groups N seats under one payment code. Used by the
+	// in-chat multi-seat picker so a single monobank payment covers all
+	// the selected seats. Returns ErrSeatTaken / ErrSeatNotSellable on
+	// race; the entire order rolls back on failure.
+	CreateOrder(ctx context.Context, seats []Seat, tgUserID, tgChatID int64, buyerName, code string, hold time.Duration) (Order, []OrderItem, error)
 	CancelReservation(ctx context.Context, code string, tgUserID int64) (Reservation, Seat, error)
 	MyReservations(ctx context.Context, tgUserID int64) ([]MyItem, error)
 	Stats(ctx context.Context, showID int64) (Stats, error)
@@ -191,18 +196,36 @@ type Bot struct {
 	jar        JarLookup  // optional — nil if jar link unparseable
 	showFn     ShowFn
 
-	// pending tracks chat users mid-name-input after picking a seat
-	// inline. Key = tg user id; value = pendingPick. A periodic sweep
-	// drops entries past Until so abandoned picks don't pile up.
+	// pending tracks chat users mid-pick (accumulating seats in the
+	// inline keyboard) or mid-name-input (after tapping "Завершити"). Key
+	// = tg user id; value = pendingPick. A periodic sweep drops entries
+	// past Until so abandoned picks don't pile up.
 	pending sync.Map
 	done    chan struct{}
 }
 
+// pendingPick is the bot-side basket: the seats this chat user has
+// currently ticked in the inline picker, awaiting either more taps, the
+// "✅ Завершити" button (→ AwaitingName), or a TTL sweep.
 type pendingPick struct {
 	ShowID int64
+	Slug   string
+	// Seats accumulates picks in tap order. Re-tapping a row/col toggles
+	// it off. Stored as a slice (not a set) so we render in a stable
+	// "first picked first" order in the confirmation message.
+	Seats []pickedSeat
+	// AwaitingName flips true after "✅ Завершити"; handleText only fires
+	// the order creation when this is set. While false, free-text input
+	// from the user is ignored.
+	AwaitingName bool
+	Until        time.Time
+}
+
+type pickedSeat struct {
+	SeatID int64
 	Row    int
 	Col    int
-	Until  time.Time
+	Price  money.Money
 }
 
 type Options struct {
@@ -390,6 +413,10 @@ func (b *Bot) handleCallback(c tele.Context) error {
 		return b.callbackPick(c, cb)
 	case strings.HasPrefix(cb.Data, "\fseat|"):
 		return b.callbackSeat(c, cb)
+	case strings.HasPrefix(cb.Data, "\fdone|"):
+		return b.callbackDone(c, cb)
+	case strings.HasPrefix(cb.Data, "\fclear|"):
+		return b.callbackClear(c, cb)
 	case strings.HasPrefix(cb.Data, "\fcancel|"):
 		return b.callbackCancel(c, cb)
 	case strings.HasPrefix(cb.Data, "\fevents|"):
@@ -450,7 +477,9 @@ func (b *Bot) callbackShow(c tele.Context, cb *tele.Callback) error {
 // callbackPick handles the "📋 Обрати місце" tap from the show menu —
 // renders the seat grid as an inline keyboard. The grid uses the same
 // row/col layout the admin set up; free seats show their col number,
-// held are "…", sold are "✖".
+// held are "…", sold are "✖". Re-entering the picker wipes any prior
+// in-progress selection for this user so the basket always starts
+// empty here.
 func (b *Bot) callbackPick(c tele.Context, cb *tele.Callback) error {
 	slug := strings.TrimPrefix(cb.Data, "\fpick|")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -474,6 +503,36 @@ func (b *Bot) callbackPick(c tele.Context, cb *tele.Callback) error {
 	}
 	_ = c.Respond(&tele.CallbackResponse{})
 
+	if !anySellable(seats) {
+		return c.Send("Зала ще не налаштована. Спробуй пізніше.")
+	}
+
+	// Re-enter the picker → wipe any half-done basket from earlier.
+	b.pending.Store(cb.Sender.ID, pendingPick{
+		ShowID: sh.ID,
+		Slug:   sh.Slug,
+		Until:  time.Now().Add(pendingTTL),
+	})
+
+	text, markup := renderPickBoard(sh.Slug, seats, status, nil)
+	return c.Send(text, markup)
+}
+
+// maxPickSeats caps how many seats one chat user can stack in the
+// in-chat picker. Mirrors the soft cap on POST /api/public/orders so the
+// bot and web paths share the same upper bound.
+const maxPickSeats = 20
+
+// renderPickBoard builds the inline-keyboard seat grid plus the footer
+// controls ("✅ Завершити", "🧹 Очистити", "↩ Назад"). Seats in `picked`
+// render with a "✓" instead of the column number so the user can spot
+// what's in their basket without leaving the message.
+func renderPickBoard(slug string, seats []Seat, status map[int64]SeatStatus, picked []pickedSeat) (string, *tele.ReplyMarkup) {
+	pickedSet := make(map[int64]struct{}, len(picked))
+	for _, p := range picked {
+		pickedSet[p.SeatID] = struct{}{}
+	}
+
 	rowMap := make(map[int][]Seat)
 	maxRow := 0
 	for _, s := range seats {
@@ -485,49 +544,85 @@ func (b *Bot) callbackPick(c tele.Context, cb *tele.Callback) error {
 			maxRow = s.Row
 		}
 	}
-	if maxRow == 0 {
-		return c.Send("Зала ще не налаштована. Спробуй пізніше.")
-	}
 
-	kb := make([][]tele.InlineButton, 0, maxRow+1)
+	kb := make([][]tele.InlineButton, 0, maxRow+3)
 	for r := 1; r <= maxRow; r++ {
 		rowSeats := rowMap[r]
 		btns := make([]tele.InlineButton, 0, len(rowSeats))
 		for _, s := range rowSeats {
 			label := strconv.Itoa(s.Col)
-			switch status[s.ID] {
-			case SeatSold:
+			switch {
+			case status[s.ID] == SeatSold:
 				label = "✖"
-			case SeatHeld:
-				label = "…"
+			case status[s.ID] == SeatHeld:
+				if _, ok := pickedSet[s.ID]; !ok {
+					label = "…"
+				}
+			}
+			if _, ok := pickedSet[s.ID]; ok {
+				// Picked overrides everything else (the seat is in the
+				// caller's own basket — still free from the DB's POV).
+				label = "✓"
 			}
 			btns = append(btns, tele.InlineButton{
 				Unique: "seat",
 				Text:   label,
-				Data:   fmt.Sprintf("%s:%d:%d", sh.Slug, s.Row, s.Col),
+				Data:   fmt.Sprintf("%s:%d:%d", slug, s.Row, s.Col),
 			})
 		}
 		kb = append(kb, btns)
 	}
-	kb = append(kb, []tele.InlineButton{
-		{Unique: "show", Text: "↩ Назад", Data: sh.Slug},
-	})
-	markup := &tele.ReplyMarkup{InlineKeyboard: kb}
 
-	priceLine := ""
-	if len(seats) > 0 {
-		priceLine = "\nЦіна вказана у редакторі залу адміном."
+	// Footer: dynamic "Завершити вибір (N)", optional Clear, then Back.
+	doneLabel := "✅ Завершити вибір"
+	if n := len(picked); n > 0 {
+		doneLabel = fmt.Sprintf("✅ Завершити (%d · %s)", n, sumPrice(picked).String())
 	}
+	footer := []tele.InlineButton{
+		{Unique: "done", Text: doneLabel, Data: slug},
+	}
+	if len(picked) > 0 {
+		footer = append(footer, tele.InlineButton{
+			Unique: "clear", Text: "🧹 Очистити", Data: slug,
+		})
+	}
+	kb = append(kb, footer)
+	kb = append(kb, []tele.InlineButton{
+		{Unique: "show", Text: "↩ Назад", Data: slug},
+	})
+
 	header := "🎭 ━━━━━ СЦЕНА ━━━━━ 🎭\n               ▲ ближче до сцени\n\n"
-	return c.Send(
-		fmt.Sprintf("%sРяд 1 — найближче до сцени.\nНатисни вільне місце, щоб забронювати.%s",
-			header, priceLine),
-		markup)
+	body := "Ряд 1 — найближче до сцени.\nНатисни вільні місця (можна декілька), потім ✅ Завершити."
+	if n := len(picked); n > 0 {
+		body += fmt.Sprintf("\n\nВ кошику: %d · %s", n, sumPrice(picked).String())
+	}
+	return header + body, &tele.ReplyMarkup{InlineKeyboard: kb}
 }
 
-// callbackSeat handles a tap on one of the seat buttons. Stores the
-// (showID, row, col) tuple in pending, asks for the buyer's name with
-// ForceReply, and waits for handleText to pick it up.
+func anySellable(seats []Seat) bool {
+	for _, s := range seats {
+		if s.Sellable {
+			return true
+		}
+	}
+	return false
+}
+
+func sumPrice(picks []pickedSeat) money.Money {
+	if len(picks) == 0 {
+		return money.Money{}
+	}
+	out := money.Money{Code: picks[0].Price.Code}
+	for _, p := range picks {
+		out.Minor += p.Price.Minor
+	}
+	return out
+}
+
+// callbackSeat handles a tap on one of the seat buttons. Toggles the
+// seat in the user's pending basket and re-renders the keyboard
+// in-place. Reaching the maxPickSeats cap shows a transient toast and
+// leaves the basket unchanged.
 func (b *Bot) callbackSeat(c tele.Context, cb *tele.Callback) error {
 	data := strings.TrimPrefix(cb.Data, "\fseat|")
 	parts := strings.SplitN(data, ":", 3)
@@ -547,20 +642,98 @@ func (b *Bot) callbackSeat(c tele.Context, cb *tele.Callback) error {
 	if err != nil {
 		return c.Respond(&tele.CallbackResponse{Text: "Подію не знайдено"})
 	}
-	// Pre-check that the seat is still free so the name prompt isn't a
-	// dead end. Re-checked atomically inside Reserve.
+
+	pick, ok := b.loadPending(cb.Sender.ID, sh)
+	if !ok {
+		// Stale message: their basket either expired or never existed
+		// for this show. Bounce them back to the picker so it re-seeds.
+		return c.Respond(&tele.CallbackResponse{Text: "Натисни 📋 Обрати місце ще раз"})
+	}
+
+	// If the seat is already in the basket, toggle off without hitting
+	// the DB. Otherwise we need the live seat state to decide whether
+	// the tap should add or refuse.
+	if idx := indexOfPick(pick.Seats, row, col); idx >= 0 {
+		pick.Seats = append(pick.Seats[:idx], pick.Seats[idx+1:]...)
+		pick.Until = time.Now().Add(pendingTTL)
+		b.pending.Store(cb.Sender.ID, pick)
+		_ = c.Respond(&tele.CallbackResponse{})
+		return b.editPickBoard(c, sh, pick.Seats)
+	}
+
+	if len(pick.Seats) >= maxPickSeats {
+		return c.Respond(&tele.CallbackResponse{
+			Text: fmt.Sprintf("Максимум %d місць за одну покупку", maxPickSeats),
+		})
+	}
+
 	seat, err := b.store.FindFreeSeat(ctx, sh.ID, row, col)
 	if err != nil {
 		return c.Respond(&tele.CallbackResponse{Text: friendly(err)})
 	}
-	b.pending.Store(cb.Sender.ID, pendingPick{
-		ShowID: sh.ID, Row: row, Col: col,
-		Until: time.Now().Add(pendingTTL),
+	pick.Seats = append(pick.Seats, pickedSeat{
+		SeatID: seat.ID, Row: seat.Row, Col: seat.Col, Price: seat.Price,
 	})
-	_ = c.Respond(&tele.CallbackResponse{Text: "Введи ім'я"})
-	_, err = b.tb.Send(cb.Sender, fmt.Sprintf(
-		"Місце ряд %d · %d, ціна %s.\nВведи ім'я та прізвище — будуть надруковані на квитку:",
-		seat.Row, seat.Col, seat.Price),
+	pick.Until = time.Now().Add(pendingTTL)
+	b.pending.Store(cb.Sender.ID, pick)
+	_ = c.Respond(&tele.CallbackResponse{})
+	return b.editPickBoard(c, sh, pick.Seats)
+}
+
+// callbackClear empties the current basket but keeps the user on the
+// picker — re-renders the board without any "✓" markers.
+func (b *Bot) callbackClear(c tele.Context, cb *tele.Callback) error {
+	slug := strings.TrimPrefix(cb.Data, "\fclear|")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	sh, err := b.store.FindShowBySlug(ctx, slug)
+	if err != nil {
+		return c.Respond(&tele.CallbackResponse{Text: "Подію не знайдено"})
+	}
+	pick, ok := b.loadPending(cb.Sender.ID, sh)
+	if !ok {
+		return c.Respond(&tele.CallbackResponse{Text: "Натисни 📋 Обрати місце ще раз"})
+	}
+	pick.Seats = nil
+	pick.AwaitingName = false
+	pick.Until = time.Now().Add(pendingTTL)
+	b.pending.Store(cb.Sender.ID, pick)
+	_ = c.Respond(&tele.CallbackResponse{Text: "Очищено"})
+	return b.editPickBoard(c, sh, nil)
+}
+
+// callbackDone closes the picking phase: validates ≥1 seat is in the
+// basket, flips AwaitingName, and asks for the buyer's name via
+// ForceReply. handleText finishes the flow when the user replies.
+func (b *Bot) callbackDone(c tele.Context, cb *tele.Callback) error {
+	slug := strings.TrimPrefix(cb.Data, "\fdone|")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	sh, err := b.store.FindShowBySlug(ctx, slug)
+	if err != nil {
+		return c.Respond(&tele.CallbackResponse{Text: "Подію не знайдено"})
+	}
+	pick, ok := b.loadPending(cb.Sender.ID, sh)
+	if !ok {
+		return c.Respond(&tele.CallbackResponse{Text: "Натисни 📋 Обрати місце ще раз"})
+	}
+	if len(pick.Seats) == 0 {
+		return c.Respond(&tele.CallbackResponse{Text: "Спочатку обери хоч одне місце"})
+	}
+	pick.AwaitingName = true
+	pick.Until = time.Now().Add(pendingTTL)
+	b.pending.Store(cb.Sender.ID, pick)
+	_ = c.Respond(&tele.CallbackResponse{})
+
+	var summary strings.Builder
+	for _, p := range pick.Seats {
+		fmt.Fprintf(&summary, "· ряд %d місце %d — %s\n", p.Row, p.Col, p.Price)
+	}
+	prompt := fmt.Sprintf(
+		"Обрано %d %s:\n%sСума: %s.\n\nВведи ім'я та прізвище — будуть на квитках:",
+		len(pick.Seats), seatWord(len(pick.Seats)), summary.String(),
+		sumPrice(pick.Seats))
+	_, err = b.tb.Send(cb.Sender, prompt,
 		&tele.ReplyMarkup{ForceReply: true, Selective: true})
 	return err
 }
@@ -572,57 +745,185 @@ func (b *Bot) handleText(c tele.Context) error {
 	}
 	raw, ok := b.pending.Load(sender.ID)
 	if !ok {
-		return nil // user typed text but isn't in name-input mode
+		return nil // user typed text but isn't in any pick flow
 	}
 	pick, ok := raw.(pendingPick)
 	if !ok {
 		b.pending.Delete(sender.ID)
 		return nil
 	}
+	if !pick.AwaitingName {
+		return nil // still picking — free-text shouldn't derail the picker
+	}
 	if time.Now().After(pick.Until) {
 		b.pending.Delete(sender.ID)
-		return c.Send("Час на введення імені вийшов. Тицьни /events і вибери місце ще раз.")
+		return c.Send("Час на введення імені вийшов. Тицьни /events і вибери місця ще раз.")
 	}
 
 	name, err := normalizeName(c.Text())
 	if err != nil {
 		return c.Send(err.Error() + "\nСпробуй ще раз:")
 	}
+	if len(pick.Seats) == 0 {
+		b.pending.Delete(sender.ID)
+		return c.Send("Кошик порожній. Тицьни /events і вибери місця.")
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	seat, err := b.store.FindFreeSeat(ctx, pick.ShowID, pick.Row, pick.Col)
-	if err != nil {
-		b.pending.Delete(sender.ID)
-		return c.Send(friendly(err))
+	// Re-resolve each pick to a live Seat — gives a friendly error if
+	// someone else grabbed it between picking and confirming. CreateOrder
+	// re-checks atomically inside the tx, so this is just for UX.
+	seats := make([]Seat, 0, len(pick.Seats))
+	for _, p := range pick.Seats {
+		s, err := b.store.FindFreeSeat(ctx, pick.ShowID, p.Row, p.Col)
+		if err != nil {
+			b.pending.Delete(sender.ID)
+			return c.Send(fmt.Sprintf("Місце ряд %d · %d: %s",
+				p.Row, p.Col, friendly(err)))
+		}
+		seats = append(seats, s)
 	}
+
 	code, err := b.coder.NewCode()
 	if err != nil {
 		return c.Send("Внутрішня помилка, спробуй пізніше")
 	}
-	r, err := b.store.Reserve(ctx, seat, sender.ID, c.Chat().ID, name, code, b.hold)
+	order, items, err := b.store.CreateOrder(ctx, seats, sender.ID, c.Chat().ID, name, code, b.hold)
 	if err != nil {
 		b.pending.Delete(sender.ID)
 		return c.Send(friendly(err))
 	}
 	b.pending.Delete(sender.ID)
 
-	payURL := jarPrefillURL(b.jarLink, seat.Price, r.Code)
-	payBtn := tele.InlineButton{Text: "💳 Оплатити", URL: payURL}
-	cancelBtn := tele.InlineButton{Unique: "cancel", Text: "✖ Скасувати бронь", Data: r.Code}
-	markup := &tele.ReplyMarkup{InlineKeyboard: [][]tele.InlineButton{{payBtn}, {cancelBtn}}}
+	total := sumOrderPrice(items)
+	payURL := jarPrefillURL(b.jarLink, total, order.Code)
 
-	return c.Send(fmt.Sprintf(
-		"Місце забронювано: ряд %d, місце %d.\n"+
-			"На квитку буде: *%s*\n\n"+
-			"💳 Натисни *Оплатити* — сума й коментар вже вписані.\n"+
-			"Код у коментарі — `%s`.\n"+
-			"Бронювання дійсне до %s. Після оплати бот сам пришле PDF.",
-		seat.Row, seat.Col, name, r.Code, formatClock(r.ExpiresAt)),
-		tele.ModeMarkdown,
-		&tele.SendOptions{DisableWebPagePreview: true},
-		markup)
+	var seatsList strings.Builder
+	for _, it := range items {
+		fmt.Fprintf(&seatsList, "· ряд %d місце %d — %s\n", it.Seat.Row, it.Seat.Col, it.Seat.Price)
+	}
+
+	// Cancel button only on single-seat (legacy parity). Multi-seat
+	// cancel goes through /my so each row has its own ✖ — clearer than
+	// guessing which seat a single button represents.
+	rows := [][]tele.InlineButton{
+		{{Text: "💳 Оплатити", URL: payURL}},
+	}
+	if len(items) == 1 {
+		rows = append(rows, []tele.InlineButton{
+			{Unique: "cancel", Text: "✖ Скасувати бронь", Data: items[0].Reservation.Code},
+		})
+	}
+	markup := &tele.ReplyMarkup{InlineKeyboard: rows}
+
+	// All child reservations share the order's expiry (set atomically in
+	// CreateOrder); pull from the first row.
+	expires := items[0].Reservation.ExpiresAt
+
+	var msg string
+	if len(items) == 1 {
+		s := items[0].Seat
+		msg = fmt.Sprintf(
+			"Місце забронювано: ряд %d, місце %d.\n"+
+				"На квитку буде: *%s*\n\n"+
+				"💳 Натисни *Оплатити* — сума й коментар вже вписані.\n"+
+				"Код у коментарі — `%s`.\n"+
+				"Бронювання дійсне до %s. Після оплати бот сам пришле PDF.",
+			s.Row, s.Col, name, order.Code, formatClock(expires))
+	} else {
+		msg = fmt.Sprintf(
+			"Забронював %d %s:\n%s"+
+				"На квитках буде: *%s*\n\n"+
+				"💳 Натисни *Оплатити* — сума %s і коментар вже вписані.\n"+
+				"Код у коментарі — `%s`.\n"+
+				"Бронювання дійсне до %s. Після оплати бот пришле %d PDF — по одному на місце.",
+			len(items), seatWord(len(items)), seatsList.String(),
+			name, total, order.Code, formatClock(expires), len(items))
+	}
+
+	return c.Send(msg, tele.ModeMarkdown,
+		&tele.SendOptions{DisableWebPagePreview: true}, markup)
+}
+
+// loadPending reads a basket out of the sync.Map, verifying it still
+// belongs to the right show and hasn't expired. Stale or mismatched
+// entries are deleted and reported as not-found.
+func (b *Bot) loadPending(userID int64, sh Show) (pendingPick, bool) {
+	raw, ok := b.pending.Load(userID)
+	if !ok {
+		return pendingPick{}, false
+	}
+	pick, ok := raw.(pendingPick)
+	if !ok {
+		b.pending.Delete(userID)
+		return pendingPick{}, false
+	}
+	if time.Now().After(pick.Until) {
+		b.pending.Delete(userID)
+		return pendingPick{}, false
+	}
+	if pick.Slug != sh.Slug {
+		// Different show — silently let the caller decide. We don't
+		// delete: the basket for the other show stays valid.
+		return pendingPick{}, false
+	}
+	return pick, true
+}
+
+// editPickBoard re-renders the picker keyboard in-place for the message
+// the callback fired from. Falls back to sending a fresh message if the
+// edit fails (e.g. message too old to edit per Telegram API limits).
+func (b *Bot) editPickBoard(c tele.Context, sh Show, picked []pickedSeat) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	seats, err := b.store.Seats(ctx, sh.ID)
+	if err != nil {
+		return c.Send("storage error")
+	}
+	status, err := b.store.SeatStatuses(ctx, sh.ID)
+	if err != nil {
+		return c.Send("storage error")
+	}
+	text, markup := renderPickBoard(sh.Slug, seats, status, picked)
+	if editErr := c.Edit(text, markup); editErr != nil {
+		// Message too old / unchanged content — send a new one as
+		// fallback so the user always sees their updated basket.
+		return c.Send(text, markup)
+	}
+	return nil
+}
+
+func indexOfPick(picks []pickedSeat, row, col int) int {
+	for i, p := range picks {
+		if p.Row == row && p.Col == col {
+			return i
+		}
+	}
+	return -1
+}
+
+func sumOrderPrice(items []OrderItem) money.Money {
+	if len(items) == 0 {
+		return money.Money{}
+	}
+	out := money.Money{Code: items[0].Seat.Price.Code}
+	for _, it := range items {
+		out.Minor += it.Seat.Price.Minor
+	}
+	return out
+}
+
+func seatWord(n int) string {
+	switch {
+	case n == 1:
+		return "місце"
+	case n >= 2 && n <= 4:
+		return "місця"
+	default:
+		return "місць"
+	}
 }
 
 // friendly turns store-side errors into user-facing Ukrainian.

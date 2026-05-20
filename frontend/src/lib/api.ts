@@ -226,6 +226,34 @@ export interface ReservationStatusResponse {
 	status: ReservationStatus;
 }
 
+// --- multi-seat order endpoint (POST /api/public/orders) ---
+//
+// One order ties together N reservations under a single 8-char payment
+// code. The seat map polls /reservations/{code}/status with the order
+// code; status flips once monobank confirms the total transfer.
+
+export interface CreateOrderInput {
+	slug: string;
+	seat_ids: number[];
+	buyer_name: string;
+	buyer_email: string;
+}
+
+export interface OrderItem {
+	seat: PublicSeat;
+}
+
+export interface CreateOrderResponse {
+	code: string;
+	expires_at: string;
+	pay_url: string;
+	total_kopecks: number;
+	items: OrderItem[];
+	buyer_name: string;
+	buyer_email: string;
+	tg_deep_link?: string;
+}
+
 // publicApi mirrors api.* but does NOT auto-redirect to /admin/login on
 // 401 — the public buyer flow shouldn't even reach a 401, and bouncing
 // an anonymous visitor to an admin page would be confusing. Treats all

@@ -81,24 +81,29 @@ func (h *Handler) reservationStatus(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_code", "")
 		return
 	}
-	res, _, err := h.st.FindReservationByCode(r.Context(), code)
+	// Orders carry the bare 8-char base32 code that the buyer pastes into
+	// the monobank comment. For multi-seat orders each child reservation
+	// has a derived "<code>.<seq>" id, so the order row is the only place
+	// where the unified status lives. Single-seat orders also live here
+	// (Reserve delegates to CreateOrder([seat]) under the hood), so this
+	// branch covers both cases.
+	order, _, err := h.st.FindOrderByCode(r.Context(), code)
 	switch {
 	case errors.Is(err, store.ErrCodeNotFound):
 		writeError(w, http.StatusNotFound, "not_found", "")
 		return
 	case errors.Is(err, store.ErrAlreadyClosed):
-		// FindReservationByCode raises this for cancelled rows.
 		writeJSON(w, http.StatusOK, reservationStatusResponse{Status: "cancelled"})
 		return
 	case err != nil:
-		writeInternal(w, "reservation status", err)
+		writeInternal(w, "order status", err)
 		return
 	}
 	status := "held"
 	switch {
-	case res.ConfirmedAt != nil:
+	case order.ConfirmedAt != nil:
 		status = "paid"
-	case res.ExpiresAt.Before(time.Now()):
+	case order.ExpiresAt.Before(time.Now()):
 		status = "expired"
 	}
 	writeJSON(w, http.StatusOK, reservationStatusResponse{Status: status})

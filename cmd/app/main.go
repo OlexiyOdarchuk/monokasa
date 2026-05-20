@@ -583,6 +583,37 @@ func (b botStore) Reserve(
 	return toBotReservation(r), translateStoreErr(err)
 }
 
+// CreateOrder groups N seats under one payment code for the bot's
+// in-chat multi-seat picker. Bot buyers have no email column — the
+// PDF batch is delivered via Telegram only.
+func (b botStore) CreateOrder(
+	ctx context.Context, seats []bot.Seat, tgUserID, tgChatID int64,
+	buyerName, code string, hold time.Duration,
+) (bot.Order, []bot.OrderItem, error) {
+	storeSeats := make([]store.Seat, len(seats))
+	for i, s := range seats {
+		storeSeats[i] = fromBotSeat(s)
+	}
+	o, reservations, err := b.s.CreateOrder(ctx, storeSeats, tgUserID, tgChatID, buyerName, "", code, hold)
+	if err != nil {
+		return bot.Order{}, nil, translateStoreErr(err)
+	}
+	botOrder := bot.Order{
+		ID: o.ID, Code: o.Code,
+		BuyerName: o.BuyerName, BuyerEmail: o.BuyerEmail,
+		TGChatID:    o.TGChatID,
+		ConfirmedAt: o.ConfirmedAt,
+	}
+	items := make([]bot.OrderItem, len(reservations))
+	for i, r := range reservations {
+		items[i] = bot.OrderItem{
+			Reservation: toBotReservation(r),
+			Seat:        toBotSeat(storeSeats[i]),
+		}
+	}
+	return botOrder, items, nil
+}
+
 // Shows lists non-archived shows — same predicate the public landing
 // uses, so the bot афіша doesn't drift from monokasa.app/. Past-dated
 // events are deliberately shown (admin controls visibility through

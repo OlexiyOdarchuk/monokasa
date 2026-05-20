@@ -1,10 +1,11 @@
 <script lang="ts">
 	import { page } from '$app/state';
+	import { SvelteSet } from 'svelte/reactivity';
 	import {
 		publicApi,
 		type PublicShow,
 		type PublicSeat,
-		type ReservationResponse,
+		type CreateOrderResponse,
 		type ReservationStatus,
 		type ReservationStatusResponse,
 		ApiError
@@ -16,15 +17,22 @@
 	let loaded = $state(false);
 	let error = $state('');
 
-	let selectedId = $state<number | null>(null);
-	const selected = $derived(show?.seats.find((s) => s.id === selectedId) ?? null);
+	// Multi-seat: SvelteSet so `add`/`delete` calls reactively re-trigger
+	// the $derived selections. Plain `$state(new Set())` doesn't reliably
+	// notify on mutation in Svelte 5.
+	let selectedIds = $state(new SvelteSet<number>());
+	const selectedSeats = $derived.by(() => {
+		if (!show) return [] as PublicSeat[];
+		const ids = selectedIds;
+		// Preserve canvas order (row/col-ish via x/y already), not click order.
+		return show.seats.filter((s) => ids.has(s.id));
+	});
+	const totalKopecks = $derived(selectedSeats.reduce((acc, s) => acc + s.price_kopecks, 0));
 
-	// Reservation state. Once `success` is set the form swaps for the
-	// "pay through monobank" screen with the share-friendly code.
 	let buyerName = $state('');
 	let buyerEmail = $state('');
 	let submitting = $state(false);
-	let success = $state<ReservationResponse | null>(null);
+	let success = $state<CreateOrderResponse | null>(null);
 
 	// Polled by the success screen. Starts at 'held', flips to 'paid'
 	// when the webhook lands the confirmation, swaps the UI for the
@@ -34,6 +42,7 @@
 
 	const SEAT_R = 22;
 	const PAD = 60;
+	const SEATS_MAX = 20; // matches server-side soft cap on /api/public/orders
 
 	const knownColors: Record<string, string> = {
 		'': '#3b82f6',
@@ -83,30 +92,47 @@
 		load();
 	});
 
-	function pickSeat(s: PublicSeat) {
+	function toggleSeat(s: PublicSeat) {
 		if (!s.sellable || s.taken) return;
-		selectedId = s.id;
+		if (selectedIds.has(s.id)) {
+			selectedIds.delete(s.id);
+			return;
+		}
+		if (selectedIds.size >= SEATS_MAX) {
+			error = `Максимум ${SEATS_MAX} місць за одну покупку.`;
+			return;
+		}
+		error = '';
+		selectedIds.add(s.id);
+	}
+
+	function clearSelection() {
+		selectedIds.clear();
+		error = '';
 	}
 
 	async function submit(e: Event) {
 		e.preventDefault();
-		if (!show || !selected) return;
+		if (!show || selectedSeats.length === 0) return;
 		submitting = true;
 		error = '';
 		try {
-			success = await publicApi.post<ReservationResponse>('/api/public/reservations', {
+			success = await publicApi.post<CreateOrderResponse>('/api/public/orders', {
 				slug: show.slug,
-				seat_id: selected.id,
+				seat_ids: selectedSeats.map((s) => s.id),
 				buyer_name: buyerName.trim(),
 				buyer_email: buyerEmail.trim()
 			});
 			payStatus = 'held';
 		} catch (e) {
-			if (e instanceof ApiError && e.code === 'seat_taken') {
-				error = 'На жаль, це місце щойно зайняли. Обери інше.';
-				// Refresh seat status so the canvas stops offering it.
+			if (
+				e instanceof ApiError &&
+				(e.code === 'seat_taken' || e.code === 'seat_not_sellable')
+			) {
+				error = 'Одне з обраних місць щойно зайняли. Онови мапу й обери інше.';
+				// Re-pull seat statuses, wipe selection — user must reconfirm.
 				load();
-				selectedId = null;
+				clearSelection();
 			} else if (e instanceof ApiError) {
 				error = e.detail || e.code;
 			} else {
@@ -117,7 +143,7 @@
 		}
 	}
 
-	// Polling: once we have a reservation `code`, ping the status endpoint
+	// Polling: once we have an order `code`, ping the status endpoint
 	// every 5s until terminal state. Stop after 30 min as a safety net
 	// against forgotten tabs — by then the HOLD has expired anyway.
 	$effect(() => {
@@ -163,6 +189,10 @@
 	function formatUAH(k: number): string {
 		return (k / 100).toLocaleString('uk-UA', { minimumFractionDigits: 2 }) + ' ₴';
 	}
+
+	function seatLabel(s: PublicSeat): string {
+		return `ряд ${s.row} · місце ${s.col}`;
+	}
 </script>
 
 <svelte:head>
@@ -178,7 +208,7 @@
 		<p class="mt-2 text-neutral-400">{error}</p>
 	</div>
 {:else if success && show && payStatus === 'paid'}
-	<!-- Confirmed: webhook landed, ticket sent to email/telegram -->
+	<!-- Confirmed: webhook landed, tickets sent to email/telegram -->
 	<main class="mx-auto max-w-md p-6">
 		<div class="rounded-2xl border border-emerald-700 bg-emerald-950/60 p-6 text-center">
 			<div class="text-5xl">🎉</div>
@@ -186,12 +216,15 @@
 			<p class="mt-2 text-sm text-emerald-200">
 				{show.title} · {startsAtText(show.starts_at)}
 			</p>
-			<p class="mt-1 text-sm text-emerald-300/80">
-				ряд {success.seat.row} · місце {success.seat.col}
-			</p>
+			<ul class="mt-3 space-y-1 text-sm text-emerald-300/80">
+				{#each success.items as it (it.seat.id)}
+					<li>· {seatLabel(it.seat)}</li>
+				{/each}
+			</ul>
 			<div class="mt-5 rounded-lg border border-emerald-900 bg-emerald-950 p-4 text-left">
 				<p class="text-sm text-emerald-200">
-					📧 Квиток із QR-кодом надіслано на <b>{success.buyer_email}</b>.
+					📧 {success.items.length > 1 ? `${success.items.length} квитки` : 'Квиток'} із QR-кодом
+					надіслано на <b>{success.buyer_email}</b>.
 				</p>
 				<p class="mt-2 text-xs text-emerald-300/70">
 					На вході відкривай PDF з телефону — охорона сканує QR.
@@ -221,6 +254,7 @@
 				onclick={() => {
 					success = null;
 					payStatus = 'held';
+					clearSelection();
 					load();
 				}}
 				class="mt-5 rounded-md bg-[var(--color-brand)] px-4 py-2 text-sm font-medium text-black hover:bg-[var(--color-brand-hover)]"
@@ -230,19 +264,34 @@
 		</div>
 	</main>
 {:else if success && show}
-	<!-- Held: post-reservation, awaiting payment. Polling runs in background. -->
+	<!-- Held: post-order, awaiting payment. Polling runs in background. -->
 	<main class="mx-auto max-w-md p-6">
 		<div class="rounded-2xl border border-emerald-900 bg-emerald-950/40 p-6 text-center">
 			<div class="text-3xl">🎟</div>
-			<h1 class="mt-2 text-xl font-semibold">Місце за тобою на 15 хвилин</h1>
+			<h1 class="mt-2 text-xl font-semibold">
+				{success.items.length > 1
+					? `${success.items.length} місця за тобою на 15 хвилин`
+					: 'Місце за тобою на 15 хвилин'}
+			</h1>
 			<p class="mt-2 text-sm text-neutral-300">
 				{show.title} · {startsAtText(show.starts_at)}
 			</p>
-			<p class="mt-1 text-sm text-neutral-400">
-				ряд {success.seat.row} · місце {success.seat.col} · {formatUAH(success.seat.price_kopecks)}
-			</p>
 
-			<div class="mt-5 rounded-lg border border-neutral-800 bg-neutral-950 p-3 text-left">
+			<ul class="mt-3 space-y-1 text-left text-sm text-neutral-400">
+				{#each success.items as it (it.seat.id)}
+					<li class="flex justify-between rounded border border-neutral-800 bg-neutral-950 px-3 py-1.5">
+						<span>{seatLabel(it.seat)}{it.seat.category ? ` · ${it.seat.category}` : ''}</span>
+						<span class="text-neutral-500">{formatUAH(it.seat.price_kopecks)}</span>
+					</li>
+				{/each}
+			</ul>
+
+			<div class="mt-4 flex items-center justify-between rounded-lg border border-neutral-800 bg-neutral-950 px-3 py-2 text-left">
+				<span class="text-sm text-neutral-400">Сума</span>
+				<span class="text-base font-semibold">{formatUAH(success.total_kopecks)}</span>
+			</div>
+
+			<div class="mt-3 rounded-lg border border-neutral-800 bg-neutral-950 p-3 text-left">
 				<div class="text-xs text-neutral-500">Код броні (вже у коментарі платежу):</div>
 				<div class="mt-1 font-mono text-lg tracking-wider">{success.code}</div>
 			</div>
@@ -263,7 +312,7 @@
 					rel="noopener"
 					class="mt-3 block w-full rounded-lg border border-sky-700 bg-sky-950/40 px-4 py-3 text-sm text-sky-200 hover:bg-sky-950/70"
 				>
-					💬 Підключити Telegram (квиток ще й сюди)
+					💬 Підключити Telegram (квитки ще й сюди)
 				</a>
 				<p class="mt-2 text-xs text-neutral-500">
 					Опційно. Якщо підключиш — після оплати PDF прийде і на email, і в Telegram.
@@ -277,7 +326,7 @@
 		</div>
 	</main>
 {:else if show}
-	<main class="mx-auto max-w-3xl p-4 sm:p-6">
+	<main class="mx-auto max-w-3xl p-4 sm:p-6 pb-32">
 		{#if show.poster_url}
 			<div class="mb-4 overflow-hidden rounded-xl border border-neutral-800 bg-neutral-950">
 				<img
@@ -313,20 +362,21 @@
 				</text>
 
 				{#each show.seats as seat (seat.id)}
-					{@const isSel = selectedId === seat.id}
+					{@const isSel = selectedIds.has(seat.id)}
 					{@const blocked = !seat.sellable || seat.taken}
 					{@const fill = blocked ? '#3a3a3a' : categoryColor(seat.category)}
 					<g
 						transform="translate({seat.x} {seat.y + 40})"
 						role="button"
 						tabindex={blocked ? -1 : 0}
-						aria-label="Місце ряд {seat.row} місце {seat.col}{blocked ? ' (зайняте)' : ''}"
+						aria-label="Місце ряд {seat.row} місце {seat.col}{blocked ? ' (зайняте)' : isSel ? ' (обрано)' : ''}"
+						aria-pressed={isSel}
 						class={blocked ? 'cursor-not-allowed' : 'cursor-pointer'}
-						onclick={() => pickSeat(seat)}
+						onclick={() => toggleSeat(seat)}
 						onkeydown={(e: KeyboardEvent) => {
 							if (e.key === 'Enter' || e.key === ' ') {
 								e.preventDefault();
-								pickSeat(seat);
+								toggleSeat(seat);
 							}
 						}}
 					>
@@ -367,22 +417,41 @@
 		</div>
 
 		<!-- selection / form panel -->
-		{#if selected}
+		{#if selectedSeats.length > 0}
 			<form
 				onsubmit={submit}
 				class="mt-5 rounded-2xl border border-neutral-800 bg-neutral-900 p-5"
 			>
-				<div class="flex items-center justify-between gap-3">
-					<div>
-						<div class="text-sm text-neutral-400">Обрано місце</div>
-						<div class="text-lg font-medium">
-							ряд {selected.row} · місце {selected.col}
-							{#if selected.category}<span class="ml-2 text-sm text-neutral-500">({selected.category})</span>{/if}
+				<div class="flex items-start justify-between gap-3">
+					<div class="min-w-0 flex-1">
+						<div class="text-sm text-neutral-400">
+							Обрано {selectedSeats.length}
+							{selectedSeats.length === 1 ? 'місце' : selectedSeats.length < 5 ? 'місця' : 'місць'}
 						</div>
+						<ul class="mt-2 space-y-1 text-sm">
+							{#each selectedSeats as s (s.id)}
+								<li class="flex items-center justify-between gap-2">
+									<span class="truncate">
+										{seatLabel(s)}{s.category ? ` · ${s.category}` : ''}
+									</span>
+									<span class="flex items-center gap-2 text-neutral-500">
+										<span>{formatUAH(s.price_kopecks)}</span>
+										<button
+											type="button"
+											aria-label="Прибрати місце ряд {s.row} місце {s.col}"
+											onclick={() => selectedIds.delete(s.id)}
+											class="rounded px-1.5 text-neutral-500 hover:bg-neutral-800 hover:text-neutral-200"
+										>
+											✕
+										</button>
+									</span>
+								</li>
+							{/each}
+						</ul>
 					</div>
-					<div class="text-right">
+					<div class="shrink-0 text-right">
 						<div class="text-xs text-neutral-500">До оплати</div>
-						<div class="text-lg font-semibold">{formatUAH(selected.price_kopecks)}</div>
+						<div class="text-lg font-semibold">{formatUAH(totalKopecks)}</div>
 					</div>
 				</div>
 
@@ -425,24 +494,31 @@
 				<div class="mt-5 flex gap-2">
 					<button
 						type="button"
-						onclick={() => (selectedId = null)}
+						onclick={clearSelection}
 						class="rounded-md border border-neutral-700 px-4 py-2 text-sm text-neutral-300 hover:bg-neutral-800"
 					>
-						Скасувати
+						Очистити
 					</button>
 					<button
 						type="submit"
 						disabled={submitting}
 						class="flex-1 rounded-md bg-[var(--color-brand)] px-4 py-2 text-base font-medium text-black hover:bg-[var(--color-brand-hover)] disabled:opacity-50"
 					>
-						{submitting ? 'Бронюю…' : 'Забронювати і платити'}
+						{submitting
+							? 'Бронюю…'
+							: `Забронювати ${selectedSeats.length === 1 ? 'і платити' : `${selectedSeats.length} і платити`}`}
 					</button>
 				</div>
 			</form>
 		{:else}
 			<p class="mt-5 text-center text-sm text-neutral-500">
-				Тицьни вільне місце на мапі вище 👆
+				Тицьни вільні місця на мапі вище 👆 (можна декілька)
 			</p>
+			{#if error}
+				<div class="mt-3 rounded-md border border-red-900 bg-red-950/50 p-3 text-sm text-red-300">
+					{error}
+				</div>
+			{/if}
 		{/if}
 	</main>
 {/if}
