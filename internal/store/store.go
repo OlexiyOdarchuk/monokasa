@@ -1437,21 +1437,60 @@ func (s *Store) ConfirmedNotYetReminded(ctx context.Context, showID int64) ([]My
 }
 
 // SweepExpiredHolds cancels every reservation whose HOLD has lapsed and
-// which was never paid for. Returns the number of rows touched. Safe to
-// run on any schedule — it's idempotent and only touches stale rows.
-func (s *Store) SweepExpiredHolds(ctx context.Context) (int64, error) {
+// which was never paid for. Returns the freed seats so callers can
+// broadcast SSE seat-status events. Safe to run on any schedule — it's
+// idempotent and only touches stale rows.
+//
+// SELECT and UPDATE run in one transaction so we never report a seat
+// as freed before its row is actually cancelled.
+func (s *Store) SweepExpiredHolds(ctx context.Context) ([]Seat, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
 	now := time.Now().Unix()
-	res, err := s.db.ExecContext(ctx, `
+	rows, err := tx.QueryContext(ctx, `
+		SELECT s.id, s.show_id, s.row, s.col, s.x, s.y,
+		       s.label, s.category, s.price_kopecks, s.sellable
+		FROM reservations r JOIN seats s ON s.id = r.seat_id
+		WHERE r.cancelled_at IS NULL
+		  AND r.confirmed_at IS NULL
+		  AND r.expires_at < ?`, now)
+	if err != nil {
+		return nil, err
+	}
+	var freed []Seat
+	for rows.Next() {
+		var seat Seat
+		var sellable int
+		if err := rows.Scan(&seat.ID, &seat.ShowID, &seat.Row, &seat.Col,
+			&seat.X, &seat.Y, &seat.Label, &seat.Category,
+			&seat.PriceKopecks, &sellable); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		seat.Sellable = sellable != 0
+		freed = append(freed, seat)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	if _, err := tx.ExecContext(ctx, `
 		UPDATE reservations
 		SET cancelled_at = ?
 		WHERE cancelled_at IS NULL
 		  AND confirmed_at IS NULL
-		  AND expires_at < ?`, now, now)
-	if err != nil {
-		return 0, err
+		  AND expires_at < ?`, now, now); err != nil {
+		return nil, err
 	}
-	n, _ := res.RowsAffected()
-	return n, nil
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return freed, nil
 }
 
 func (s *Store) MarkReminded(ctx context.Context, reservationID int64) error {

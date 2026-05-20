@@ -28,6 +28,8 @@ import (
 
 	"github.com/OlexiyOdarchuk/go-monobank-sdk/money"
 	tele "gopkg.in/telebot.v3"
+
+	"github.com/OlexiyOdarchuk/monokasa/internal/realtime"
 )
 
 // Show is the subset of show info the bot needs. Slug is used to build
@@ -192,8 +194,9 @@ type Bot struct {
 	jarLink    string
 	hold       time.Duration
 	adminTGID  int64
-	reconciler Reconciler // optional — nil if MONO_TOKEN missing
-	jar        JarLookup  // optional — nil if jar link unparseable
+	reconciler Reconciler   // optional — nil if MONO_TOKEN missing
+	jar        JarLookup    // optional — nil if jar link unparseable
+	hub        *realtime.Hub // optional — nil-safe Publish, skipped for tests
 	showFn     ShowFn
 
 	// pending tracks chat users mid-pick (accumulating seats in the
@@ -237,8 +240,9 @@ type Options struct {
 	JarLink    string
 	Hold       time.Duration // how long a pre-paid hold lives
 	AdminTGID  int64
-	Reconciler Reconciler // optional
-	Jar        JarLookup  // optional
+	Reconciler Reconciler    // optional
+	Jar        JarLookup     // optional
+	Hub        *realtime.Hub // optional; broadcasts seat changes to SSE subscribers
 }
 
 func New(opts Options) (*Bot, error) {
@@ -253,7 +257,7 @@ func New(opts Options) (*Bot, error) {
 		tb: tb, store: opts.Store, coder: opts.Coder, showFn: opts.ShowFn,
 		baseURL: strings.TrimRight(opts.BaseURL, "/"),
 		jarLink: opts.JarLink, hold: opts.Hold, adminTGID: opts.AdminTGID,
-		reconciler: opts.Reconciler, jar: opts.Jar,
+		reconciler: opts.Reconciler, jar: opts.Jar, hub: opts.Hub,
 		done: make(chan struct{}),
 	}
 	b.routes()
@@ -799,6 +803,14 @@ func (b *Bot) handleText(c tele.Context) error {
 	}
 	b.pending.Delete(sender.ID)
 
+	// Broadcast each newly-held seat to live SSE subscribers so any
+	// open web map flips this seat to "taken" without a refresh.
+	for _, it := range items {
+		b.hub.Publish(it.Seat.ShowID, realtime.Event{
+			Type: "seat_status", SeatID: it.Seat.ID, Status: realtime.SeatHeld,
+		})
+	}
+
 	total := sumOrderPrice(items)
 	payURL := jarPrefillURL(b.jarLink, total, order.Code)
 
@@ -961,6 +973,11 @@ func (b *Bot) callbackCancel(c tele.Context, cb *tele.Callback) error {
 		}
 	}
 	_ = c.Respond(&tele.CallbackResponse{Text: "Скасовано"})
+	// Single-seat path — cancel button only renders on N=1 orders.
+	// Broadcast the freed seat to live SSE subscribers.
+	b.hub.Publish(seat.ShowID, realtime.Event{
+		Type: "seat_status", SeatID: seat.ID, Status: realtime.SeatFree,
+	})
 	_, err = b.tb.Send(cb.Sender,
 		fmt.Sprintf("Бронь ряд %d місце %d скасовано. Місце знов вільне.", seat.Row, seat.Col))
 	return err

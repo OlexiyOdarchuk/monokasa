@@ -4,6 +4,8 @@
 *.db-wal
 *.db-shm
 monokasa
+# Stray default-name Go binaries from `go build` without `-o`.
+/main
 
 # direnv / Nix
 .direnv/

@@ -97,6 +97,20 @@
 		load();
 	});
 
+	// Browsers throttle background tabs aggressively — an EventSource
+	// can miss frames while the page sleeps. When the tab regains
+	// focus, do a one-shot refetch so the map matches reality. Skipped
+	// once we're on the success/expired/paid screens (their state has
+	// its own poller and a stale map there doesn't matter).
+	$effect(() => {
+		if (success) return;
+		function refresh() {
+			if (document.visibilityState === 'visible') load();
+		}
+		document.addEventListener('visibilitychange', refresh);
+		return () => document.removeEventListener('visibilitychange', refresh);
+	});
+
 	// Live seat updates over Server-Sent Events. The server publishes a
 	// "seat_status" frame whenever someone reserves/cancels/pays for a
 	// seat in this show, so the picker reflects reality without polling.

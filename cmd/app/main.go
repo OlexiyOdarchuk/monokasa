@@ -88,6 +88,12 @@ func main() {
 
 	coder := token.NewCoder(cfg.Secret)
 
+	// Realtime hub is a single instance shared by every producer
+	// (public reserve, pay confirm, admin cancel, bot reserve/cancel,
+	// sweep) and every SSE subscriber. In-process — single process,
+	// no fan-out across replicas needed.
+	hub := realtime.New()
+
 	// Bot and pay both pull the active show on demand via ShowFn so admin
 	// edits propagate without a restart, and a new show created after a
 	// run-down period becomes the one bot/pay use automatically.
@@ -115,6 +121,7 @@ func main() {
 		JarLink:   cfg.JarLink,
 		Hold:      cfg.HoldDuration,
 		AdminTGID: cfg.AdminTGID,
+		Hub:       hub,
 	})
 	if err != nil {
 		fatal("bot init", "err", err)
@@ -144,12 +151,6 @@ func main() {
 	} else {
 		slog.Info("smtp not configured; email delivery disabled (web buyers won't receive PDFs)")
 	}
-
-	// Realtime hub is a single instance shared by every producer
-	// (public reserve, pay confirm, admin cancel) and every SSE
-	// subscriber. In-process — there's only one process, no fan-out
-	// across replicas needed.
-	hub := realtime.New()
 
 	monoClient := bank.New()
 	processor := &pay.Processor{
@@ -322,7 +323,7 @@ func main() {
 
 	// Eagerly free seats whose HOLD has lapsed without payment, so /seats
 	// reflects reality even when no user has triggered a status read.
-	go runHoldSweeper(ctx, st, 5*time.Minute)
+	go runHoldSweeper(ctx, st, hub, 5*time.Minute)
 
 	// GC idle rate-limit buckets so the map doesn't grow over the show's lifetime.
 	go scanner.RunGC(ctx, 10*time.Minute, 30*time.Minute)
@@ -396,19 +397,27 @@ func liveActiveStat(st *store.Store, pick func(store.Stats) int) int {
 
 // runHoldSweeper periodically cancels expired-but-unpaid reservations so
 // their seats become free without waiting for someone to call /seats.
-func runHoldSweeper(ctx context.Context, st *store.Store, every time.Duration) {
+// Each freed seat is broadcast through the realtime hub so any live
+// SSE subscriber sees the map flip back to "free" without a refresh.
+func runHoldSweeper(ctx context.Context, st *store.Store, hub *realtime.Hub, every time.Duration) {
 	tick := time.NewTicker(every)
 	defer tick.Stop()
 	sweep := func() {
 		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
-		n, err := st.SweepExpiredHolds(ctx)
+		freed, err := st.SweepExpiredHolds(ctx)
 		if err != nil {
 			slog.Error("sweep holds", "err", err)
 			return
 		}
-		if n > 0 {
-			slog.Info("sweep holds: freed expired reservations", "count", n)
+		if len(freed) == 0 {
+			return
+		}
+		slog.Info("sweep holds: freed expired reservations", "count", len(freed))
+		for _, seat := range freed {
+			hub.Publish(seat.ShowID, realtime.Event{
+				Type: "seat_status", SeatID: seat.ID, Status: realtime.SeatFree,
+			})
 		}
 	}
 	sweep() // fire once at startup to catch carry-over from before restart

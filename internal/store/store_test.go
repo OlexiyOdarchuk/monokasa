@@ -249,16 +249,16 @@ func TestSweepExpiredHolds(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	n, err := s.SweepExpiredHolds(ctx)
+	freed, err := s.SweepExpiredHolds(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n != 1 {
-		t.Fatalf("swept %d rows, want 1", n)
+	if len(freed) != 1 {
+		t.Fatalf("swept %d rows, want 1", len(freed))
 	}
 	// Re-running is a no-op.
-	if n, _ := s.SweepExpiredHolds(ctx); n != 0 {
-		t.Fatalf("re-run swept %d rows, want 0", n)
+	if freed, _ := s.SweepExpiredHolds(ctx); len(freed) != 0 {
+		t.Fatalf("re-run swept %d rows, want 0", len(freed))
 	}
 	// Seat1 is now free again.
 	if _, err := s.FindFreeSeat(ctx, showID, 1, 1); err != nil {
