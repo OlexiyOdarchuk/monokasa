@@ -103,8 +103,13 @@
 								</p>
 							{/if}
 							{#if !soldOut}
-								<p class="mt-3 text-xs text-neutral-500">
-									{show.seats_free} / {show.seats_total} місць вільно
+								{@const lowStock = show.seats_free <= 5}
+								<p class="mt-3 text-xs {lowStock ? 'font-medium text-amber-400' : 'text-neutral-500'}">
+									{#if lowStock}
+										🔥 Залишилось {show.seats_free} з {show.seats_total}
+									{:else}
+										{show.seats_free} / {show.seats_total} місць вільно
+									{/if}
 								</p>
 							{/if}
 						</div>
