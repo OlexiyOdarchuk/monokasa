@@ -158,3 +158,81 @@ export interface UpdateShowInput {
 	venue?: string;
 	starts_at?: string;
 }
+
+// ---- public-side (anonymous buyer) shapes ----
+
+export interface PublicSeat {
+	id: number;
+	row: number;
+	col: number;
+	x: number;
+	y: number;
+	label: string;
+	category: string;
+	price_kopecks: number;
+	sellable: boolean;
+	taken: boolean;
+}
+
+export interface PublicShow {
+	slug: string;
+	title: string;
+	venue: string;
+	starts_at: string;
+	seats: PublicSeat[];
+}
+
+export interface CreateReservationInput {
+	slug: string;
+	seat_id: number;
+	buyer_name: string;
+	buyer_email: string;
+}
+
+export interface ReservationResponse {
+	code: string;
+	expires_at: string;
+	pay_url: string;
+	seat: PublicSeat;
+	buyer_name: string;
+	buyer_email: string;
+}
+
+// publicApi mirrors api.* but does NOT auto-redirect to /admin/login on
+// 401 — the public buyer flow shouldn't even reach a 401, and bouncing
+// an anonymous visitor to an admin page would be confusing. Treats all
+// 4xx/5xx as plain ApiError instances.
+export const publicApi = {
+	async get<T>(path: string): Promise<T> {
+		const r = await fetch(path, {
+			credentials: 'omit',
+			headers: { Accept: 'application/json' }
+		});
+		return handlePublicResponse<T>(r);
+	},
+	async post<T>(path: string, body: unknown): Promise<T> {
+		const r = await fetch(path, {
+			method: 'POST',
+			credentials: 'omit',
+			headers: {
+				Accept: 'application/json',
+				'Content-Type': 'application/json'
+			},
+			body: JSON.stringify(body)
+		});
+		return handlePublicResponse<T>(r);
+	}
+};
+
+async function handlePublicResponse<T>(r: Response): Promise<T> {
+	if (r.status === 204) return undefined as T;
+	const isJson = (r.headers.get('content-type') ?? '').includes('application/json');
+	if (!r.ok) {
+		if (isJson) {
+			const err = (await r.json()) as { error?: string; detail?: string };
+			throw new ApiError(r.status, err.error ?? 'unknown', err.detail ?? '');
+		}
+		throw new ApiError(r.status, 'http_' + r.status, await r.text());
+	}
+	return (await r.json()) as T;
+}
