@@ -154,6 +154,18 @@ var migrations = []string{
 	// the PDF" — the renderer falls back accordingly. Only the multi-seat
 	// web flow lets buyers fill these; bot and single-seat leave it empty.
 	`ALTER TABLE reservations ADD COLUMN attendee_name TEXT NOT NULL DEFAULT ''`,
+	// Audit log: every admin mutation gets a row here. actor_email is
+	// denormalised so the trail survives user deletions.
+	`CREATE TABLE IF NOT EXISTS audit_log (
+		id              INTEGER PRIMARY KEY,
+		actor_user_id   INTEGER NOT NULL,
+		actor_email     TEXT NOT NULL DEFAULT '',
+		action          TEXT NOT NULL,
+		target          TEXT NOT NULL DEFAULT '',
+		details         TEXT NOT NULL DEFAULT '',
+		created_at      INTEGER NOT NULL
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at DESC)`,
 }
 
 // Errors.
@@ -1627,6 +1639,50 @@ func (s *Store) SweepExpiredSessions(ctx context.Context) (int64, error) {
 	}
 	n, _ := res.RowsAffected()
 	return n, nil
+}
+
+// --- audit log ---
+
+// LogAudit records one admin action. Sync — INSERT cost is negligible
+// (one row, indexed). Returning the error so callers can decide whether
+// to surface it; production callers usually only slog.Warn and continue,
+// because losing an audit line is less bad than failing the action.
+func (s *Store) LogAudit(ctx context.Context, e AuditEntry) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO audit_log(actor_user_id, actor_email, action, target, details, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		e.ActorUserID, e.ActorEmail, e.Action, e.Target, e.Details,
+		time.Now().Unix())
+	return err
+}
+
+// ListAuditEntries returns the most recent audit rows, newest first.
+// `limit` caps the response; pass 0 for the default of 200.
+func (s *Store) ListAuditEntries(ctx context.Context, limit int) ([]AuditEntry, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, actor_user_id, actor_email, action, target, details, created_at
+		FROM audit_log
+		ORDER BY created_at DESC, id DESC
+		LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AuditEntry
+	for rows.Next() {
+		var e AuditEntry
+		var createdAt int64
+		if err := rows.Scan(&e.ID, &e.ActorUserID, &e.ActorEmail,
+			&e.Action, &e.Target, &e.Details, &createdAt); err != nil {
+			return nil, err
+		}
+		e.CreatedAt = time.Unix(createdAt, 0)
+		out = append(out, e)
+	}
+	return out, rows.Err()
 }
 
 // isUniqueErr peeks at the SQLite error string to detect UNIQUE-constraint

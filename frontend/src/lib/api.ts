@@ -146,6 +146,16 @@ export interface Guest {
 	seat: SeatBrief;
 }
 
+export interface AuditEntry {
+	id: number;
+	actor_user_id: number;
+	actor_email: string;
+	action: string;
+	target: string;
+	details?: unknown;
+	created_at: string;
+}
+
 export interface CreateShowInput {
 	title: string;
 	venue: string;

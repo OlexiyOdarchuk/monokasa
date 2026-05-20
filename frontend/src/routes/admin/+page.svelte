@@ -34,14 +34,22 @@
 	<title>monokasa · події</title>
 </svelte:head>
 
-<div class="flex items-center justify-between">
+<div class="flex items-center justify-between gap-3">
 	<h1 class="text-2xl font-semibold tracking-tight">Події</h1>
-	<a
-		href="/admin/shows/new"
-		class="rounded-md bg-[var(--color-brand)] px-4 py-2 text-sm font-medium text-black hover:bg-[var(--color-brand-hover)]"
-	>
-		+ Створити подію
-	</a>
+	<div class="flex items-center gap-2">
+		<a
+			href="/admin/audit"
+			class="rounded-md border border-neutral-700 px-3 py-2 text-sm text-neutral-300 hover:bg-neutral-800"
+		>
+			📜 Журнал
+		</a>
+		<a
+			href="/admin/shows/new"
+			class="rounded-md bg-[var(--color-brand)] px-4 py-2 text-sm font-medium text-black hover:bg-[var(--color-brand-hover)]"
+		>
+			+ Створити подію
+		</a>
+	</div>
 </div>
 
 {#if error}

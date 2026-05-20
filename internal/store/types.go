@@ -151,6 +151,21 @@ type User struct {
 	CreatedAt    time.Time
 }
 
+// AuditEntry is one admin action recorded in the audit_log table.
+// ActorEmail is denormalised at write time so a future user deletion
+// doesn't blank the trail. Details is a free-form JSON blob — callers
+// keep the schema light, the column carries whatever context the
+// action needed.
+type AuditEntry struct {
+	ID           int64
+	ActorUserID  int64
+	ActorEmail   string
+	Action       string // e.g. "show.create", "reservation.cancel"
+	Target       string // e.g. "show:42", "reservation:123"
+	Details      string // JSON, may be ""
+	CreatedAt    time.Time
+}
+
 // Session is a long-lived auth credential keyed by an opaque random Token.
 // Issued on successful login, looked up on every authed request, deleted
 // on logout. The token lives in an HttpOnly cookie on the client; the

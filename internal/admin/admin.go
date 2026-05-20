@@ -74,6 +74,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/admin/shows/{id}/guests", h.listGuests)
 	mux.HandleFunc("GET /api/admin/shows/{id}/guests.csv", h.exportGuestsCSV)
 	mux.HandleFunc("POST /api/admin/reservations/{id}/cancel", h.cancelReservation)
+
+	mux.HandleFunc("GET /api/admin/audit", h.listAudit)
 }
 
 // --- /me ---
@@ -92,6 +94,31 @@ func (h *Handler) me(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, meResponse{ID: u.ID, Email: u.Email, Name: u.Name})
+}
+
+// audit writes a row to audit_log without bothering the caller about
+// the outcome. Audit failures get logged and swallowed — losing a
+// trail line is less bad than failing the user-facing action.
+func (h *Handler) audit(r *http.Request, action, target string, details map[string]any) {
+	u, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		return
+	}
+	var raw string
+	if len(details) > 0 {
+		if b, err := json.Marshal(details); err == nil {
+			raw = string(b)
+		}
+	}
+	if err := h.st.LogAudit(r.Context(), store.AuditEntry{
+		ActorUserID: u.ID,
+		ActorEmail:  u.Email,
+		Action:      action,
+		Target:      target,
+		Details:     raw,
+	}); err != nil {
+		slog.Warn("audit log write failed", "action", action, "target", target, "err", err)
+	}
 }
 
 // --- shows ---
@@ -170,6 +197,10 @@ func (h *Handler) createShow(w http.ResponseWriter, r *http.Request) {
 		writeInternal(w, "load created show", err)
 		return
 	}
+	h.audit(r, "show.create", fmt.Sprintf("show:%d", id), map[string]any{
+		"title": sh.Title, "venue": sh.Venue, "starts_at": sh.StartsAt,
+		"rows": req.Rows, "cols": req.Cols, "price_kopecks": req.PriceKopecks,
+	})
 	writeJSON(w, http.StatusCreated, toShowResponse(sh, nil))
 }
 
@@ -246,6 +277,25 @@ func (h *Handler) updateShow(w http.ResponseWriter, r *http.Request) {
 		writeInternal(w, "update show", err)
 		return
 	}
+	// Track which fields actually changed so the audit row is useful
+	// without a separate "before/after" diff in the UI.
+	changed := map[string]any{}
+	if req.Title != nil {
+		changed["title"] = merged.Title
+	}
+	if req.Venue != nil {
+		changed["venue"] = merged.Venue
+	}
+	if req.StartsAt != nil {
+		changed["starts_at"] = merged.StartsAt
+	}
+	if req.Description != nil {
+		changed["description"] = merged.Description
+	}
+	if req.PosterURL != nil {
+		changed["poster_url"] = merged.PosterURL
+	}
+	h.audit(r, "show.update", fmt.Sprintf("show:%d", id), changed)
 	writeJSON(w, http.StatusOK, toShowResponse(merged, nil))
 }
 
@@ -264,6 +314,7 @@ func (h *Handler) archiveShow(w http.ResponseWriter, r *http.Request) {
 		writeInternal(w, "archive show", err)
 		return
 	}
+	h.audit(r, "show.archive", fmt.Sprintf("show:%d", id), nil)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -346,6 +397,10 @@ func (h *Handler) addSeat(w http.ResponseWriter, r *http.Request) {
 		writeInternal(w, "add seat", err)
 		return
 	}
+	h.audit(r, "seat.add", fmt.Sprintf("seat:%d", seat.ID), map[string]any{
+		"show_id": showID, "row": seat.Row, "col": seat.Col,
+		"price_kopecks": seat.PriceKopecks,
+	})
 	writeJSON(w, http.StatusCreated, toSeatResponse(seat))
 }
 
@@ -386,6 +441,13 @@ func (h *Handler) batchUpdateSeats(w http.ResponseWriter, r *http.Request) {
 		writeInternal(w, "batch update seats", err)
 		return
 	}
+	ids := make([]int64, len(patches))
+	for i, p := range patches {
+		ids[i] = p.ID
+	}
+	h.audit(r, "seat.batch_update", "seats", map[string]any{
+		"count": len(patches), "ids": ids,
+	})
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -407,6 +469,7 @@ func (h *Handler) removeSeat(w http.ResponseWriter, r *http.Request) {
 		writeInternal(w, "remove seat", err)
 		return
 	}
+	h.audit(r, "seat.remove", fmt.Sprintf("seat:%d", id), nil)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -555,7 +618,51 @@ func (h *Handler) cancelReservation(w http.ResponseWriter, r *http.Request) {
 			Type: "seat_status", SeatID: s.ID, Status: realtime.SeatFree,
 		})
 	}
+	h.audit(r, "reservation.cancel", fmt.Sprintf("reservation:%d", id), map[string]any{
+		"buyer_name": res.BuyerName, "buyer_email": res.BuyerEmail,
+		"freed_seats": len(freed),
+	})
 	writeJSON(w, http.StatusOK, toGuestResponse(store.MyItem{Reservation: res, Seat: seat}, time.Now()))
+}
+
+// --- audit ---
+
+type auditResponse struct {
+	ID          int64           `json:"id"`
+	ActorUserID int64           `json:"actor_user_id"`
+	ActorEmail  string          `json:"actor_email"`
+	Action      string          `json:"action"`
+	Target      string          `json:"target"`
+	Details     json.RawMessage `json:"details,omitempty"`
+	CreatedAt   time.Time       `json:"created_at"`
+}
+
+func (h *Handler) listAudit(w http.ResponseWriter, r *http.Request) {
+	limit := 200
+	if q := r.URL.Query().Get("limit"); q != "" {
+		if n, err := strconv.Atoi(q); err == nil && n > 0 && n <= 1000 {
+			limit = n
+		}
+	}
+	entries, err := h.st.ListAuditEntries(r.Context(), limit)
+	if err != nil {
+		writeInternal(w, "list audit", err)
+		return
+	}
+	out := make([]auditResponse, len(entries))
+	for i, e := range entries {
+		out[i] = auditResponse{
+			ID: e.ID, ActorUserID: e.ActorUserID, ActorEmail: e.ActorEmail,
+			Action: e.Action, Target: e.Target,
+			CreatedAt: e.CreatedAt,
+		}
+		// Pass-through stored JSON as-is. Empty string stays nil so the
+		// field can be omitted on the wire.
+		if e.Details != "" {
+			out[i].Details = json.RawMessage(e.Details)
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // --- helpers ---
