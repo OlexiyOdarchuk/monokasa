@@ -109,7 +109,7 @@ func main() {
 		if err != nil {
 			return pay.Show{}, err
 		}
-		return pay.Show{Title: sh.Title, Venue: sh.Venue, StartsAt: sh.StartsAt}, nil
+		return pay.Show{Slug: sh.Slug, Title: sh.Title, Venue: sh.Venue, StartsAt: sh.StartsAt}, nil
 	}
 
 	tg, err := bot.New(bot.Options{
@@ -857,7 +857,7 @@ func (p payEmail) SendTicketBatchEmail(ctx context.Context, to, buyerName string
 		return nil
 	}
 	var seatList strings.Builder
-	attachments := make([]email.Attachment, 0, len(items))
+	attachments := make([]email.Attachment, 0, len(items)+1)
 	for _, it := range items {
 		fmt.Fprintf(&seatList, "<li>ряд %d · місце %d</li>", it.Seat.Row, it.Seat.Col)
 		attachments = append(attachments, email.Attachment{
@@ -866,6 +866,20 @@ func (p payEmail) SendTicketBatchEmail(ctx context.Context, to, buyerName string
 			ContentType: "application/pdf",
 		})
 	}
+	// One .ics per email, not per ticket — multi-seat order is one
+	// event in the buyer's calendar. Apple Mail and Gmail render an
+	// "Add to calendar" button when they see text/calendar.
+	attachments = append(attachments, email.Attachment{
+		Filename: "event.ics",
+		Body: email.BuildICS(email.EventInvite{
+			Title:     show.Title,
+			Venue:     show.Venue,
+			StartsAt:  show.StartsAt,
+			StableID:  show.Slug,
+			Organizer: p.from,
+		}),
+		ContentType: "text/calendar; method=PUBLISH; charset=utf-8",
+	})
 	noun := "квиток"
 	if len(items) > 1 {
 		noun = fmt.Sprintf("квитки (%d шт.)", len(items))

@@ -23,8 +23,12 @@ import (
 	"github.com/OlexiyOdarchuk/monokasa/internal/realtime"
 )
 
-// Show is the subset of show info this package passes through to the renderer.
+// Show is the subset of show info this package passes through to the
+// renderer and email side. Slug is used as the stable iCalendar UID
+// seed so re-sending an invite updates the buyer's calendar entry
+// instead of duplicating it.
 type Show struct {
+	Slug     string
 	Title    string
 	Venue    string
 	StartsAt time.Time
