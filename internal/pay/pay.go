@@ -6,6 +6,7 @@ package pay
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"time"
@@ -64,12 +65,17 @@ type Notifier interface {
 // Renderer turns a confirmed reservation into a printable PDF.
 type Renderer func(show Show, seat Seat, buyerName, qrPayload string) ([]byte, error)
 
+// ShowFn resolves the currently active show on each payment. Reading
+// fresh keeps the PDF header (title/venue/start) in sync with admin edits
+// without restarting the process.
+type ShowFn func(ctx context.Context) (Show, error)
+
 type Processor struct {
 	Store    Store
 	Coder    Coder
 	Notifier Notifier
 	Renderer Renderer
-	Show     Show
+	ShowFn   ShowFn
 }
 
 // Handle is the OnEvent callback wired into webhook.NewHandler.
@@ -126,11 +132,20 @@ func (p *Processor) processTx(ctx context.Context, t bank.Transaction) (bool, er
 		return false, nil
 	}
 
+	// Resolve the show *before* Confirm so a transient store error doesn't
+	// leave us with a confirmed reservation we can't render a ticket for.
+	// Webhook retries replay processTx end-to-end; we'd then hit
+	// ErrAlreadyPaid on Confirm and never render the PDF.
+	show, err := p.ShowFn(ctx)
+	if err != nil {
+		return false, fmt.Errorf("resolve show: %w", err)
+	}
+
 	qrPayload := p.Coder.QRPayload(res.ID, seat.ID)
 	if err := p.Store.Confirm(ctx, res.ID, qrPayload); err != nil {
 		return false, err
 	}
-	pdf, err := p.Renderer(p.Show, seat, res.BuyerName, qrPayload)
+	pdf, err := p.Renderer(show, seat, res.BuyerName, qrPayload)
 	if err != nil {
 		return false, err
 	}

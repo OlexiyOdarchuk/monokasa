@@ -122,7 +122,7 @@ func newTestProcessor(store *fakeStore, notifier *fakeNotifier) *Processor {
 		Coder:    fakeCoder{},
 		Notifier: notifier,
 		Renderer: func(Show, Seat, string, string) ([]byte, error) { return []byte("PDF"), nil },
-		Show:     Show{Title: "Test"},
+		ShowFn:   func(context.Context) (Show, error) { return Show{Title: "Test"}, nil },
 	}
 }
 

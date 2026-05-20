@@ -150,7 +150,7 @@ func newHarness(t *testing.T) *harness {
 		Coder:    coder,
 		Notifier: notifier,
 		Renderer: render.render,
-		Show:     pay.Show{Title: "E2E", Venue: "Home"},
+		ShowFn:   func(context.Context) (pay.Show, error) { return pay.Show{Title: "E2E", Venue: "Home"}, nil },
 	}
 	scanner := web.NewScanner(webAdapter{st}, coder, "")
 	return &harness{

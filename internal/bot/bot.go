@@ -126,11 +126,18 @@ type JarLookup interface {
 	Balance(ctx context.Context) (JarBalance, error)
 }
 
+// ShowFn returns the currently active show. Called on every handler that
+// needs show metadata so admin edits via the web UI take effect without
+// restarting the bot. Returning an error tells callers to surface a
+// friendly "no active event right now" message rather than crashing the
+// command.
+type ShowFn func(ctx context.Context) (Show, error)
+
 type Bot struct {
 	tb         *tele.Bot
 	store      Store
 	coder      Coder
-	show       Show
+	showFn     ShowFn
 	jarLink    string
 	hold       time.Duration
 	adminTGID  int64
@@ -154,7 +161,7 @@ type Options struct {
 	Token      string
 	Store      Store
 	Coder      Coder
-	Show       Show
+	ShowFn     ShowFn // resolves the active show at call time
 	JarLink    string
 	Hold       time.Duration
 	AdminTGID  int64
@@ -171,7 +178,7 @@ func New(opts Options) (*Bot, error) {
 		return nil, err
 	}
 	b := &Bot{
-		tb: tb, store: opts.Store, coder: opts.Coder, show: opts.Show,
+		tb: tb, store: opts.Store, coder: opts.Coder, showFn: opts.ShowFn,
 		jarLink: opts.JarLink, hold: opts.Hold, adminTGID: opts.AdminTGID,
 		reconciler: opts.Reconciler, jar: opts.Jar,
 		done: make(chan struct{}),
@@ -179,6 +186,19 @@ func New(opts Options) (*Bot, error) {
 	b.routes()
 	go b.sweepPending(time.Minute)
 	return b, nil
+}
+
+// activeShow resolves the show with a short context so a hung DB doesn't
+// freeze the bot handler. Errors are wrapped with friendly user-facing
+// text the caller can pass straight to c.Send.
+func (b *Bot) activeShow(ctx context.Context) (Show, string) {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	sh, err := b.showFn(ctx)
+	if err != nil {
+		return Show{}, "Зараз немає активної події. Загляни пізніше."
+	}
+	return sh, ""
 }
 
 func (b *Bot) Start() { b.tb.Start() }
@@ -231,11 +251,20 @@ func (b *Bot) SendTicket(chatID int64, seat Seat, pdf []byte) error {
 	return err
 }
 
-// NotifyShowSoon pings a buyer about the upcoming show.
+// NotifyShowSoon pings a buyer about the upcoming show. Title is fetched
+// fresh so an admin rename right before show-time lands in the reminder.
+// Falls back to a generic "захід" on lookup failure rather than blocking
+// the reminder over a transient DB hiccup.
 func (b *Bot) NotifyShowSoon(chatID int64, seat Seat, when time.Time) error {
+	title := "захід"
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if sh, err := b.showFn(ctx); err == nil {
+		title = sh.Title
+	}
 	_, err := b.tb.Send(tele.ChatID(chatID), fmt.Sprintf(
 		"Привіт! Нагадую: %s — вже сьогодні о %s.\nТвоє місце: ряд %d · %d.\nЧекаємо!",
-		b.show.Title, formatClock(when), seat.Row, seat.Col))
+		title, formatClock(when), seat.Row, seat.Col))
 	return err
 }
 
@@ -255,22 +284,30 @@ func (b *Bot) handleStart(c tele.Context) error {
 	if b.adminTGID != 0 && c.Sender().ID == b.adminTGID {
 		cmds += "  /stats — статистика (адмін)\n  /reconcile — звірити пропущені оплати (адмін)\n  /jar — баланс банки (адмін)\n"
 	}
+	show, friendly := b.activeShow(context.Background())
+	if friendly != "" {
+		return c.Send(friendly)
+	}
 	return c.Send(fmt.Sprintf(
 		"Вітаю! Це бот продажу квитків на %q (%s, %s).\n\n"+
 			"Команди:\n%s\n"+
 			"Щоб купити: натисни /seats → обери вільне місце.",
-		b.show.Title, b.show.Venue, formatDateTime(b.show.StartsAt), cmds))
+		show.Title, show.Venue, formatDateTime(show.StartsAt), cmds))
 }
 
 func (b *Bot) handleSeats(c tele.Context) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	seats, err := b.store.Seats(ctx, b.show.ID)
+	show, friendly := b.activeShow(ctx)
+	if friendly != "" {
+		return c.Send(friendly)
+	}
+	seats, err := b.store.Seats(ctx, show.ID)
 	if err != nil {
 		return c.Send("storage error: " + err.Error())
 	}
-	status, err := b.store.SeatStatuses(ctx, b.show.ID)
+	status, err := b.store.SeatStatuses(ctx, show.ID)
 	if err != nil {
 		return c.Send("storage error: " + err.Error())
 	}
@@ -345,9 +382,13 @@ func (b *Bot) callbackSeat(c tele.Context, cb *tele.Callback) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
+	show, friendlyErr := b.activeShow(ctx)
+	if friendlyErr != "" {
+		return c.Respond(&tele.CallbackResponse{Text: friendlyErr})
+	}
 	// Pre-check the seat is free so we don't ask for a name on a taken seat.
 	// We re-check on Reserve to close the (small) race window.
-	seat, err := b.store.FindFreeSeat(ctx, b.show.ID, row, col)
+	seat, err := b.store.FindFreeSeat(ctx, show.ID, row, col)
 	if err != nil {
 		return c.Respond(&tele.CallbackResponse{Text: friendly(err)})
 	}
@@ -426,7 +467,11 @@ func (b *Bot) handleStats(c tele.Context) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	st, err := b.store.Stats(ctx, b.show.ID)
+	show, friendlyErr := b.activeShow(ctx)
+	if friendlyErr != "" {
+		return c.Send(friendlyErr)
+	}
+	st, err := b.store.Stats(ctx, show.ID)
 	if err != nil {
 		return c.Send("storage error: " + err.Error())
 	}
@@ -438,7 +483,7 @@ func (b *Bot) handleStats(c tele.Context) error {
 			"в очікуванні оплати: *%d*\n"+
 			"вільно: *%d*\n\n"+
 			"виторг: *%s*",
-		b.show.Title, b.show.Venue, formatDateTime(b.show.StartsAt),
+		show.Title, show.Venue, formatDateTime(show.StartsAt),
 		st.Total, st.Sold, st.Held, st.Free, st.Revenue), tele.ModeMarkdown)
 }
 
@@ -541,7 +586,12 @@ func (b *Bot) handleText(c tele.Context) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	seat, err := b.store.FindFreeSeat(ctx, b.show.ID, pick.Row, pick.Col)
+	show, friendlyErr := b.activeShow(ctx)
+	if friendlyErr != "" {
+		b.pending.Delete(sender.ID)
+		return c.Send(friendlyErr)
+	}
+	seat, err := b.store.FindFreeSeat(ctx, show.ID, pick.Row, pick.Col)
 	if err != nil {
 		b.pending.Delete(sender.ID)
 		return c.Send(friendly(err))

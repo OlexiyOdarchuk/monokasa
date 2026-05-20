@@ -69,35 +69,45 @@ func main() {
 	ctx, cancel := signalCtx()
 	defer cancel()
 
-	showID, err := st.SeedIfEmpty(ctx, store.Show{
+	if _, err := st.SeedIfEmpty(ctx, store.Show{
 		Title:    cfg.ShowTitle,
 		Venue:    cfg.ShowVenue,
 		StartsAt: cfg.ShowStartsAt,
-	}, cfg.Rows, cfg.Cols, cfg.PriceKopecks)
-	if err != nil {
+	}, cfg.Rows, cfg.Cols, cfg.PriceKopecks); err != nil {
 		fatal("seed", "err", err)
 	}
-	show, err := st.LoadShow(ctx, showID)
-	if err != nil {
-		fatal("load show", "err", err)
+	if sh, err := st.ActiveShow(ctx); err == nil {
+		slog.Info("show ready",
+			"id", sh.ID,
+			"title", sh.Title,
+			"startsAt", timefmt.DateTime(sh.StartsAt))
 	}
-	slog.Info("show ready",
-		"id", show.ID,
-		"title", show.Title,
-		"startsAt", timefmt.DateTime(show.StartsAt))
 
 	coder := token.NewCoder(cfg.Secret)
+
+	// Bot and pay both pull the active show on demand via ShowFn so admin
+	// edits propagate without a restart, and a new show created after a
+	// run-down period becomes the one bot/pay use automatically.
+	botShowFn := func(ctx context.Context) (bot.Show, error) {
+		sh, err := st.ActiveShow(ctx)
+		if err != nil {
+			return bot.Show{}, err
+		}
+		return bot.Show{ID: sh.ID, Title: sh.Title, Venue: sh.Venue, StartsAt: sh.StartsAt}, nil
+	}
+	payShowFn := func(ctx context.Context) (pay.Show, error) {
+		sh, err := st.ActiveShow(ctx)
+		if err != nil {
+			return pay.Show{}, err
+		}
+		return pay.Show{Title: sh.Title, Venue: sh.Venue, StartsAt: sh.StartsAt}, nil
+	}
 
 	tg, err := bot.New(bot.Options{
 		Token:     cfg.TGToken,
 		Store:     botStore{st},
 		Coder:     coder,
-		Show: bot.Show{
-			ID:       show.ID,
-			Title:    show.Title,
-			Venue:    show.Venue,
-			StartsAt: show.StartsAt,
-		},
+		ShowFn:    botShowFn,
 		JarLink:   cfg.JarLink,
 		Hold:      cfg.HoldDuration,
 		AdminTGID: cfg.AdminTGID,
@@ -115,7 +125,7 @@ func main() {
 		Coder:    coder,
 		Notifier: payNotifier{tg},
 		Renderer: payRenderer,
-		Show:     pay.Show{Title: show.Title, Venue: show.Venue, StartsAt: show.StartsAt},
+		ShowFn:   payShowFn,
 	}
 	hook, err := webhook.NewHandler(ctx, webhook.Options{
 		Keys:    monoClient,
@@ -163,17 +173,18 @@ func main() {
 
 	scanner := web.NewScanner(webStore{st}, coder, cfg.ScannerToken)
 
-	// Seat gauges read straight from the store at scrape time — Prometheus
-	// scrapes infrequently enough that this is cheaper than maintaining a
-	// cached value in memory and keeping it consistent.
+	// Seat gauges resolve the active show at scrape time and stat against
+	// its id — so admins flipping between shows in the web UI don't need
+	// to think about which one the metrics reflect (it's whatever's
+	// currently active).
 	expvar.Publish("monokasa_seats_sold", expvar.Func(func() any {
-		return liveStat(st, show.ID, func(s store.Stats) int { return s.Sold })
+		return liveActiveStat(st, func(s store.Stats) int { return s.Sold })
 	}))
 	expvar.Publish("monokasa_seats_held", expvar.Func(func() any {
-		return liveStat(st, show.ID, func(s store.Stats) int { return s.Held })
+		return liveActiveStat(st, func(s store.Stats) int { return s.Held })
 	}))
 	expvar.Publish("monokasa_seats_free", expvar.Func(func() any {
-		return liveStat(st, show.ID, func(s store.Stats) int { return s.Free })
+		return liveActiveStat(st, func(s store.Stats) int { return s.Free })
 	}))
 
 	spa, err := webui.New()
@@ -237,7 +248,7 @@ func main() {
 	}
 
 	// Reminders.
-	go runReminderLoop(ctx, st, tg, show, cfg.RemindBefore)
+	go runReminderLoop(ctx, st, tg, cfg.RemindBefore)
 
 	// Eagerly free seats whose HOLD has lapsed without payment, so /seats
 	// reflects reality even when no user has triggered a status read.
@@ -295,13 +306,18 @@ func registerWebhook(ctx context.Context, token, url string) {
 	slog.Error("register webhook giving up — register manually", "url", url)
 }
 
-// liveStat reads one field out of store.Stats with a 1s timeout. Used by
-// the expvar gauges; on failure it returns -1 so a flat-lined gauge in
-// Prometheus is a visible signal rather than a stale value.
-func liveStat(st *store.Store, showID int64, pick func(store.Stats) int) int {
+// liveActiveStat resolves the active show and reads one field out of its
+// store.Stats with a 1s timeout. Used by the expvar gauges; on failure it
+// returns -1 so a flat-lined gauge in Prometheus is a visible signal
+// rather than a stale value.
+func liveActiveStat(st *store.Store, pick func(store.Stats) int) int {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	s, err := st.Stats(ctx, showID)
+	sh, err := st.ActiveShow(ctx)
+	if err != nil {
+		return -1
+	}
+	s, err := st.Stats(ctx, sh.ID)
 	if err != nil {
 		return -1
 	}
@@ -390,19 +406,25 @@ func runSessionSweeper(ctx context.Context, st *store.Store, every time.Duration
 }
 
 // runReminderLoop wakes up periodically; when we're within
-// `remindBefore` of show start, it pings every paid-and-not-yet-reminded
-// reservation once, then idles. The DB column reminded_at guarantees
-// at-most-once delivery across restarts.
-func runReminderLoop(ctx context.Context, st *store.Store, tg *bot.Bot, show store.Show, remindBefore time.Duration) {
+// `remindBefore` of the active show's start, it pings every
+// paid-and-not-yet-reminded reservation once, then idles. The DB column
+// reminded_at guarantees at-most-once delivery across restarts. The
+// active-show is re-resolved each tick so admin edits to StartsAt take
+// effect without a restart.
+func runReminderLoop(ctx context.Context, st *store.Store, tg *bot.Bot, remindBefore time.Duration) {
 	tick := time.NewTicker(1 * time.Minute)
 	defer tick.Stop()
 	check := func() {
+		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		show, err := st.ActiveShow(ctx)
+		if err != nil {
+			return // no active show — nothing to remind about
+		}
 		until := time.Until(show.StartsAt)
 		if until > remindBefore || until < -2*time.Hour {
 			return // too early or already long over
 		}
-		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		defer cancel()
 		items, err := st.ConfirmedNotYetReminded(ctx, show.ID)
 		if err != nil {
 			slog.Error("remind", "err", err)
