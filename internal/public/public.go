@@ -21,6 +21,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/OlexiyOdarchuk/monokasa/internal/realtime"
 	"github.com/OlexiyOdarchuk/monokasa/internal/store"
 	"github.com/OlexiyOdarchuk/monokasa/internal/token"
 )
@@ -33,6 +34,7 @@ type Handler struct {
 	hold        time.Duration
 	priceMin    int64  // minimum price kopecks; reservations below this are rejected
 	botUsername string // optional; when set, ReservationResponse carries a TG deep link
+	hub         *realtime.Hub
 }
 
 type Config struct {
@@ -41,7 +43,8 @@ type Config struct {
 	JarLink     string
 	Hold        time.Duration
 	MinPrice    int64
-	BotUsername string // optional Telegram bot @-handle (no leading "@")
+	BotUsername string        // optional Telegram bot @-handle (no leading "@")
+	Hub         *realtime.Hub // optional; SSE seat updates skipped if nil
 }
 
 func NewHandler(c Config) *Handler {
@@ -52,15 +55,101 @@ func NewHandler(c Config) *Handler {
 		hold:        c.Hold,
 		priceMin:    c.MinPrice,
 		botUsername: c.BotUsername,
+		hub:         c.Hub,
 	}
 }
 
 func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/public/shows", h.listShows)
 	mux.HandleFunc("GET /api/public/shows/{slug}", h.getShow)
+	mux.HandleFunc("GET /api/public/shows/{slug}/events", h.events)
 	mux.HandleFunc("POST /api/public/reservations", h.createReservation)
 	mux.HandleFunc("POST /api/public/orders", h.createOrder)
 	mux.HandleFunc("GET /api/public/reservations/{code}/status", h.reservationStatus)
+}
+
+// --- GET /api/public/shows/{slug}/events ---
+//
+// Server-Sent Events stream of seat-status changes for one show. Buyers
+// keep an EventSource open while viewing /event/<slug> so the seat map
+// updates without polling. Disconnected clients are reaped via the
+// request context — no manual goroutine bookkeeping here.
+//
+// When the hub is nil (tests / minimal builds) we return 503 so the
+// client knows to fall back to its own polling cadence.
+
+func (h *Handler) events(w http.ResponseWriter, r *http.Request) {
+	if h.hub == nil {
+		writeError(w, http.StatusServiceUnavailable, "realtime_disabled", "")
+		return
+	}
+	slug := r.PathValue("slug")
+	if slug == "" {
+		writeError(w, http.StatusBadRequest, "invalid_slug", "")
+		return
+	}
+	show, err := h.st.LoadShowBySlug(r.Context(), slug)
+	if errors.Is(err, store.ErrShowNotFound) {
+		writeError(w, http.StatusNotFound, "show_not_found", "")
+		return
+	}
+	if err != nil {
+		writeInternal(w, "load show by slug", err)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		// Net/http always provides Flusher for HTTP/1.1 and h2, so this
+		// path is only ever hit under a weird middleware that wraps the
+		// response writer. Bail clearly.
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	// Disable buffering on intermediaries that honor it (nginx).
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	ch, unsub := h.hub.Subscribe(show.ID)
+	defer unsub()
+
+	// Keep-alive comment line every 25s so proxies / browsers don't drop
+	// an idle SSE connection. Comments (`:` prefix) are silently
+	// ignored by EventSource.
+	keepalive := time.NewTicker(25 * time.Second)
+	defer keepalive.Stop()
+
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-keepalive.C:
+			if _, err := fmt.Fprint(w, ": ping\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		case ev, ok := <-ch:
+			if !ok {
+				return
+			}
+			payload, err := json.Marshal(ev)
+			if err != nil {
+				// Drop this frame; structurally impossible for our
+				// own struct, but never panic on a stream.
+				continue
+			}
+			if _, err := fmt.Fprintf(w, "data: %s\n\n", payload); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
 }
 
 // --- GET /api/public/reservations/{code}/status ---
@@ -337,6 +426,9 @@ func (h *Handler) createReservation(w http.ResponseWriter, r *http.Request) {
 	}
 
 	payURL := jarPrefillURL(h.jarLink, target.PriceKopecks, order.Code)
+	h.hub.Publish(show.ID, realtime.Event{
+		Type: "seat_status", SeatID: target.ID, Status: realtime.SeatHeld,
+	})
 	slog.Info("public reservation created",
 		"code", order.Code, "slug", show.Slug, "seatId", target.ID,
 		"buyer", name, "email", email)
@@ -515,6 +607,9 @@ func (h *Handler) createOrder(w http.ResponseWriter, r *http.Request) {
 			X: s.X, Y: s.Y, Label: s.Label, Category: s.Category,
 			PriceKopecks: s.PriceKopecks, Sellable: true,
 		}})
+		h.hub.Publish(show.ID, realtime.Event{
+			Type: "seat_status", SeatID: s.ID, Status: realtime.SeatHeld,
+		})
 	}
 	var tgLink string
 	if h.botUsername != "" {

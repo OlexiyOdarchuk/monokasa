@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/OlexiyOdarchuk/monokasa/internal/auth"
+	"github.com/OlexiyOdarchuk/monokasa/internal/realtime"
 	"github.com/OlexiyOdarchuk/monokasa/internal/store"
 )
 
@@ -39,6 +40,7 @@ type CancelNotifier func(ctx context.Context, res store.Reservation, seat store.
 type Handler struct {
 	st       *store.Store
 	onCancel CancelNotifier // optional; nil is a no-op
+	hub      *realtime.Hub  // optional; nil → no SSE publish on cancel
 }
 
 func NewHandler(st *store.Store) *Handler {
@@ -48,6 +50,10 @@ func NewHandler(st *store.Store) *Handler {
 // SetCancelNotifier wires the post-cancel notification hook. Optional;
 // when nil the cancel endpoint just updates the DB.
 func (h *Handler) SetCancelNotifier(fn CancelNotifier) { h.onCancel = fn }
+
+// SetHub wires the realtime pub/sub so cancel actions broadcast a
+// seat-status event to live SSE subscribers.
+func (h *Handler) SetHub(hub *realtime.Hub) { h.hub = hub }
 
 // Register wires every endpoint onto the given mux. The mux is meant to
 // be wrapped by auth.RequireAuth at the call site, not by this package.
@@ -525,7 +531,7 @@ func (h *Handler) cancelReservation(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	res, seat, err := h.st.AdminCancelReservation(r.Context(), id)
+	res, seat, freed, err := h.st.AdminCancelReservation(r.Context(), id)
 	switch {
 	case errors.Is(err, store.ErrCodeNotFound):
 		writeError(w, http.StatusNotFound, "reservation_not_found", "")
@@ -541,6 +547,13 @@ func (h *Handler) cancelReservation(w http.ResponseWriter, r *http.Request) {
 	// for SMTP — failures get logged inside the notifier.
 	if h.onCancel != nil {
 		go h.onCancel(context.Background(), res, seat)
+	}
+	// Broadcast every freed seat — multi-seat cancel cascades, so any
+	// live SSE subscriber should see the whole basket flip back to free.
+	for _, s := range freed {
+		h.hub.Publish(s.ShowID, realtime.Event{
+			Type: "seat_status", SeatID: s.ID, Status: realtime.SeatFree,
+		})
 	}
 	writeJSON(w, http.StatusOK, toGuestResponse(store.MyItem{Reservation: res, Seat: seat}, time.Now()))
 }

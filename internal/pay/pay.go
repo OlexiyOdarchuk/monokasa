@@ -20,6 +20,7 @@ import (
 	"github.com/OlexiyOdarchuk/go-monobank-sdk/webhook"
 
 	"github.com/OlexiyOdarchuk/monokasa/internal/metrics"
+	"github.com/OlexiyOdarchuk/monokasa/internal/realtime"
 )
 
 // Show is the subset of show info this package passes through to the renderer.
@@ -32,6 +33,7 @@ type Show struct {
 // Seat is the subset of seat info this package passes through.
 type Seat struct {
 	ID       int64
+	ShowID   int64
 	Row, Col int
 	Price    money.Money
 }
@@ -108,6 +110,10 @@ type Processor struct {
 	// Email is optional. When nil, web-buyer reservations confirm but
 	// the buyer doesn't get an email — operator log will warn.
 	Email EmailDelivery
+	// Hub is optional. When set, every confirmed seat gets a
+	// realtime.SeatSold event so live SSE subscribers update without
+	// reloading. Nil-safe (Publish on a nil hub is a no-op).
+	Hub *realtime.Hub
 }
 
 // Handle is the OnEvent callback wired into webhook.NewHandler.
@@ -177,6 +183,16 @@ func (p *Processor) processTx(ctx context.Context, t bank.Transaction) (bool, er
 	}
 	if err := p.Store.ConfirmOrder(ctx, order.ID, qrs); err != nil {
 		return false, err
+	}
+
+	// Broadcast each confirmed seat as "sold" — live SSE subscribers
+	// flip them on the map without a reload. Publish is non-blocking
+	// and nil-safe; do it before render so a slow PDF stage doesn't
+	// delay the wire event.
+	for _, it := range items {
+		p.Hub.Publish(it.Seat.ShowID, realtime.Event{
+			Type: "seat_status", SeatID: it.Seat.ID, Status: realtime.SeatSold,
+		})
 	}
 
 	// Render each PDF; if any render fails we still log_warn and

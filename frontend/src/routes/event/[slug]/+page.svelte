@@ -97,6 +97,43 @@
 		load();
 	});
 
+	// Live seat updates over Server-Sent Events. The server publishes a
+	// "seat_status" frame whenever someone reserves/cancels/pays for a
+	// seat in this show, so the picker reflects reality without polling.
+	// Browser EventSource handles reconnect on its own (3s default).
+	$effect(() => {
+		if (!show || !loaded) return;
+		const src = new EventSource(`/api/public/shows/${show.slug}/events`);
+		src.onmessage = (e) => {
+			try {
+				const ev = JSON.parse(e.data) as {
+					type: string;
+					seat_id: number;
+					status: 'free' | 'held' | 'sold';
+				};
+				if (ev.type !== 'seat_status' || !show) return;
+				const idx = show.seats.findIndex((s) => s.id === ev.seat_id);
+				if (idx < 0) return;
+				// `taken` covers both held and sold for the picker's purposes.
+				show.seats[idx] = { ...show.seats[idx], taken: ev.status !== 'free' };
+				// If our basket includes this seat and it just got taken
+				// by someone else, drop it so the user doesn't try to
+				// submit a stale selection.
+				if (ev.status !== 'free' && selectedIds.has(ev.seat_id)) {
+					selectedIds.delete(ev.seat_id);
+				}
+			} catch (err) {
+				console.warn('SSE parse failed', err);
+			}
+		};
+		src.onerror = () => {
+			// Browser auto-reconnects; nothing to do. Logging only when
+			// the connection actually closes would require readyState
+			// checks — for now stay quiet.
+		};
+		return () => src.close();
+	});
+
 	function toggleSeat(s: PublicSeat) {
 		if (!s.sellable || s.taken) return;
 		if (selectedIds.has(s.id)) {

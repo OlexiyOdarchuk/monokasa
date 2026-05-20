@@ -35,6 +35,7 @@ import (
 	"github.com/OlexiyOdarchuk/monokasa/internal/pay"
 	"github.com/OlexiyOdarchuk/monokasa/internal/posters"
 	"github.com/OlexiyOdarchuk/monokasa/internal/public"
+	"github.com/OlexiyOdarchuk/monokasa/internal/realtime"
 	"github.com/OlexiyOdarchuk/monokasa/internal/store"
 	"github.com/OlexiyOdarchuk/monokasa/internal/ticket"
 	"github.com/OlexiyOdarchuk/monokasa/internal/timefmt"
@@ -144,6 +145,12 @@ func main() {
 		slog.Info("smtp not configured; email delivery disabled (web buyers won't receive PDFs)")
 	}
 
+	// Realtime hub is a single instance shared by every producer
+	// (public reserve, pay confirm, admin cancel) and every SSE
+	// subscriber. In-process — there's only one process, no fan-out
+	// across replicas needed.
+	hub := realtime.New()
+
 	monoClient := bank.New()
 	processor := &pay.Processor{
 		Store:    payStore{st},
@@ -152,6 +159,7 @@ func main() {
 		Renderer: payRenderer,
 		ShowFn:   payShowFn,
 		Email:    emailDelivery,
+		Hub:      hub,
 	}
 	hook, err := webhook.NewHandler(ctx, webhook.Options{
 		Keys:    monoClient,
@@ -222,6 +230,7 @@ func main() {
 	// auth.RequireAuth once, rather than decorating every endpoint.
 	adminMux := http.NewServeMux()
 	adminH := admin.NewHandler(st)
+	adminH.SetHub(hub)
 	// Best-effort notification fan-out: when admin force-cancels a
 	// reservation, ping the buyer through whichever channels are
 	// attached to their row. Failures get logged inside; the cancel
@@ -262,6 +271,7 @@ func main() {
 		Hold:        cfg.HoldDuration,
 		MinPrice:    cfg.PriceKopecks,
 		BotUsername: cfg.BotUsername,
+		Hub:         hub,
 	})
 
 	mux := http.NewServeMux()
@@ -786,7 +796,8 @@ func (p payStore) FindOrderByCode(ctx context.Context, code string) (pay.Order, 
 			ReservationID: it.Reservation.ID,
 			AttendeeName:  it.Reservation.AttendeeName,
 			Seat: pay.Seat{
-				ID: it.Seat.ID, Row: it.Seat.Row, Col: it.Seat.Col,
+				ID: it.Seat.ID, ShowID: it.Seat.ShowID,
+				Row: it.Seat.Row, Col: it.Seat.Col,
 				Price: money.New(it.Seat.PriceKopecks, currency.UAH),
 			},
 		}

@@ -34,6 +34,7 @@ README.md — для тих, хто хоче ЗАПУСТИТИ. Цей vault �
 - [[50-packages/auth]] — bcrypt-сесії
 - [[50-packages/email]] — SMTP-доставка
 - [[50-packages/posters]] — upload афіш
+- [[50-packages/realtime]] — SSE hub для live seat updates
 - [[50-packages/ticket]] — рендер PDF
 - [[50-packages/token]] — коди + HMAC для QR
 - [[50-packages/web]] — сканер на вході

@@ -50,6 +50,13 @@
 ### `GET /api/public/reservations/{code}/status`
 Полл-ендпоінт для success-екрана. Дивиться в **orders** (бо для multi-seat reservation коди це `code.N`). Відповідь: `{status: "held"|"paid"|"expired"|"cancelled"}`.
 
+### `GET /api/public/shows/{slug}/events`
+Server-Sent Events stream із seat-status оновленнями для однієї події.
+Фронтенд (`/event/<slug>`) тримає відкритим, щоб мапа оновлювалась без
+polling'у. Кожне повідомлення — `data: {"type":"seat_status","seat_id":N,"status":"free|held|sold"}\n\n`.
+Keep-alive comment `: ping\n\n` кожні 25 секунд. 503 `realtime_disabled`
+якщо hub не сконфігурований. Деталі → [[50-packages/realtime]].
+
 ## Admin (за `RequireAuth`)
 
 | Метод | Шлях | Що робить |

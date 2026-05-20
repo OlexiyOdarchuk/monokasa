@@ -759,7 +759,7 @@ func TestAdminCancelReservationWorksOnPaid(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, _, err := s.AdminCancelReservation(ctx, r.ID)
+	got, _, _, err := s.AdminCancelReservation(ctx, r.ID)
 	if err != nil {
 		t.Fatalf("AdminCancelReservation on paid: %v", err)
 	}
@@ -779,17 +779,17 @@ func TestAdminCancelReservationDoubleFails(t *testing.T) {
 	seats, _ := s.Seats(ctx, showID)
 	r, _ := s.Reserve(ctx, seats[0], 1, 100, "A", "", "code0001", 5*time.Minute)
 
-	if _, _, err := s.AdminCancelReservation(ctx, r.ID); err != nil {
+	if _, _, _, err := s.AdminCancelReservation(ctx, r.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.AdminCancelReservation(ctx, r.ID); !errors.Is(err, ErrAlreadyClosed) {
+	if _, _, _, err := s.AdminCancelReservation(ctx, r.ID); !errors.Is(err, ErrAlreadyClosed) {
 		t.Errorf("re-cancel: got %v, want ErrAlreadyClosed", err)
 	}
 }
 
 func TestAdminCancelReservationNotFound(t *testing.T) {
 	s := newTestStore(t)
-	if _, _, err := s.AdminCancelReservation(context.Background(), 9999); !errors.Is(err, ErrCodeNotFound) {
+	if _, _, _, err := s.AdminCancelReservation(context.Background(), 9999); !errors.Is(err, ErrCodeNotFound) {
 		t.Errorf("got %v, want ErrCodeNotFound", err)
 	}
 }
@@ -1029,7 +1029,7 @@ func TestLinkReservationCancelledFails(t *testing.T) {
 	seats, _ := s.Seats(ctx, showID)
 	r, _ := s.Reserve(ctx, seats[0], 0, 0, "Web", "web@x.com", "codelink2", time.Minute)
 	// Force-cancel as admin.
-	if _, _, err := s.AdminCancelReservation(ctx, r.ID); err != nil {
+	if _, _, _, err := s.AdminCancelReservation(ctx, r.ID); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := s.LinkOrderToTGChat(ctx, r.Code, 1, 2); !errors.Is(err, ErrAlreadyClosed) {

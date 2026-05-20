@@ -895,10 +895,14 @@ func (s *Store) ListReservations(ctx context.Context, showID int64) ([]MyItem, e
 // Paid cancellations are permitted: monobank refunds happen out of band,
 // the DB just frees the seats and marks the rows. Already-cancelled
 // orders return ErrAlreadyClosed.
-func (s *Store) AdminCancelReservation(ctx context.Context, reservationID int64) (Reservation, Seat, error) {
+//
+// The returned freed slice contains every seat that became free as a
+// result of the cancellation (including the targeted seat). Callers
+// broadcast SSE seat-status events from this list.
+func (s *Store) AdminCancelReservation(ctx context.Context, reservationID int64) (Reservation, Seat, []Seat, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return Reservation{}, Seat{}, err
+		return Reservation{}, Seat{}, nil, err
 	}
 	defer tx.Rollback()
 
@@ -909,50 +913,78 @@ func (s *Store) AdminCancelReservation(ctx context.Context, reservationID int64)
 		FROM reservations r JOIN seats s ON s.id = r.seat_id
 		WHERE r.id = ?`, reservationID), &r, &seat)
 	if errors.Is(err, sql.ErrNoRows) {
-		return r, seat, ErrCodeNotFound
+		return r, seat, nil, ErrCodeNotFound
 	}
 	if err != nil {
-		return r, seat, err
+		return r, seat, nil, err
 	}
 	if r.CancelledAt != nil {
-		return r, seat, ErrAlreadyClosed
+		return r, seat, nil, ErrAlreadyClosed
 	}
 
 	var orderID sql.NullInt64
 	if err := tx.QueryRowContext(ctx,
 		`SELECT order_id FROM reservations WHERE id = ?`, reservationID).Scan(&orderID); err != nil {
-		return r, seat, err
+		return r, seat, nil, err
 	}
 
 	now := time.Now()
+	freed := []Seat{seat}
 	if orderID.Valid {
 		// Cascade: cancel every reservation in the order and the order
 		// itself. Idempotent guards (cancelled_at IS NULL) prevent
 		// stamping the same row twice if some peer was already
 		// individually cancelled.
+		//
+		// Collect the peer seats BEFORE the UPDATE so callers can
+		// broadcast realtime events for the whole order. We only need
+		// rows that are about to be cancelled (cancelled_at IS NULL)
+		// to avoid re-firing on already-cancelled peers.
+		rows, err := tx.QueryContext(ctx, `
+			SELECT s.id, s.show_id, s.row, s.col, s.x, s.y,
+			       s.label, s.category, s.price_kopecks, s.sellable
+			FROM reservations r JOIN seats s ON s.id = r.seat_id
+			WHERE r.order_id = ? AND r.cancelled_at IS NULL AND r.id != ?`,
+			orderID.Int64, reservationID)
+		if err != nil {
+			return r, seat, nil, err
+		}
+		for rows.Next() {
+			var s Seat
+			var sellable int
+			if err := rows.Scan(&s.ID, &s.ShowID, &s.Row, &s.Col, &s.X, &s.Y,
+				&s.Label, &s.Category, &s.PriceKopecks, &sellable); err != nil {
+				rows.Close()
+				return r, seat, nil, err
+			}
+			s.Sellable = sellable != 0
+			freed = append(freed, s)
+		}
+		rows.Close()
+
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE reservations SET cancelled_at=? WHERE order_id=? AND cancelled_at IS NULL`,
 			now.Unix(), orderID.Int64); err != nil {
-			return r, seat, err
+			return r, seat, nil, err
 		}
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE orders SET cancelled_at=? WHERE id=? AND cancelled_at IS NULL`,
 			now.Unix(), orderID.Int64); err != nil {
-			return r, seat, err
+			return r, seat, nil, err
 		}
 	} else {
 		// Legacy reservation pre-dating orders (shouldn't exist after
 		// the backfill, but defend against partial state).
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE reservations SET cancelled_at=? WHERE id=?`, now.Unix(), r.ID); err != nil {
-			return r, seat, err
+			return r, seat, nil, err
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return r, seat, err
+		return r, seat, nil, err
 	}
 	r.CancelledAt = &now
-	return r, seat, nil
+	return r, seat, freed, nil
 }
 
 // --- orders (multi-seat) ---
