@@ -123,7 +123,6 @@ func newTestProcessor(store *fakeStore, notifier *fakeNotifier) *Processor {
 		Notifier: notifier,
 		Renderer: func(Show, Seat, string, string) ([]byte, error) { return []byte("PDF"), nil },
 		Show:     Show{Title: "Test"},
-		MinPrice: money.New(25000, currency.UAH),
 	}
 }
 
@@ -232,6 +231,34 @@ func TestProcessor_ShortAmountRejected(t *testing.T) {
 	}
 	if len(notifier.sends) != 0 {
 		t.Errorf("ticket sent on short payment")
+	}
+}
+
+func TestProcessor_CheapSeatAcceptedRegardlessOfDefaults(t *testing.T) {
+	// Regression: the floor was previously a global Processor.MinPrice
+	// (taken from cfg.PriceKopecks); admins who priced balcony seats at
+	// 100 UAH while default was 250 UAH had those payments rejected.
+	// After the per-seat fix, the check is seat.Price; a 100 UAH payment
+	// on a 100 UAH seat must clear.
+	st := &fakeStore{
+		codeKnown:   "abcdefgh",
+		reservation: Reservation{ID: 7, TGChatID: 42, BuyerName: "Анна"},
+		seat:        Seat{ID: 3, Row: 1, Col: 2, Price: money.New(10000, currency.UAH)}, // 100 UAH
+	}
+	notifier := &fakeNotifier{}
+	p := newTestProcessor(st, notifier)
+
+	// Pay exactly the seat's price.
+	if err := p.Handle(context.Background(), &webhook.Response{
+		Data: webhook.Data{Transaction: newTx("payment abcdefgh", 10000)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(st.confirmCalls) != 1 {
+		t.Errorf("Confirm calls = %d, want 1 (cheap seat should be accepted)", len(st.confirmCalls))
+	}
+	if len(notifier.sends) != 1 {
+		t.Errorf("ticket sends = %d, want 1", len(notifier.sends))
 	}
 }
 

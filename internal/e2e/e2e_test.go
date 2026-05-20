@@ -151,7 +151,6 @@ func newHarness(t *testing.T) *harness {
 		Notifier: notifier,
 		Renderer: render.render,
 		Show:     pay.Show{Title: "E2E", Venue: "Home"},
-		MinPrice: money.New(25000, currency.UAH),
 	}
 	scanner := web.NewScanner(webAdapter{st}, coder, "")
 	return &harness{

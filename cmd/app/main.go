@@ -116,7 +116,6 @@ func main() {
 		Notifier: payNotifier{tg},
 		Renderer: payRenderer,
 		Show:     pay.Show{Title: show.Title, Venue: show.Venue, StartsAt: show.StartsAt},
-		MinPrice: money.New(cfg.PriceKopecks, currency.UAH),
 	}
 	hook, err := webhook.NewHandler(ctx, webhook.Options{
 		Keys:    monoClient,

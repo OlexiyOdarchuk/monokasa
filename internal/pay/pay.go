@@ -70,9 +70,6 @@ type Processor struct {
 	Notifier Notifier
 	Renderer Renderer
 	Show     Show
-	// MinPrice is the minimum acceptable payment. Overpayment (paid >
-	// MinPrice) is fine — the ticket is still issued.
-	MinPrice money.Money
 }
 
 // Handle is the OnEvent callback wired into webhook.NewHandler.
@@ -120,11 +117,12 @@ func (p *Processor) processTx(ctx context.Context, t bank.Transaction) (bool, er
 			"txId", t.ID, "code", code)
 		return false, nil
 	}
-	// Accept paid >= expected: overpayment is fine, exact match is fine,
-	// short payment is rejected.
-	if t.Amount.Minor < p.MinPrice.Minor {
+	// Each seat carries its own price (set by the admin layout editor);
+	// the floor for "is this payment enough" is per-seat, not global.
+	// Overpayment is fine — exact match is fine — short payment is rejected.
+	if t.Amount.Minor < seat.Price.Minor {
 		slog.Warn("payment short",
-			"txId", t.ID, "paid", t.Amount, "need", p.MinPrice, "code", code)
+			"txId", t.ID, "paid", t.Amount, "need", seat.Price, "code", code)
 		return false, nil
 	}
 
