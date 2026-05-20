@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/mail"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -55,8 +56,55 @@ func NewHandler(c Config) *Handler {
 }
 
 func (h *Handler) Register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /api/public/shows", h.listShows)
 	mux.HandleFunc("GET /api/public/shows/{slug}", h.getShow)
 	mux.HandleFunc("POST /api/public/reservations", h.createReservation)
+}
+
+// --- GET /api/public/shows ---
+
+type publicShowSummary struct {
+	Slug      string    `json:"slug"`
+	Title     string    `json:"title"`
+	Venue     string    `json:"venue"`
+	StartsAt  time.Time `json:"starts_at"`
+	SeatsFree int       `json:"seats_free"`
+	SeatsTotal int      `json:"seats_total"`
+}
+
+func (h *Handler) listShows(w http.ResponseWriter, r *http.Request) {
+	shows, err := h.st.ListShows(r.Context())
+	if err != nil {
+		writeInternal(w, "list shows", err)
+		return
+	}
+	now := time.Now()
+	out := make([]publicShowSummary, 0, len(shows))
+	for _, sh := range shows {
+		// Hide archived shows and ones that already happened more than
+		// 2h ago — landing page is forward-looking.
+		if sh.ArchivedAt != nil {
+			continue
+		}
+		if sh.StartsAt.Before(now.Add(-2 * time.Hour)) {
+			continue
+		}
+		st, err := h.st.Stats(r.Context(), sh.ID)
+		if err != nil {
+			// One bad stats query shouldn't blank the whole list.
+			slog.Warn("public list: stats failed", "showId", sh.ID, "err", err)
+			continue
+		}
+		out = append(out, publicShowSummary{
+			Slug: sh.Slug, Title: sh.Title, Venue: sh.Venue,
+			StartsAt:   sh.StartsAt,
+			SeatsFree:  st.Free,
+			SeatsTotal: st.Total,
+		})
+	}
+	// Sort by start, soonest first.
+	sort.Slice(out, func(i, j int) bool { return out[i].StartsAt.Before(out[j].StartsAt) })
+	writeJSON(w, http.StatusOK, out)
 }
 
 // --- GET /api/public/shows/{slug} ---

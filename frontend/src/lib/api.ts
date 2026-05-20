@@ -161,6 +161,16 @@ export interface UpdateShowInput {
 
 // ---- public-side (anonymous buyer) shapes ----
 
+export interface PublicShowSummary {
+	slug: string;
+	title: string;
+	venue: string;
+	starts_at: string;
+	seats_free: number;
+	seats_total: number;
+}
+
+
 export interface PublicSeat {
 	id: number;
 	row: number;
