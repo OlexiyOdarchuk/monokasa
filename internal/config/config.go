@@ -60,6 +60,11 @@ type Config struct {
 	// місце" → BASE_URL/event/<slug>). Without it the bot omits the
 	// WebApp button and shows a plain URL hint instead.
 	BaseURL string
+
+	// PostersDir is where admin-uploaded show posters live. Defaults to
+	// /data/posters in the docker image (same volume as SQLite). Override
+	// to a relative path for local dev (./posters etc.).
+	PostersDir string
 }
 
 func Load() (Config, error) {
@@ -92,6 +97,7 @@ func Load() (Config, error) {
 	c.SMTPImplicitTLS = envBool("SMTP_IMPLICIT_TLS", false)
 	c.BotUsername = strings.TrimPrefix(os.Getenv("BOT_USERNAME"), "@")
 	c.BaseURL = strings.TrimRight(os.Getenv("BASE_URL"), "/")
+	c.PostersDir = env("POSTERS_DIR", "/data/posters")
 
 	if c.TGToken == "" {
 		return c, errors.New("TG_TOKEN is required")

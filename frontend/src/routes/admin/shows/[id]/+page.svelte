@@ -16,6 +16,38 @@
 	let editStartsAt = $state(''); // RFC3339 UTC, two-way bound to DateTimePicker
 	let editDescription = $state('');
 	let editPosterURL = $state('');
+	let uploading = $state(false);
+	let uploadError = $state('');
+
+	async function uploadPoster(file: File | undefined) {
+		if (!file) return;
+		uploadError = '';
+		uploading = true;
+		try {
+			const form = new FormData();
+			form.append('file', file);
+			const r = await fetch('/api/admin/posters', {
+				method: 'POST',
+				credentials: 'same-origin',
+				body: form
+			});
+			if (r.status === 401) {
+				window.location.href = '/admin/login';
+				return;
+			}
+			if (!r.ok) {
+				const err = (await r.json().catch(() => ({}))) as { detail?: string; error?: string };
+				uploadError = err.detail || err.error || `HTTP ${r.status}`;
+				return;
+			}
+			const { url } = (await r.json()) as { url: string };
+			editPosterURL = url;
+		} catch (e) {
+			uploadError = String(e);
+		} finally {
+			uploading = false;
+		}
+	}
 	let saving = $state(false);
 	let savedAt = $state<Date | null>(null);
 
@@ -206,17 +238,37 @@
 			</div>
 		</div>
 		<div>
-			<label for="poster" class="block text-sm text-neutral-400">Постер (URL картинки, https://…)</label>
-			<input
-				id="poster"
-				type="url"
-				bind:value={editPosterURL}
-				placeholder="https://example.com/poster.jpg"
-				class="mt-1 w-full rounded-md border border-neutral-800 bg-neutral-900 px-3 py-2 focus:border-neutral-600 focus:outline-none"
-			/>
-			{#if editPosterURL}
-				<img src={editPosterURL} alt="Прев'ю постера" class="mt-2 max-h-48 rounded-md border border-neutral-800" onerror={(e: Event) => ((e.target as HTMLImageElement).style.display = 'none')} />
-			{/if}
+			<label for="poster-file" class="block text-sm text-neutral-400">Постер</label>
+			<div class="mt-1 flex flex-col gap-2">
+				<div class="flex items-center gap-2">
+					<input
+						id="poster-file"
+						type="file"
+						accept="image/jpeg,image/png,image/webp,image/gif"
+						onchange={(e: Event) => uploadPoster((e.target as HTMLInputElement).files?.[0])}
+						disabled={uploading}
+						class="block w-full text-sm text-neutral-300 file:mr-3 file:rounded-md file:border-0 file:bg-neutral-800 file:px-3 file:py-1.5 file:text-sm file:font-medium file:text-neutral-200 hover:file:bg-neutral-700"
+					/>
+					{#if uploading}
+						<span class="text-xs text-neutral-500">завантажую…</span>
+					{/if}
+				</div>
+				<details class="text-xs text-neutral-500">
+					<summary class="cursor-pointer hover:text-neutral-300">або вставити URL</summary>
+					<input
+						type="url"
+						bind:value={editPosterURL}
+						placeholder="https://example.com/poster.jpg"
+						class="mt-2 w-full rounded-md border border-neutral-800 bg-neutral-900 px-3 py-2 text-sm text-neutral-100 focus:border-neutral-600 focus:outline-none"
+					/>
+				</details>
+				{#if editPosterURL}
+					<img src={editPosterURL} alt="Прев'ю постера" class="max-h-48 rounded-md border border-neutral-800" onerror={(e: Event) => ((e.target as HTMLImageElement).style.display = 'none')} />
+				{/if}
+				{#if uploadError}
+					<p class="text-xs text-red-400">{uploadError}</p>
+				{/if}
+			</div>
 		</div>
 		<div>
 			<label for="desc" class="block text-sm text-neutral-400">Опис події</label>

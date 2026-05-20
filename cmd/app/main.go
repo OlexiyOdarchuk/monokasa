@@ -33,6 +33,7 @@ import (
 	"github.com/OlexiyOdarchuk/monokasa/internal/email"
 	"github.com/OlexiyOdarchuk/monokasa/internal/metrics"
 	"github.com/OlexiyOdarchuk/monokasa/internal/pay"
+	"github.com/OlexiyOdarchuk/monokasa/internal/posters"
 	"github.com/OlexiyOdarchuk/monokasa/internal/public"
 	"github.com/OlexiyOdarchuk/monokasa/internal/store"
 	"github.com/OlexiyOdarchuk/monokasa/internal/ticket"
@@ -246,6 +247,14 @@ func main() {
 	})
 	adminH.Register(adminMux)
 
+	postersSvc, err := posters.New(cfg.PostersDir)
+	if err != nil {
+		fatal("posters", "err", err)
+	}
+	// Upload sits behind admin auth (writes to disk + serves URL back);
+	// serve is public (it's the URL we ship to every landing/event card).
+	adminMux.HandleFunc("POST /api/admin/posters", postersSvc.HandleUpload)
+
 	publicHandler := public.NewHandler(public.Config{
 		Store:       st,
 		Coder:       coder,
@@ -259,6 +268,7 @@ func main() {
 	mux.Handle("/webhook", hook)
 	mux.Handle("/debug/vars", expvar.Handler())
 	mux.Handle("/api/admin/", authHandler.RequireAuth(adminMux))
+	mux.HandleFunc("/posters/", postersSvc.HandleServe)
 	publicHandler.Register(mux)
 	authHandler.Register(mux)
 	scanner.Register(mux)
