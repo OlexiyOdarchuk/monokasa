@@ -775,12 +775,13 @@ type loginRequestBody struct {
 // returns a generic ok response. Doesn't leak whether the email
 // matched an existing buyer — anyone can request a link, and only
 // the inbox owner can use it.
+//
+// Dev-friendly: missing BASE_URL falls back to the request's own
+// scheme+host (covers local `make run` testing). Missing SMTP logs
+// the link to slog at WARN level instead of returning an error —
+// useful for trying the flow locally before signing up to Resend.
+// Both fallbacks are visibly noisy so an operator notices in prod.
 func (h *Handler) loginRequest(w http.ResponseWriter, r *http.Request) {
-	if h.loginMailer == nil || h.baseURL == "" {
-		writeError(w, http.StatusServiceUnavailable, "login_disabled",
-			"magic-link login needs SMTP and BASE_URL configured")
-		return
-	}
 	var req loginRequestBody
 	if !decodeJSON(w, r, &req) {
 		return
@@ -799,7 +800,16 @@ func (h *Handler) loginRequest(w http.ResponseWriter, r *http.Request) {
 		writeInternal(w, "create login token", err)
 		return
 	}
-	link := fmt.Sprintf("%s/my?token=%s", h.baseURL, url.QueryEscape(token))
+	link := fmt.Sprintf("%s/my?token=%s", h.publicOrigin(r), url.QueryEscape(token))
+	if h.loginMailer == nil {
+		// No SMTP configured. Log the link so the developer can copy
+		// it from console, but advertise that this is not safe for
+		// production (anyone reading logs can hijack the session).
+		slog.Warn("SMTP not configured — magic link printed in logs (NOT SAFE FOR PRODUCTION)",
+			"email", email, "link", link)
+		writeJSON(w, http.StatusOK, map[string]string{"status": "logged"})
+		return
+	}
 	// Send asynchronously — SMTP can be slow, no reason to make the
 	// buyer wait for the round-trip. Errors stay in the slog.
 	go func() {
@@ -812,6 +822,23 @@ func (h *Handler) loginRequest(w http.ResponseWriter, r *http.Request) {
 		slog.Info("login link sent", "email", email)
 	}()
 	writeJSON(w, http.StatusOK, map[string]string{"status": "sent"})
+}
+
+// publicOrigin returns BASE_URL when configured, otherwise reconstructs
+// scheme+host from the request. Both forms drop the trailing slash so
+// callers can append paths cleanly.
+func (h *Handler) publicOrigin(r *http.Request) string {
+	if h.baseURL != "" {
+		return h.baseURL
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if p := r.Header.Get("X-Forwarded-Proto"); p != "" {
+		scheme = p
+	}
+	return scheme + "://" + r.Host
 }
 
 // loginConsume validates the token from the magic link, mints a long-

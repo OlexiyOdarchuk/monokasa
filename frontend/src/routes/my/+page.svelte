@@ -4,7 +4,7 @@
 	import QRCode from 'qrcode';
 	import { publicApi, type BuyerTicket, ApiError } from '$lib/api';
 
-	type Mode = 'loading' | 'login' | 'sent' | 'tokenError' | 'tickets';
+	type Mode = 'loading' | 'login' | 'sent' | 'sentDev' | 'tokenError' | 'tickets';
 	let mode = $state<Mode>('loading');
 	let email = $state('');
 	let myEmail = $state('');
@@ -69,8 +69,13 @@
 		submitting = true;
 		error = '';
 		try {
-			await publicApi.post('/api/public/login/request', { email: email.trim() });
-			mode = 'sent';
+			const r = await publicApi.post<{ status: string }>('/api/public/login/request', {
+				email: email.trim()
+			});
+			// Server returns status: "logged" when SMTP isn't configured —
+			// the link went to server logs instead of email. Useful for
+			// local dev so the operator can copy it manually.
+			mode = r.status === 'logged' ? 'sentDev' : 'sent';
 		} catch (err) {
 			if (err instanceof ApiError) error = err.detail || err.code;
 			else error = String(err);
@@ -172,6 +177,20 @@
 			</p>
 			<p class="mt-2 text-xs text-neutral-500">
 				Не прийшло? Глянь у "Спам" або запроси ще раз через хвилину.
+			</p>
+		</div>
+	{:else if mode === 'sentDev'}
+		<div class="rounded-2xl border border-amber-900 bg-amber-950/40 p-6 text-center">
+			<div class="text-3xl">⚠️</div>
+			<h2 class="mt-2 text-lg font-medium">SMTP не налаштований</h2>
+			<p class="mt-2 text-sm text-neutral-300">
+				Magic-link <b>не</b> пішов поштою — він написаний у логах
+				сервера. Шукай рядок <code class="rounded bg-neutral-900 px-1.5 py-0.5 font-mono text-xs">magic link printed in logs</code>
+				і скопіюй URL звідти.
+			</p>
+			<p class="mt-3 text-xs text-neutral-500">
+				У проді обов'язково підняти SMTP — інакше будь-хто з доступом
+				до логів зможе залогінитись за чужий email.
 			</p>
 		</div>
 	{:else if mode === 'login'}
