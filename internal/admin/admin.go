@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/skip2/go-qrcode"
 
@@ -86,6 +87,9 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/admin/reservations/{id}/refund", h.markRefunded)
 
 	mux.HandleFunc("GET /api/admin/audit", h.listAudit)
+
+	mux.HandleFunc("GET /api/admin/organizer", h.getOrganizer)
+	mux.HandleFunc("PUT /api/admin/organizer", h.saveOrganizer)
 }
 
 // --- /me ---
@@ -888,6 +892,86 @@ func (h *Handler) listAudit(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// --- organizer profile ---
+
+type organizerResponse struct {
+	Name         string    `json:"name"`
+	Bio          string    `json:"bio"`
+	ContactEmail string    `json:"contact_email"`
+	Phone        string    `json:"phone"`
+	WebsiteURL   string    `json:"website_url"`
+	TelegramURL  string    `json:"telegram_url"`
+	InstagramURL string    `json:"instagram_url"`
+	FacebookURL  string    `json:"facebook_url"`
+	LogoURL      string    `json:"logo_url"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+func toOrganizerResponse(o store.Organizer) organizerResponse {
+	return organizerResponse{
+		Name: o.Name, Bio: o.Bio, ContactEmail: o.ContactEmail, Phone: o.Phone,
+		WebsiteURL: o.WebsiteURL, TelegramURL: o.TelegramURL,
+		InstagramURL: o.InstagramURL, FacebookURL: o.FacebookURL,
+		LogoURL: o.LogoURL, UpdatedAt: o.UpdatedAt,
+	}
+}
+
+func (h *Handler) getOrganizer(w http.ResponseWriter, r *http.Request) {
+	o, err := h.st.LoadOrganizer(r.Context())
+	if err != nil {
+		writeInternal(w, "load organizer", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toOrganizerResponse(o))
+}
+
+type saveOrganizerRequest struct {
+	Name         string `json:"name"`
+	Bio          string `json:"bio"`
+	ContactEmail string `json:"contact_email"`
+	Phone        string `json:"phone"`
+	WebsiteURL   string `json:"website_url"`
+	TelegramURL  string `json:"telegram_url"`
+	InstagramURL string `json:"instagram_url"`
+	FacebookURL  string `json:"facebook_url"`
+	LogoURL      string `json:"logo_url"`
+}
+
+func (h *Handler) saveOrganizer(w http.ResponseWriter, r *http.Request) {
+	var req saveOrganizerRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	// Trim everything — admin pastes URLs/emails from elsewhere and trailing
+	// whitespace silently breaks links. Length cap on bio so the table row
+	// stays sane; everything else is naturally bounded.
+	trim := func(s string) string { return strings.TrimSpace(s) }
+	name := trim(req.Name)
+	bio := trim(req.Bio)
+	if utf8.RuneCountInString(bio) > 2000 {
+		writeError(w, http.StatusBadRequest, "invalid_input",
+			"bio занадто довге (макс 2000 символів)")
+		return
+	}
+	saved, err := h.st.SaveOrganizer(r.Context(), store.Organizer{
+		Name: name, Bio: bio,
+		ContactEmail: trim(req.ContactEmail), Phone: trim(req.Phone),
+		WebsiteURL:   trim(req.WebsiteURL),
+		TelegramURL:  trim(req.TelegramURL),
+		InstagramURL: trim(req.InstagramURL),
+		FacebookURL:  trim(req.FacebookURL),
+		LogoURL:      trim(req.LogoURL),
+	})
+	if err != nil {
+		writeInternal(w, "save organizer", err)
+		return
+	}
+	h.audit(r, "organizer.update", "organizer:1", map[string]any{
+		"name": saved.Name, "has_bio": saved.Bio != "",
+	})
+	writeJSON(w, http.StatusOK, toOrganizerResponse(saved))
 }
 
 // --- helpers ---

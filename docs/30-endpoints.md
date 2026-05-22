@@ -69,6 +69,9 @@ polling'у. Кожне повідомлення — `data: {"type":"seat_status"
 Keep-alive comment `: ping\n\n` кожні 25 секунд. 503 `realtime_disabled`
 якщо hub не сконфігурований. Деталі → [[50-packages/realtime]].
 
+### `GET /api/public/organizer`
+Single-row профіль для сторінки `/about`. Завжди 200, навіть якщо все порожнє — порожні поля = сигнал "не налаштовано". Відповідь: `{name, bio, contact_email, phone, website_url, telegram_url, instagram_url, facebook_url, logo_url}`.
+
 ### Buyer "Мої квитки" (magic-link auth)
 
 | Метод | Шлях | Що робить |
@@ -106,6 +109,8 @@ based підхід раніше ламав cookie в деяких браузер
 | POST | `/api/admin/shows/{id}/categories` | upsert tier (creates or updates by name); cascade-syncs seat prices |
 | DELETE | `/api/admin/categories/{id}` | видалити tier (не торкає seats.category labels) |
 | GET | `/api/admin/shows/{id}/poster-qr.png` | PNG QR-код на /event/<slug> для друкованих афіш |
+| GET | `/api/admin/organizer` | single-row профіль (name/bio/socials) |
+| PUT | `/api/admin/organizer` | overwrite профіль (всі поля опційні; bio ≤2000 chars) |
 
 ## Auth
 

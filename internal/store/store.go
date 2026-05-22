@@ -226,6 +226,24 @@ var migrations = []string{
 	// усього") even after seats sell.
 	`ALTER TABLE shows ADD COLUMN kind TEXT NOT NULL DEFAULT 'seated'`,
 	`ALTER TABLE shows ADD COLUMN ga_capacity INTEGER NOT NULL DEFAULT 0`,
+	// Single-row "organizer profile" — name, bio, socials. Used by the
+	// public /about page and footer links. The CHECK(id=1) makes the
+	// table effectively a key/value record while keeping the rest of
+	// the codebase working with normal CRUD primitives.
+	`CREATE TABLE IF NOT EXISTS organizer (
+		id              INTEGER PRIMARY KEY CHECK (id = 1),
+		name            TEXT NOT NULL DEFAULT '',
+		bio             TEXT NOT NULL DEFAULT '',
+		contact_email   TEXT NOT NULL DEFAULT '',
+		phone           TEXT NOT NULL DEFAULT '',
+		website_url     TEXT NOT NULL DEFAULT '',
+		telegram_url    TEXT NOT NULL DEFAULT '',
+		instagram_url   TEXT NOT NULL DEFAULT '',
+		facebook_url    TEXT NOT NULL DEFAULT '',
+		logo_url        TEXT NOT NULL DEFAULT '',
+		updated_at      INTEGER NOT NULL DEFAULT 0
+	)`,
+	`INSERT OR IGNORE INTO organizer (id) VALUES (1)`,
 }
 
 // Errors.
@@ -2241,6 +2259,53 @@ func isUniqueErr(err error) bool {
 		return false
 	}
 	return strings.Contains(err.Error(), "UNIQUE constraint failed")
+}
+
+// --- organizer (single-row profile) ---
+
+const organizerCols = `name, bio, contact_email, phone, website_url, telegram_url, instagram_url, facebook_url, logo_url, updated_at`
+
+// LoadOrganizer returns the single organizer profile row. The row is
+// guaranteed to exist by the migration's INSERT OR IGNORE — so the
+// caller never sees ErrNoRows. An all-blank Organizer is the normal
+// "not yet configured" state, not an error.
+func (s *Store) LoadOrganizer(ctx context.Context) (Organizer, error) {
+	var o Organizer
+	var updatedAt int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT `+organizerCols+` FROM organizer WHERE id = 1`).Scan(
+		&o.Name, &o.Bio, &o.ContactEmail, &o.Phone,
+		&o.WebsiteURL, &o.TelegramURL, &o.InstagramURL, &o.FacebookURL,
+		&o.LogoURL, &updatedAt)
+	if err != nil {
+		return Organizer{}, err
+	}
+	if updatedAt > 0 {
+		o.UpdatedAt = time.Unix(updatedAt, 0)
+	}
+	return o, nil
+}
+
+// SaveOrganizer overwrites the single organizer row. The row is
+// pre-seeded by the migration so this is always an UPDATE — no INSERT
+// branch. UpdatedAt is stamped server-side and returned via the
+// returned Organizer; the caller's UpdatedAt is ignored.
+func (s *Store) SaveOrganizer(ctx context.Context, o Organizer) (Organizer, error) {
+	now := time.Now()
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE organizer SET
+			name=?, bio=?, contact_email=?, phone=?,
+			website_url=?, telegram_url=?, instagram_url=?, facebook_url=?,
+			logo_url=?, updated_at=?
+		WHERE id = 1`,
+		o.Name, o.Bio, o.ContactEmail, o.Phone,
+		o.WebsiteURL, o.TelegramURL, o.InstagramURL, o.FacebookURL,
+		o.LogoURL, now.Unix())
+	if err != nil {
+		return Organizer{}, err
+	}
+	o.UpdatedAt = now
+	return o, nil
 }
 
 // --- helpers ---

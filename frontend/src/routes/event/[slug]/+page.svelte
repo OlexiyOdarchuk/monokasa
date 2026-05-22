@@ -822,5 +822,9 @@
 			{/if}
 		{/if}
 		{/if}
+
+		<footer class="mt-12 border-t border-neutral-900 pt-4 pb-2 text-center text-xs text-neutral-600">
+			<a href="/about" class="hover:text-neutral-400">Про організатора</a>
+		</footer>
 	</main>
 {/if}

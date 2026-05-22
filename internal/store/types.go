@@ -222,6 +222,33 @@ type AuditEntry struct {
 	CreatedAt    time.Time
 }
 
+// Organizer is the single-row profile that the public /about page
+// renders: name, bio, socials, contact. Used as a soft footer on
+// event pages so buyers know who's behind the event. All fields are
+// optional — empty Organizer means /about renders a generic "Цей
+// інстанс ще не налаштований" stub.
+type Organizer struct {
+	Name         string
+	Bio          string
+	ContactEmail string
+	Phone        string
+	WebsiteURL   string
+	TelegramURL  string
+	InstagramURL string
+	FacebookURL  string
+	LogoURL      string
+	UpdatedAt    time.Time
+}
+
+// IsEmpty reports whether the organizer profile has any user-visible
+// fields filled in. Public /about uses this to decide between a real
+// rendering and a "не налаштовано" stub.
+func (o Organizer) IsEmpty() bool {
+	return o.Name == "" && o.Bio == "" && o.ContactEmail == "" &&
+		o.Phone == "" && o.WebsiteURL == "" && o.TelegramURL == "" &&
+		o.InstagramURL == "" && o.FacebookURL == "" && o.LogoURL == ""
+}
+
 // Session is a long-lived auth credential keyed by an opaque random Token.
 // Issued on successful login, looked up on every authed request, deleted
 // on logout. The token lives in an HttpOnly cookie on the client; the

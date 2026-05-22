@@ -119,6 +119,39 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/public/login/logout", h.loginLogout)
 	mux.HandleFunc("GET /api/public/my", h.myWhoami)
 	mux.HandleFunc("GET /api/public/my/tickets", h.myTickets)
+
+	mux.HandleFunc("GET /api/public/organizer", h.getOrganizer)
+}
+
+// --- GET /api/public/organizer ---
+//
+// Single-row profile rendered by /about. Always returns 200 — empty
+// fields are the "not yet configured" signal the SPA handles on its
+// own.
+type publicOrganizer struct {
+	Name         string `json:"name"`
+	Bio          string `json:"bio"`
+	ContactEmail string `json:"contact_email"`
+	Phone        string `json:"phone"`
+	WebsiteURL   string `json:"website_url"`
+	TelegramURL  string `json:"telegram_url"`
+	InstagramURL string `json:"instagram_url"`
+	FacebookURL  string `json:"facebook_url"`
+	LogoURL      string `json:"logo_url"`
+}
+
+func (h *Handler) getOrganizer(w http.ResponseWriter, r *http.Request) {
+	o, err := h.st.LoadOrganizer(r.Context())
+	if err != nil {
+		writeInternal(w, "load organizer", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, publicOrganizer{
+		Name: o.Name, Bio: o.Bio, ContactEmail: o.ContactEmail, Phone: o.Phone,
+		WebsiteURL: o.WebsiteURL, TelegramURL: o.TelegramURL,
+		InstagramURL: o.InstagramURL, FacebookURL: o.FacebookURL,
+		LogoURL: o.LogoURL,
+	})
 }
 
 // --- GET /api/public/shows/{slug}/events ---

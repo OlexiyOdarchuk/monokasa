@@ -74,8 +74,10 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 export const api = {
 	get: <T>(path: string) => request<T>('GET', path),
 	post: <T>(path: string, body?: unknown) => request<T>('POST', path, body),
+	put: <T>(path: string, body?: unknown) => request<T>('PUT', path, body),
 	patch: <T>(path: string, body?: unknown) => request<T>('PATCH', path, body),
-	del: <T>(path: string) => request<T>('DELETE', path)
+	del: <T>(path: string) => request<T>('DELETE', path),
+	req: <T>(method: string, path: string, body?: unknown) => request<T>(method, path, body)
 };
 
 // ---- typed response shapes (mirror internal/admin/admin.go) ----
@@ -184,6 +186,19 @@ export interface BuyerTicket {
 	created_at: string;
 	show: BuyerTicketShow;
 	items: BuyerTicketItem[];
+}
+
+export interface Organizer {
+	name: string;
+	bio: string;
+	contact_email: string;
+	phone: string;
+	website_url: string;
+	telegram_url: string;
+	instagram_url: string;
+	facebook_url: string;
+	logo_url: string;
+	updated_at?: string;
 }
 
 export interface AuditEntry {
