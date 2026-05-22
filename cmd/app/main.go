@@ -32,6 +32,7 @@ import (
 	"github.com/OlexiyOdarchuk/monokasa/internal/config"
 	"github.com/OlexiyOdarchuk/monokasa/internal/email"
 	"github.com/OlexiyOdarchuk/monokasa/internal/metrics"
+	"github.com/OlexiyOdarchuk/monokasa/internal/og"
 	"github.com/OlexiyOdarchuk/monokasa/internal/pay"
 	"github.com/OlexiyOdarchuk/monokasa/internal/posters"
 	"github.com/OlexiyOdarchuk/monokasa/internal/public"
@@ -295,6 +296,12 @@ func main() {
 	publicHandler.Register(mux)
 	authHandler.Register(mux)
 	scanner.Register(mux)
+	// Social-preview wrapper: GET /event/<slug> is the canonical URL we
+	// hand out (in QR posters, "copy link", buyer emails). Bots scraping
+	// it need OG meta tags they can read without running JS. Falls back
+	// to the plain SPA shell when slug doesn't resolve so the SvelteKit
+	// client still renders a 404 view.
+	mux.HandleFunc("GET /event/{slug}", eventOGHandler(st, spa, cfg.BaseURL))
 	// SPA on "/" is the catch-all — http.ServeMux picks the longest pattern
 	// match, so the specific routes above (and /health below) win for their
 	// exact paths; everything else falls through to the Svelte build.
@@ -990,6 +997,56 @@ func payRenderer(show pay.Show, seat pay.Seat, buyerName, qrPayload string) ([]b
 		ticket.Seat{Row: seat.Row, Col: seat.Col, Category: seat.Category},
 		buyerName, qrPayload,
 	)
+}
+
+// eventOGHandler serves the SPA shell with route-specific Open Graph
+// tags injected so social bots (Telegram, FB, Twitter, Slack, Discord)
+// get a rich preview when someone pastes the URL. Falls back to the
+// plain SPA if the slug doesn't resolve — the client-side router will
+// render its own 404 view in that case.
+func eventOGHandler(st *store.Store, spa *webui.Handler, baseURL string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		slug := r.PathValue("slug")
+		if slug == "" {
+			spa.ServeHTTP(w, r)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		show, err := st.LoadShowBySlug(ctx, slug)
+		if err != nil {
+			// Unknown slug or archived → let the SPA render its own
+			// "not found" view. Errors from the DB shouldn't break the
+			// page either; if SQLite is busy we still want to serve the
+			// shell, the client will then surface a friendlier message.
+			spa.ServeHTTP(w, r)
+			return
+		}
+		origin := strings.TrimRight(baseURL, "/")
+		if origin == "" {
+			scheme := "https"
+			if r.TLS == nil && r.Header.Get("X-Forwarded-Proto") != "https" {
+				scheme = "http"
+			}
+			origin = scheme + "://" + r.Host
+		}
+		props := og.Props{
+			URL:         origin + "/event/" + show.Slug,
+			Title:       show.Title,
+			Description: show.Description,
+			ImageURL:    og.AbsoluteImageURL(origin, show.PosterURL),
+			SiteName:    "monokasa",
+			StartsAt:    show.StartsAt,
+			Venue:       show.Venue,
+		}
+		body := og.Render(spa.IndexHTML(), props)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		// Short cache so a description/poster edit flows out within a
+		// reasonable window. Bots typically re-scrape on each share
+		// anyway, but humans land on the same URL too.
+		w.Header().Set("Cache-Control", "public, max-age=60")
+		_, _ = w.Write(body)
+	}
 }
 
 // --- /reconcile adapter ---

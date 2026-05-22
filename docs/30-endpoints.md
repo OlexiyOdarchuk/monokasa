@@ -13,6 +13,7 @@
 | `/webhook` | monobank Personal API | `cmd/app` |
 | `/health` | LB | `cmd/app` |
 | `/debug/vars` | expvar (Prometheus) | `internal/metrics` |
+| `/event/<slug>` | OG-wrap → embed SPA | `cmd/app` + [[50-packages/og]] |
 | `/` і інші статичні | embed SPA | [[50-packages/webui]] |
 
 ## Public (без авторизації)

@@ -86,3 +86,9 @@ func (h *Handler) writeIndex(w http.ResponseWriter) {
 	w.Header().Set("Cache-Control", "no-cache")
 	_, _ = w.Write(h.indexHTML)
 }
+
+// IndexHTML returns the raw embedded index.html for handlers that need
+// to inject route-specific markup (e.g. Open Graph meta tags for
+// /event/<slug>) before serving. The slice is shared — callers must
+// treat it as read-only and write a derived copy to the response.
+func (h *Handler) IndexHTML() []byte { return h.indexHTML }
