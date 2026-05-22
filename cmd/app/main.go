@@ -113,6 +113,10 @@ func main() {
 		return pay.Show{Slug: sh.Slug, Title: sh.Title, Venue: sh.Venue, StartsAt: sh.StartsAt}, nil
 	}
 
+	// notifyWaitlist is set later (after we've inspected SMTP config) but
+	// captured by closures here so the bot's user-cancel path can wire to
+	// the same dispatcher the sweep / admin-cancel paths use.
+	var notifyWaitlist waitlistNotifyFn
 	tg, err := bot.New(bot.Options{
 		Token:     cfg.TGToken,
 		Store:     botStore{st},
@@ -123,6 +127,11 @@ func main() {
 		Hold:      cfg.HoldDuration,
 		AdminTGID: cfg.AdminTGID,
 		Hub:       hub,
+		OnSeatsFreed: func(ctx context.Context, showID int64, count int) {
+			if notifyWaitlist != nil {
+				notifyWaitlist(ctx, showID, count)
+			}
+		},
 	})
 	if err != nil {
 		fatal("bot init", "err", err)
@@ -233,10 +242,6 @@ func main() {
 	adminMux := http.NewServeMux()
 	adminH := admin.NewHandler(st)
 	adminH.SetHub(hub)
-	// Waitlist notifier — declared up here because the admin cancel
-	// callback below closes over it. Set later (after we know we have
-	// SMTP) but Go captures by reference, so the late assignment lands.
-	var notifyWaitlist waitlistNotifyFn
 	// Best-effort notification fan-out: when admin force-cancels a
 	// reservation, ping the buyer through whichever channels are
 	// attached to their row. Failures get logged inside; the cancel

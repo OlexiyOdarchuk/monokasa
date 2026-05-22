@@ -209,6 +209,10 @@ type Bot struct {
 	jar        JarLookup    // optional — nil if jar link unparseable
 	hub        *realtime.Hub // optional — nil-safe Publish, skipped for tests
 	showFn     ShowFn
+	// onSeatsFreed fires after any user-cancel that releases seats. Main.go
+	// wires it to the waitlist notifier (and could add other side effects
+	// later). nil-safe: skipped when not configured.
+	onSeatsFreed func(ctx context.Context, showID int64, count int)
 
 	// pending tracks chat users mid-pick (accumulating seats in the
 	// inline keyboard) or mid-name-input (after tapping "Завершити"). Key
@@ -254,6 +258,10 @@ type Options struct {
 	Reconciler Reconciler    // optional
 	Jar        JarLookup     // optional
 	Hub        *realtime.Hub // optional; broadcasts seat changes to SSE subscribers
+	// OnSeatsFreed fires when a user cancels via /my and seats return to
+	// the pool. main.go wires this to the waitlist notifier so the next-
+	// in-line buyer gets pinged. nil = no-op.
+	OnSeatsFreed func(ctx context.Context, showID int64, count int)
 }
 
 func New(opts Options) (*Bot, error) {
@@ -269,7 +277,8 @@ func New(opts Options) (*Bot, error) {
 		baseURL: strings.TrimRight(opts.BaseURL, "/"),
 		jarLink: opts.JarLink, hold: opts.Hold, adminTGID: opts.AdminTGID,
 		reconciler: opts.Reconciler, jar: opts.Jar, hub: opts.Hub,
-		done: make(chan struct{}),
+		onSeatsFreed: opts.OnSeatsFreed,
+		done:         make(chan struct{}),
 	}
 	b.routes()
 	go b.sweepPending(time.Minute)
@@ -1012,6 +1021,9 @@ func (b *Bot) callbackCancel(c tele.Context, cb *tele.Callback) error {
 	b.hub.Publish(seat.ShowID, realtime.Event{
 		Type: "seat_status", SeatID: seat.ID, Status: realtime.SeatFree,
 	})
+	if b.onSeatsFreed != nil {
+		b.onSeatsFreed(ctx, seat.ShowID, 1)
+	}
 	_, err = b.tb.Send(cb.Sender,
 		fmt.Sprintf("Бронь ряд %d місце %d скасовано. Місце знов вільне.", seat.Row, seat.Col))
 	return err
@@ -1214,11 +1226,19 @@ func (b *Bot) callbackCancelOrder(c tele.Context, cb *tele.Callback) error {
 	}
 	_ = c.Respond(&tele.CallbackResponse{Text: "Скасовано"})
 	// Broadcast every freed seat to live SSE subscribers so anyone
-	// staring at the seat map sees them turn green immediately.
+	// staring at the seat map sees them turn green immediately, and
+	// count per-show to fire one waitlist notify per affected event.
+	perShow := make(map[int64]int, 1)
 	for _, s := range freed {
 		b.hub.Publish(s.ShowID, realtime.Event{
 			Type: "seat_status", SeatID: s.ID, Status: realtime.SeatFree,
 		})
+		perShow[s.ShowID]++
+	}
+	if b.onSeatsFreed != nil {
+		for showID, count := range perShow {
+			b.onSeatsFreed(ctx, showID, count)
+		}
 	}
 	// Edit the original message: drop the keyboard, add a strikethrough-
 	// style confirmation. tele.EditReplyMarkup is the lightweight path.
