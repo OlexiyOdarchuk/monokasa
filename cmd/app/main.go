@@ -265,14 +265,25 @@ func main() {
 	// serve is public (it's the URL we ship to every landing/event card).
 	adminMux.HandleFunc("POST /api/admin/posters", postersSvc.HandleUpload)
 
+	// Magic-link login wires SMTP into the public side. Optional —
+	// without SMTP_HOST set, payEmail is nil and /api/public/login/*
+	// returns 503 login_disabled, but everything else keeps working.
+	var loginMailer public.LoginMailer
+	if emailDelivery != nil {
+		loginMailer = buyerLoginMailer{sender: emailDelivery.(payEmail).sender, from: cfg.SMTPFrom}
+	}
+
 	publicHandler := public.NewHandler(public.Config{
-		Store:       st,
-		Coder:       coder,
-		JarLink:     cfg.JarLink,
-		Hold:        cfg.HoldDuration,
-		MinPrice:    cfg.PriceKopecks,
-		BotUsername: cfg.BotUsername,
-		Hub:         hub,
+		Store:         st,
+		Coder:         coder,
+		JarLink:       cfg.JarLink,
+		Hold:          cfg.HoldDuration,
+		MinPrice:      cfg.PriceKopecks,
+		BotUsername:   cfg.BotUsername,
+		Hub:           hub,
+		BaseURL:       cfg.BaseURL,
+		LoginMailer:   loginMailer,
+		SecureCookies: cfg.SecureCookies,
 	})
 
 	mux := http.NewServeMux()
@@ -855,6 +866,31 @@ func (p payNotifier) SendTicket(chatID int64, seat pay.Seat, pdf []byte) error {
 type payEmail struct {
 	sender *email.SMTPSender
 	from   string
+}
+
+// buyerLoginMailer composes the magic-link email for /my login.
+type buyerLoginMailer struct {
+	sender *email.SMTPSender
+	from   string
+}
+
+func (m buyerLoginMailer) SendLoginLink(ctx context.Context, to, link string) error {
+	body := fmt.Sprintf(`<!doctype html>
+<html><body style="font-family:system-ui,sans-serif;color:#111;line-height:1.5">
+<h2 style="margin:0 0 .5em">Вхід на monokasa</h2>
+<p>Тицьни на кнопку, щоб побачити всі свої квитки на цьому email:</p>
+<p style="margin:1.5em 0">
+  <a href="%s" style="background:#fbbe2c;color:#000;padding:.7em 1.2em;border-radius:.4em;text-decoration:none;font-weight:600">
+    Відкрити мої квитки
+  </a>
+</p>
+<p style="color:#666;font-size:.875em">Посилання живе 15 хвилин і працює лише один раз. Якщо ти не запитував — ігноруй цей лист.</p>
+</body></html>`, htmlEscape(link))
+	return m.sender.Send(ctx, email.Message{
+		To:       to,
+		Subject:  "Вхід на monokasa — твої квитки",
+		HTMLBody: body,
+	})
 }
 
 func (p payEmail) SendCancellationEmail(ctx context.Context, to, buyerName string, seat pay.Seat, show pay.Show) error {

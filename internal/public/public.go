@@ -8,6 +8,9 @@
 package public
 
 import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,36 +29,52 @@ import (
 	"github.com/OlexiyOdarchuk/monokasa/internal/token"
 )
 
+// LoginMailer sends the magic-link email when a buyer asks for one.
+// Decoupled from the package's other concerns so tests can drop in a
+// fake without involving SMTP.
+type LoginMailer interface {
+	SendLoginLink(ctx context.Context, to, link string) error
+}
+
 // Handler is the buyer-side API surface.
 type Handler struct {
-	st          *store.Store
-	coder       *token.Coder
-	jarLink     string // monobank jar URL; pay link is jarLink?a=…&t=…
-	hold        time.Duration
-	priceMin    int64  // minimum price kopecks; reservations below this are rejected
-	botUsername string // optional; when set, ReservationResponse carries a TG deep link
-	hub         *realtime.Hub
+	st             *store.Store
+	coder          *token.Coder
+	jarLink        string // monobank jar URL; pay link is jarLink?a=…&t=…
+	hold           time.Duration
+	priceMin       int64  // minimum price kopecks; reservations below this are rejected
+	botUsername    string // optional; when set, ReservationResponse carries a TG deep link
+	hub            *realtime.Hub
+	baseURL        string // public origin used when composing magic-link emails
+	loginMailer    LoginMailer
+	secureCookies  bool
 }
 
 type Config struct {
-	Store       *store.Store
-	Coder       *token.Coder
-	JarLink     string
-	Hold        time.Duration
-	MinPrice    int64
-	BotUsername string        // optional Telegram bot @-handle (no leading "@")
-	Hub         *realtime.Hub // optional; SSE seat updates skipped if nil
+	Store         *store.Store
+	Coder         *token.Coder
+	JarLink       string
+	Hold          time.Duration
+	MinPrice      int64
+	BotUsername   string        // optional Telegram bot @-handle (no leading "@")
+	Hub           *realtime.Hub // optional; SSE seat updates skipped if nil
+	BaseURL       string        // e.g. https://monokasa.app — needed for magic-link emails
+	LoginMailer   LoginMailer   // optional; magic-link login disabled when nil
+	SecureCookies bool          // true forces Secure cookie attribute in production
 }
 
 func NewHandler(c Config) *Handler {
 	return &Handler{
-		st:          c.Store,
-		coder:       c.Coder,
-		jarLink:     c.JarLink,
-		hold:        c.Hold,
-		priceMin:    c.MinPrice,
-		botUsername: c.BotUsername,
-		hub:         c.Hub,
+		st:            c.Store,
+		coder:         c.Coder,
+		jarLink:       c.JarLink,
+		hold:          c.Hold,
+		priceMin:      c.MinPrice,
+		botUsername:   c.BotUsername,
+		hub:           c.Hub,
+		baseURL:       strings.TrimRight(c.BaseURL, "/"),
+		loginMailer:   c.LoginMailer,
+		secureCookies: c.SecureCookies,
 	}
 }
 
@@ -93,6 +112,13 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/public/reservations", h.createReservation)
 	mux.HandleFunc("POST /api/public/orders", h.createOrder)
 	mux.HandleFunc("GET /api/public/reservations/{code}/status", h.reservationStatus)
+
+	// Buyer "Мої квитки" magic-link auth.
+	mux.HandleFunc("POST /api/public/login/request", h.loginRequest)
+	mux.HandleFunc("GET /api/public/login/consume", h.loginConsume)
+	mux.HandleFunc("POST /api/public/login/logout", h.loginLogout)
+	mux.HandleFunc("GET /api/public/my", h.myWhoami)
+	mux.HandleFunc("GET /api/public/my/tickets", h.myTickets)
 }
 
 // --- GET /api/public/shows/{slug}/events ---
@@ -733,6 +759,253 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
+
+// --- buyer auth (magic link) ---
+
+// buyerSessionCookie is the HttpOnly cookie holding the buyer's
+// long-lived session token. Separate from monokasa_admin so an admin
+// using the same browser doesn't collide.
+const buyerSessionCookie = "monokasa_buyer"
+
+type loginRequestBody struct {
+	Email string `json:"email"`
+}
+
+// loginRequest mints a fresh login token, emails the magic link, and
+// returns a generic ok response. Doesn't leak whether the email
+// matched an existing buyer — anyone can request a link, and only
+// the inbox owner can use it.
+func (h *Handler) loginRequest(w http.ResponseWriter, r *http.Request) {
+	if h.loginMailer == nil || h.baseURL == "" {
+		writeError(w, http.StatusServiceUnavailable, "login_disabled",
+			"magic-link login needs SMTP and BASE_URL configured")
+		return
+	}
+	var req loginRequestBody
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	email, err := normalizeEmail(req.Email)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_email", err.Error())
+		return
+	}
+	token, err := randomToken()
+	if err != nil {
+		writeInternal(w, "mint login token", err)
+		return
+	}
+	if err := h.st.CreateBuyerLoginToken(r.Context(), token, email); err != nil {
+		writeInternal(w, "create login token", err)
+		return
+	}
+	link := fmt.Sprintf("%s/my?token=%s", h.baseURL, url.QueryEscape(token))
+	// Send asynchronously — SMTP can be slow, no reason to make the
+	// buyer wait for the round-trip. Errors stay in the slog.
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		if err := h.loginMailer.SendLoginLink(ctx, email, link); err != nil {
+			slog.Error("send login link", "email", email, "err", err)
+			return
+		}
+		slog.Info("login link sent", "email", email)
+	}()
+	writeJSON(w, http.StatusOK, map[string]string{"status": "sent"})
+}
+
+// loginConsume validates the token from the magic link, mints a long-
+// lived cookie, and 303s the browser to /my. The 303 keeps the token
+// out of the address bar after the redirect.
+func (h *Handler) loginConsume(w http.ResponseWriter, r *http.Request) {
+	token := r.URL.Query().Get("token")
+	if token == "" {
+		writeError(w, http.StatusBadRequest, "missing_token", "")
+		return
+	}
+	email, err := h.st.ConsumeBuyerLoginToken(r.Context(), token)
+	switch {
+	case errors.Is(err, store.ErrCodeNotFound):
+		writeError(w, http.StatusBadRequest, "invalid_token",
+			"посилання застаріле або вже використане — запроси нове")
+		return
+	case errors.Is(err, store.ErrAlreadyClosed):
+		writeError(w, http.StatusBadRequest, "expired_token",
+			"посилання прострочене — запроси нове")
+		return
+	case err != nil:
+		writeInternal(w, "consume login token", err)
+		return
+	}
+	sessionToken, err := randomToken()
+	if err != nil {
+		writeInternal(w, "mint session token", err)
+		return
+	}
+	if err := h.st.CreateBuyerSession(r.Context(), sessionToken, email); err != nil {
+		writeInternal(w, "create buyer session", err)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     buyerSessionCookie,
+		Value:    sessionToken,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   h.cookieSecure(r),
+		MaxAge:   int(store.BuyerSessionTTL.Seconds()),
+	})
+	http.Redirect(w, r, "/my", http.StatusSeeOther)
+}
+
+// loginLogout clears the cookie + session row.
+func (h *Handler) loginLogout(w http.ResponseWriter, r *http.Request) {
+	if ck, err := r.Cookie(buyerSessionCookie); err == nil {
+		_ = h.st.DeleteBuyerSession(r.Context(), ck.Value)
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name: buyerSessionCookie, Value: "", Path: "/",
+		HttpOnly: true, MaxAge: -1, Secure: h.cookieSecure(r),
+	})
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// myWhoami returns the email tied to the current cookie, or 401.
+// Frontend uses this to decide login form vs ticket list on /my.
+func (h *Handler) myWhoami(w http.ResponseWriter, r *http.Request) {
+	email, ok := h.buyerFromRequest(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "no_session", "")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"email": email})
+}
+
+type buyerTicketResponse struct {
+	OrderID         int64                 `json:"order_id"`
+	OrderCode       string                `json:"order_code"`
+	OrderStatus     string                `json:"order_status"`
+	TotalKopecks    int64                 `json:"total_kopecks"`
+	CreatedAt       time.Time             `json:"created_at"`
+	Show            buyerTicketShow       `json:"show"`
+	Items           []buyerTicketItem     `json:"items"`
+}
+
+type buyerTicketShow struct {
+	Slug      string    `json:"slug"`
+	Title     string    `json:"title"`
+	Venue     string    `json:"venue"`
+	StartsAt  time.Time `json:"starts_at"`
+	PosterURL string    `json:"poster_url,omitempty"`
+}
+
+type buyerTicketItem struct {
+	ReservationID   int64      `json:"reservation_id"`
+	Row             int        `json:"row"`
+	Col             int        `json:"col"`
+	Label           string     `json:"label,omitempty"`
+	AttendeeName    string     `json:"attendee_name,omitempty"`
+	PriceKopecks    int64      `json:"price_kopecks"`
+	CancelledAt     *time.Time `json:"cancelled_at,omitempty"`
+	RefundedAt      *time.Time `json:"refunded_at,omitempty"`
+	QRPayload       string     `json:"qr_payload,omitempty"`
+	UsedAt          *time.Time `json:"used_at,omitempty"`
+}
+
+// myTickets returns every order under the current buyer's email,
+// grouped by order, with QR payloads on the items so the frontend can
+// render scannable QR codes inline.
+func (h *Handler) myTickets(w http.ResponseWriter, r *http.Request) {
+	email, ok := h.buyerFromRequest(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "no_session", "")
+		return
+	}
+	rows, err := h.st.BuyerTicketsByEmail(r.Context(), email)
+	if err != nil {
+		writeInternal(w, "buyer tickets", err)
+		return
+	}
+	// Group by Order.ID preserving the row order (which is order
+	// created_at DESC, reservation id ASC from the SQL).
+	byOrder := make(map[int64]int)
+	out := make([]buyerTicketResponse, 0)
+	for _, row := range rows {
+		idx, ok := byOrder[row.Order.ID]
+		if !ok {
+			status := "held"
+			switch {
+			case row.Order.CancelledAt != nil:
+				status = "cancelled"
+			case row.Order.ConfirmedAt != nil:
+				status = "paid"
+			case row.Order.ExpiresAt.Before(time.Now()):
+				status = "expired"
+			}
+			out = append(out, buyerTicketResponse{
+				OrderID: row.Order.ID, OrderCode: row.Order.Code,
+				OrderStatus: status, TotalKopecks: row.Order.TotalKopecks,
+				CreatedAt: row.Order.CreatedAt,
+				Show: buyerTicketShow{
+					Slug: row.Show.Slug, Title: row.Show.Title, Venue: row.Show.Venue,
+					StartsAt: row.Show.StartsAt, PosterURL: row.Show.PosterURL,
+				},
+			})
+			idx = len(out) - 1
+			byOrder[row.Order.ID] = idx
+		}
+		out[idx].Items = append(out[idx].Items, buyerTicketItem{
+			ReservationID: row.Reservation.ID,
+			Row:           row.Seat.Row, Col: row.Seat.Col, Label: row.Seat.Label,
+			AttendeeName: row.Reservation.AttendeeName,
+			PriceKopecks: row.Seat.PriceKopecks,
+			CancelledAt:  row.Reservation.CancelledAt,
+			RefundedAt:   row.Reservation.RefundedAt,
+			QRPayload:    row.QRPayload,
+			UsedAt:       row.UsedAt,
+		})
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// buyerFromRequest reads the session cookie + resolves to an email.
+func (h *Handler) buyerFromRequest(r *http.Request) (string, bool) {
+	ck, err := r.Cookie(buyerSessionCookie)
+	if err != nil || ck.Value == "" {
+		return "", false
+	}
+	email, err := h.st.FindBuyerSession(r.Context(), ck.Value)
+	if err != nil || email == "" {
+		return "", false
+	}
+	return email, true
+}
+
+// cookieSecure mirrors auth.Handler.setCookie's logic: honour the
+// explicit config flag, otherwise auto-detect HTTPS via TLS or the
+// X-Forwarded-Proto header (cloudflared, nginx).
+func (h *Handler) cookieSecure(r *http.Request) bool {
+	if h.secureCookies {
+		return true
+	}
+	if r.TLS != nil {
+		return true
+	}
+	return strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+}
+
+// randomToken returns a 256-bit hex string suitable for a cookie or
+// magic-link token. Crypto/rand-backed; no namespace collisions to
+// worry about given the 64-char keyspace.
+func randomToken() (string, error) {
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+// --- helpers ---
 
 func writeError(w http.ResponseWriter, status int, code, detail string) {
 	writeJSON(w, status, map[string]string{"error": code, "detail": detail})

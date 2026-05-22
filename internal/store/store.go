@@ -183,6 +183,28 @@ var migrations = []string{
 		WHERE refunded_at IS NULL
 		  AND order_id IS NOT NULL
 		  AND (SELECT refunded_at FROM orders WHERE orders.id = reservations.order_id) IS NOT NULL`,
+	// Buyer-side magic-link auth. Two short tables: one for short-lived
+	// login tokens emailed to the buyer, one for the resulting browser
+	// sessions. Sessions key on the lowercased buyer email so the
+	// /api/public/my page can look up orders by exact match.
+	`CREATE TABLE IF NOT EXISTS buyer_login_tokens (
+		id          INTEGER PRIMARY KEY,
+		token       TEXT NOT NULL UNIQUE,
+		email       TEXT NOT NULL,
+		created_at  INTEGER NOT NULL,
+		expires_at  INTEGER NOT NULL,
+		used_at     INTEGER
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_buyer_login_token ON buyer_login_tokens(token)`,
+	`CREATE TABLE IF NOT EXISTS buyer_sessions (
+		id          INTEGER PRIMARY KEY,
+		token       TEXT NOT NULL UNIQUE,
+		email       TEXT NOT NULL,
+		created_at  INTEGER NOT NULL,
+		expires_at  INTEGER NOT NULL
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_buyer_session_token ON buyer_sessions(token)`,
+	`CREATE INDEX IF NOT EXISTS idx_buyer_session_expires ON buyer_sessions(expires_at)`,
 }
 
 // Errors.
@@ -1688,6 +1710,246 @@ func (s *Store) SweepExpiredSessions(ctx context.Context) (int64, error) {
 	}
 	n, _ := res.RowsAffected()
 	return n, nil
+}
+
+// --- buyer auth (magic link) ---
+
+// BuyerLoginTokenTTL is how long a login token stays usable after
+// being emailed. Short enough that a leaked email link is useless
+// after lunch, long enough that the buyer has time to actually click.
+const BuyerLoginTokenTTL = 15 * time.Minute
+
+// BuyerSessionTTL is the lifetime of a successful buyer session
+// cookie. 30 days mirrors the admin session — buyer revisits between
+// shows shouldn't need a fresh login each time.
+const BuyerSessionTTL = 30 * 24 * time.Hour
+
+// CreateBuyerLoginToken inserts a fresh login token tied to an email.
+// Token is opaque; the email gets it via SMTP, the public handler
+// consumes it on click. Caller supplies the token bytes (so it can
+// crypto/rand-mint and immediately email without a round-trip).
+func (s *Store) CreateBuyerLoginToken(ctx context.Context, token, email string) error {
+	now := time.Now()
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO buyer_login_tokens(token, email, created_at, expires_at)
+		 VALUES (?, ?, ?, ?)`,
+		token, strings.ToLower(strings.TrimSpace(email)),
+		now.Unix(), now.Add(BuyerLoginTokenTTL).Unix())
+	return err
+}
+
+// ConsumeBuyerLoginToken validates and one-shot-burns a login token,
+// returning the email it was issued for. ErrCodeNotFound for unknown
+// tokens, ErrAlreadyClosed for tokens already used or expired.
+func (s *Store) ConsumeBuyerLoginToken(ctx context.Context, token string) (string, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+
+	var email string
+	var expiresAt int64
+	var usedAt sql.NullInt64
+	err = tx.QueryRowContext(ctx,
+		`SELECT email, expires_at, used_at FROM buyer_login_tokens WHERE token = ?`,
+		token).Scan(&email, &expiresAt, &usedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrCodeNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+	if usedAt.Valid {
+		return "", ErrAlreadyClosed
+	}
+	if expiresAt < time.Now().Unix() {
+		return "", ErrAlreadyClosed
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE buyer_login_tokens SET used_at = ? WHERE token = ?`,
+		time.Now().Unix(), token); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return email, nil
+}
+
+// CreateBuyerSession persists a long-lived buyer cookie token.
+func (s *Store) CreateBuyerSession(ctx context.Context, token, email string) error {
+	now := time.Now()
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO buyer_sessions(token, email, created_at, expires_at)
+		 VALUES (?, ?, ?, ?)`,
+		token, strings.ToLower(strings.TrimSpace(email)),
+		now.Unix(), now.Add(BuyerSessionTTL).Unix())
+	return err
+}
+
+// FindBuyerSession returns the buyer email tied to this cookie token,
+// or ErrCodeNotFound for unknown/expired sessions.
+func (s *Store) FindBuyerSession(ctx context.Context, token string) (string, error) {
+	var email string
+	var expiresAt int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT email, expires_at FROM buyer_sessions WHERE token = ?`,
+		token).Scan(&email, &expiresAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrCodeNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+	if expiresAt < time.Now().Unix() {
+		return "", ErrCodeNotFound
+	}
+	return email, nil
+}
+
+// DeleteBuyerSession kills a single cookie token. Used by logout.
+func (s *Store) DeleteBuyerSession(ctx context.Context, token string) error {
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM buyer_sessions WHERE token = ?`, token)
+	return err
+}
+
+// SweepBuyerSessions deletes expired buyer cookies + spent/expired
+// login tokens. Idempotent.
+func (s *Store) SweepBuyerSessions(ctx context.Context) (int64, error) {
+	now := time.Now().Unix()
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM buyer_sessions WHERE expires_at < ?`, now)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	if _, err := s.db.ExecContext(ctx,
+		`DELETE FROM buyer_login_tokens WHERE expires_at < ? OR used_at IS NOT NULL`, now); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
+// BuyerTicketsByEmail returns every ticket bought under this email.
+// Each row carries the full order/show/reservation/seat + ticket QR
+// payload (empty when the order isn't paid yet). The buyer-side
+// "Мої квитки" page groups by Order.ID; we return flat rows so the
+// SQL stays a single round-trip.
+//
+// Matches case-insensitively on buyer_email — addresses in monobank
+// receipts get cased inconsistently, and buyers re-typing for the
+// magic-link form will use whatever capitalization they remember.
+func (s *Store) BuyerTicketsByEmail(ctx context.Context, email string) ([]BuyerTicketRow, error) {
+	normalized := strings.ToLower(strings.TrimSpace(email))
+	if normalized == "" {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT
+		    o.id, o.code, o.buyer_name, o.buyer_email, o.tg_user_id, o.tg_chat_id,
+		    o.total_kopecks, o.created_at, o.expires_at,
+		    o.confirmed_at, o.cancelled_at, o.reminded_at, o.refunded_at,
+		    sh.id, sh.slug, sh.title, sh.venue, sh.starts_at,
+		    sh.description, sh.poster_url,
+		    `+resCols+`, r.cancelled_at,
+		    s.id, s.show_id, s.row, s.col, s.x, s.y,
+		    s.label, s.category, s.price_kopecks, s.sellable,
+		    t.qr_payload, t.used_at
+		FROM orders o
+		JOIN reservations r ON r.order_id = o.id
+		JOIN seats s ON s.id = r.seat_id
+		JOIN shows sh ON sh.id = s.show_id
+		LEFT JOIN tickets t ON t.reservation_id = r.id
+		WHERE LOWER(o.buyer_email) = ?
+		ORDER BY o.created_at DESC, r.id`, normalized)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []BuyerTicketRow
+	for rows.Next() {
+		var row BuyerTicketRow
+		var (
+			orderCreatedAt, orderExpiresAt                                       int64
+			orderConf, orderCancelled, orderReminded, orderRefunded              sql.NullInt64
+			showStartsAt                                                         int64
+			qrPayload                                                            sql.NullString
+			ticketUsedAt                                                         sql.NullInt64
+		)
+		err := rows.Scan(
+			&row.Order.ID, &row.Order.Code, &row.Order.BuyerName, &row.Order.BuyerEmail,
+			&row.Order.TGUserID, &row.Order.TGChatID,
+			&row.Order.TotalKopecks, &orderCreatedAt, &orderExpiresAt,
+			&orderConf, &orderCancelled, &orderReminded, &orderRefunded,
+			&row.Show.ID, &row.Show.Slug, &row.Show.Title, &row.Show.Venue, &showStartsAt,
+			&row.Show.Description, &row.Show.PosterURL,
+			// reservation: matches resCols + cancelled_at + seat block layout
+			&row.Reservation.ID, &row.Reservation.SeatID,
+			&row.Reservation.TGUserID, &row.Reservation.TGChatID,
+			&row.Reservation.BuyerName, &row.Reservation.BuyerEmail,
+			&row.Reservation.AttendeeName, &row.Reservation.Code,
+			scanTime(&row.Reservation.CreatedAt), scanTime(&row.Reservation.ExpiresAt),
+			new(sql.NullInt64), new(sql.NullInt64), new(sql.NullInt64), // confirmed_at, refunded_at, cancelled_at
+			&row.Seat.ID, &row.Seat.ShowID, &row.Seat.Row, &row.Seat.Col,
+			&row.Seat.X, &row.Seat.Y,
+			&row.Seat.Label, &row.Seat.Category, &row.Seat.PriceKopecks, new(int),
+			&qrPayload, &ticketUsedAt,
+		)
+		if err != nil {
+			return nil, err
+		}
+		row.Order.CreatedAt = time.Unix(orderCreatedAt, 0)
+		row.Order.ExpiresAt = time.Unix(orderExpiresAt, 0)
+		if orderConf.Valid {
+			t := time.Unix(orderConf.Int64, 0)
+			row.Order.ConfirmedAt = &t
+		}
+		if orderCancelled.Valid {
+			t := time.Unix(orderCancelled.Int64, 0)
+			row.Order.CancelledAt = &t
+		}
+		if orderReminded.Valid {
+			t := time.Unix(orderReminded.Int64, 0)
+			row.Order.RemindedAt = &t
+		}
+		if orderRefunded.Valid {
+			t := time.Unix(orderRefunded.Int64, 0)
+			row.Order.RefundedAt = &t
+		}
+		row.Show.StartsAt = time.Unix(showStartsAt, 0)
+		// Re-scan reservation cancelled/refunded via a focused query —
+		// the placeholders above kept positional alignment but we want
+		// real values for the UI's status badges.
+		// (Simpler than another set of out-args in the giant Scan.)
+		var resCancelled, resRefunded sql.NullInt64
+		if err := s.db.QueryRowContext(ctx,
+			`SELECT cancelled_at, refunded_at FROM reservations WHERE id = ?`,
+			row.Reservation.ID).Scan(&resCancelled, &resRefunded); err == nil {
+			if resCancelled.Valid {
+				t := time.Unix(resCancelled.Int64, 0)
+				row.Reservation.CancelledAt = &t
+			}
+			if resRefunded.Valid {
+				t := time.Unix(resRefunded.Int64, 0)
+				row.Reservation.RefundedAt = &t
+			}
+		}
+		if row.Order.ConfirmedAt != nil {
+			row.Reservation.ConfirmedAt = row.Order.ConfirmedAt
+		}
+		if qrPayload.Valid {
+			row.QRPayload = qrPayload.String
+		}
+		if ticketUsedAt.Valid {
+			t := time.Unix(ticketUsedAt.Int64, 0)
+			row.UsedAt = &t
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
 }
 
 // --- refunds ---

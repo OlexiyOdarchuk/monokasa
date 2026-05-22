@@ -149,6 +149,39 @@ export interface Guest {
 	seat: SeatBrief;
 }
 
+// --- buyer "Мої квитки" (magic-link auth) ---
+
+export interface BuyerTicketItem {
+	reservation_id: number;
+	row: number;
+	col: number;
+	label?: string;
+	attendee_name?: string;
+	price_kopecks: number;
+	cancelled_at?: string | null;
+	refunded_at?: string | null;
+	qr_payload?: string;
+	used_at?: string | null;
+}
+
+export interface BuyerTicketShow {
+	slug: string;
+	title: string;
+	venue: string;
+	starts_at: string;
+	poster_url?: string;
+}
+
+export interface BuyerTicket {
+	order_id: number;
+	order_code: string;
+	order_status: 'paid' | 'held' | 'expired' | 'cancelled';
+	total_kopecks: number;
+	created_at: string;
+	show: BuyerTicketShow;
+	items: BuyerTicketItem[];
+}
+
 export interface AuditEntry {
 	id: number;
 	actor_user_id: number;

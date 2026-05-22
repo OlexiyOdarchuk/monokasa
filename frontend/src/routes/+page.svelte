@@ -120,6 +120,8 @@
 	{/if}
 
 	<footer class="mt-16 border-t border-neutral-900 pt-6 pb-8 text-center text-xs text-neutral-600">
+		<a href="/my" class="hover:text-neutral-400">🎟 Мої квитки</a>
+		<span class="mx-2">·</span>
 		<a href="/admin/login" class="hover:text-neutral-400">Вхід для адміна</a>
 	</footer>
 </main>

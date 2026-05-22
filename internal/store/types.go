@@ -162,6 +162,22 @@ type User struct {
 	CreatedAt    time.Time
 }
 
+// BuyerTicketRow is one ticket-shaped row returned by BuyerTicketsByEmail.
+// Each row carries everything needed to render the buyer's "Мої квитки"
+// page: order context, show context, reservation+seat, and ticket
+// metadata when issued. Flat (not nested) so the SQL can deliver it in
+// one query — the caller groups by Order.ID for display.
+type BuyerTicketRow struct {
+	Order       Order
+	Show        Show
+	Reservation Reservation
+	Seat        Seat
+	// QRPayload + UsedAt come from the tickets table. Both zero-valued
+	// when the order hasn't been confirmed yet (no ticket row exists).
+	QRPayload string
+	UsedAt    *time.Time
+}
+
 // AuditEntry is one admin action recorded in the audit_log table.
 // ActorEmail is denormalised at write time so a future user deletion
 // doesn't blank the trail. Details is a free-form JSON blob — callers
