@@ -292,9 +292,17 @@
 					На вході відкривай PDF з телефону — охорона сканує QR.
 				</p>
 			</div>
-			<a href="/" class="mt-5 inline-block text-sm text-emerald-300 hover:underline">
-				← До списку подій
-			</a>
+			<div class="mt-5 flex flex-col items-center gap-2">
+				<a
+					href="/my"
+					class="rounded-md bg-[var(--color-brand)] px-4 py-2 text-sm font-medium text-black hover:bg-[var(--color-brand-hover)]"
+				>
+					🎟 Подивитися всі мої квитки
+				</a>
+				<a href="/" class="text-sm text-emerald-300 hover:underline">
+					← До списку подій
+				</a>
+			</div>
 		</div>
 	</main>
 {:else if success && show && (payStatus === 'expired' || payStatus === 'cancelled')}

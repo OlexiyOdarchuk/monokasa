@@ -157,16 +157,84 @@ godotenv підхопить.
 ### SMTP (для email-доставки)
 
 Без цих змінних web-покупці все одно зможуть оплатити, просто PDF на
-email не прилетить (бот-flow не торкається).
+email не прилетить, і `/my` magic-link login не запрацює (бот-flow не
+торкається).
 
 | змінна | за замовч. | що це |
 |---|---|---|
-| `SMTP_HOST` | (порожньо) | напр. `smtp.gmail.com`, `smtp.resend.com` |
+| `SMTP_HOST` | (порожньо) | напр. `smtp.resend.com`, `smtp.gmail.com` |
 | `SMTP_PORT` | `587` | 587 для STARTTLS, 465 для implicit TLS |
 | `SMTP_USER` | (порожньо) | логін SMTP |
 | `SMTP_PASS` | (порожньо) | пароль / API-key |
 | `SMTP_FROM` | (порожньо) | From-адреса (рекомендується мати SPF/DKIM) |
 | `SMTP_IMPLICIT_TLS` | `false` | `true` для портів типу 465 |
+
+#### Який SMTP підняти
+
+monokasa шле відносно мало пошти (1 лист на покупку + magic-link на
+вхід). Не треба self-host postfix; візьми готовий relay-провайдер.
+
+| Провайдер | Free tier | Що вписати |
+|---|---|---|
+| **Resend** (рекомендую) | 100/день, 3000/міс | `SMTP_HOST=smtp.resend.com SMTP_PORT=465 SMTP_USER=resend SMTP_PASS=<API key> SMTP_IMPLICIT_TLS=true` |
+| **Brevo** (Sendinblue) | 300/день | `SMTP_HOST=smtp-relay.brevo.com SMTP_PORT=587 SMTP_USER=<твій логін> SMTP_PASS=<SMTP key з панелі>` |
+| **Gmail (App Password)** | ~100/день, неофіційно | `SMTP_HOST=smtp.gmail.com SMTP_PORT=587 SMTP_USER=ти@gmail.com SMTP_PASS=<16-знач. app password>` |
+| **Mailgun** | $35/міс після 3-міс. trial | `smtp.mailgun.org:587`, full domain verification |
+| **SendGrid** | 100/день | `smtp.sendgrid.net:587` |
+
+##### Resend (5 хвилин від ідеї до робочого SMTP)
+
+1. Зареєструйся на [resend.com](https://resend.com) (картка не потрібна).
+2. **Domains → Add Domain** — додай свій домен (напр. `monokasa.app`)
+   і пропиши 3 DNS-записи (SPF, DKIM, DMARC), які покаже панель.
+   Без свого домена можна стартувати з `onboarding@resend.dev` — але
+   тільки для тестів, проду не годиться (низька deliverability).
+3. **API Keys → Create API Key** — обмежений на send only, скопіюй
+   значення.
+4. У `.env`:
+   ```
+   SMTP_HOST=smtp.resend.com
+   SMTP_PORT=465
+   SMTP_USER=resend
+   SMTP_PASS=re_abc...
+   SMTP_FROM=tickets@monokasa.app
+   SMTP_IMPLICIT_TLS=true
+   ```
+5. Перезапусти контейнер. У логах має бути `smtp ready host=smtp.resend.com from=tickets@monokasa.app`.
+
+##### Gmail (швидкий старт, якщо просто потестити)
+
+Стандартний пароль Gmail тут не запрацює — потрібен **App Password**:
+
+1. На своєму Google-аккаунті [увімкни 2-Step Verification](https://myaccount.google.com/security).
+2. Зайди в [App Passwords](https://myaccount.google.com/apppasswords),
+   назви app "monokasa" → отримаєш 16-знаковий код.
+3. У `.env`:
+   ```
+   SMTP_HOST=smtp.gmail.com
+   SMTP_PORT=587
+   SMTP_USER=ти@gmail.com
+   SMTP_PASS=abcd efgh ijkl mnop      # 16 знаків з app password
+   SMTP_FROM=ти@gmail.com
+   ```
+4. ⚠️ Гугл часто кидає такі листи в спам, бо Gmail не вважає твою
+   адресу transactional. Для прода — Resend або інший дедикований SMTP.
+
+##### Перевірка
+
+Після старту з SMTP в логах має з'явитися:
+```
+level=INFO msg="smtp ready" host=smtp.resend.com from=tickets@...
+```
+Купи тестовий квиток (або тицьни /my і запроси magic-link на свій
+email). Якщо лист не прийшов:
+- Глянь логи на `level=ERROR msg="send login link"` чи аналогічне з
+  pay-flow — там буде причина (типово неправильний user/pass або
+  заблокована від домена).
+- Перевір SPF/DKIM/DMARC у твого домена — без них листи кидаються в
+  спам. У Resend панелі є "Verify" кнопка.
+- Спробуй надіслати тестовий лист напряму через `swaks` або сайт
+  провайдера — щоб виключити DNS issues.
 
 ### Initial show (тільки якщо БД порожня)
 

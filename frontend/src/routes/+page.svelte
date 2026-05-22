@@ -33,8 +33,22 @@
 	<title>monokasa — квитки на події</title>
 </svelte:head>
 
+<nav class="border-b border-neutral-900">
+	<div class="mx-auto flex max-w-3xl items-center justify-between gap-3 px-4 py-3 sm:px-6">
+		<a href="/" class="text-base font-semibold tracking-tight hover:text-white">
+			monokasa
+		</a>
+		<a
+			href="/my"
+			class="inline-flex items-center gap-1.5 rounded-md border border-neutral-700 bg-neutral-900 px-3 py-1.5 text-sm font-medium text-neutral-200 hover:border-neutral-500 hover:bg-neutral-800"
+		>
+			🎟 Мої квитки
+		</a>
+	</div>
+</nav>
+
 <main class="mx-auto max-w-3xl p-4 sm:p-6">
-	<header class="mt-4 mb-8 text-center sm:mt-12 sm:mb-12">
+	<header class="mt-2 mb-8 text-center sm:mt-8 sm:mb-12">
 		<h1 class="text-4xl font-bold tracking-tight sm:text-5xl">monokasa</h1>
 		<p class="mt-2 text-neutral-400">Квитки на події через monobank</p>
 	</header>
@@ -120,8 +134,6 @@
 	{/if}
 
 	<footer class="mt-16 border-t border-neutral-900 pt-6 pb-8 text-center text-xs text-neutral-600">
-		<a href="/my" class="hover:text-neutral-400">🎟 Мої квитки</a>
-		<span class="mx-2">·</span>
 		<a href="/admin/login" class="hover:text-neutral-400">Вхід для адміна</a>
 	</footer>
 </main>
