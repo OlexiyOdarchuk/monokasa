@@ -1253,10 +1253,24 @@ func writeInternal(w http.ResponseWriter, op string, err error) {
 	writeError(w, http.StatusInternalServerError, "internal", "")
 }
 
+// maxJSONBody caps every JSON-decoded request at 64 KiB. Our biggest
+// payloads (seat batch updates, organizer bio) easily fit; an attacker
+// trying to OOM us with a multi-GB body hits MaxBytesReader instead.
+const maxJSONBody = 64 << 10
+
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBody)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
+		// MaxBytesReader sets *MaxBytesError on Decode; surface a
+		// stable error code so the SPA can show a friendly message.
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			writeError(w, http.StatusRequestEntityTooLarge, "body_too_large",
+				fmt.Sprintf("body must be ≤ %d bytes", maxJSONBody))
+			return false
+		}
 		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
 		return false
 	}

@@ -25,6 +25,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/OlexiyOdarchuk/monokasa/internal/store"
+	"github.com/OlexiyOdarchuk/monokasa/internal/web"
 )
 
 // Tunables.
@@ -66,13 +67,32 @@ type Store interface {
 type Handler struct {
 	st            Store
 	secureCookies bool // set true when the public origin is HTTPS-only
+	limiter       *web.Limiter
 }
 
 // NewHandler wires the auth package to a Store and a deployment hint.
 // secureCookies should be true in production behind HTTPS; false for
 // localhost development.
 func NewHandler(s Store, secureCookies bool) *Handler {
-	return &Handler{st: s, secureCookies: secureCookies}
+	// 1 attempt per 6s sustained, burst 5 — covers a human fat-finger
+	// while making online bcrypt brute force infeasible (bcrypt cost
+	// 12 ≈ 250ms per check, so 5/6s gives ~50 hours per million tries
+	// per IP — already lost cause for the attacker).
+	return &Handler{st: s, secureCookies: secureCookies, limiter: web.NewLimiter(1.0/6, 5)}
+}
+
+// RunGC trims idle limiter buckets so the map doesn't grow unbounded.
+func (h *Handler) RunGC(ctx context.Context, every, idleMax time.Duration) {
+	tick := time.NewTicker(every)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			h.limiter.GC(idleMax)
+		}
+	}
 }
 
 // Register attaches the login/logout routes to a mux.
@@ -166,6 +186,11 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 		}
 		writeLoginForm(w, http.StatusOK, "")
 	case http.MethodPost:
+		if !h.limiter.Allow(web.ClientIP(r)) {
+			writeLoginForm(w, http.StatusTooManyRequests,
+				"забагато спроб — почекай хвилину")
+			return
+		}
 		if err := r.ParseForm(); err != nil {
 			writeLoginForm(w, http.StatusBadRequest, "помилка форми")
 			return

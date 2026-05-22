@@ -27,6 +27,7 @@ import (
 	"github.com/OlexiyOdarchuk/monokasa/internal/realtime"
 	"github.com/OlexiyOdarchuk/monokasa/internal/store"
 	"github.com/OlexiyOdarchuk/monokasa/internal/token"
+	"github.com/OlexiyOdarchuk/monokasa/internal/web"
 )
 
 // LoginMailer sends the magic-link email when a buyer asks for one.
@@ -49,6 +50,13 @@ type Handler struct {
 	loginMailer        LoginMailer
 	secureCookies      bool
 	freeOrderConfirmer FreeOrderConfirmer // optional; called for 0-kopeck orders so 100%-off promos auto-issue tickets
+
+	// Per-IP token buckets in front of the abuse-prone endpoints.
+	// Tuned conservatively: real users hit each of these maybe once
+	// every few minutes; anything sustained at >burst is a bot.
+	loginLimiter    *web.Limiter // POST /login/request
+	waitlistLimiter *web.Limiter // POST /waitlist
+	orderLimiter    *web.Limiter // POST /orders + /reservations
 }
 
 // FreeOrderConfirmer is the hook the handler calls after creating an
@@ -85,6 +93,31 @@ func NewHandler(c Config) *Handler {
 		loginMailer:        c.LoginMailer,
 		secureCookies:      c.SecureCookies,
 		freeOrderConfirmer: c.FreeOrderConfirmer,
+		// Magic-link send + waitlist signups both trigger outbound
+		// mail; cap at 1 per 6s sustained with burst 3 so a quick
+		// double-tap is fine but a script can't spam our SMTP relay.
+		loginLimiter:    web.NewLimiter(1.0/6, 3),
+		waitlistLimiter: web.NewLimiter(1.0/6, 3),
+		// Order creation is more forgiving — burst 10 covers the
+		// honest "oh wait wrong show, retry" pattern; sustained 1/s.
+		orderLimiter: web.NewLimiter(1, 10),
+	}
+}
+
+// RunGC trims idle limiter buckets so the maps don't grow unbounded
+// across the show's lifetime. Call from main with a long interval.
+func (h *Handler) RunGC(ctx context.Context, every, idleMax time.Duration) {
+	tick := time.NewTicker(every)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			h.loginLimiter.GC(idleMax)
+			h.waitlistLimiter.GC(idleMax)
+			h.orderLimiter.GC(idleMax)
+		}
 	}
 }
 
@@ -143,6 +176,11 @@ type joinWaitlistRequest struct {
 }
 
 func (h *Handler) joinWaitlist(w http.ResponseWriter, r *http.Request) {
+	if !h.waitlistLimiter.Allow(web.ClientIP(r)) {
+		writeError(w, http.StatusTooManyRequests, "rate_limited",
+			"забагато спроб — почекай хвилину")
+		return
+	}
 	var req joinWaitlistRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -637,6 +675,11 @@ type createReservationResponse struct {
 }
 
 func (h *Handler) createReservation(w http.ResponseWriter, r *http.Request) {
+	if !h.orderLimiter.Allow(web.ClientIP(r)) {
+		writeError(w, http.StatusTooManyRequests, "rate_limited",
+			"забагато спроб — почекай")
+		return
+	}
 	var req createReservationRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -792,6 +835,11 @@ type createOrderResponse struct {
 }
 
 func (h *Handler) createOrder(w http.ResponseWriter, r *http.Request) {
+	if !h.orderLimiter.Allow(web.ClientIP(r)) {
+		writeError(w, http.StatusTooManyRequests, "rate_limited",
+			"забагато спроб — почекай")
+		return
+	}
 	var req createOrderRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -1115,6 +1163,11 @@ type loginRequestBody struct {
 // useful for trying the flow locally before signing up to Resend.
 // Both fallbacks are visibly noisy so an operator notices in prod.
 func (h *Handler) loginRequest(w http.ResponseWriter, r *http.Request) {
+	if !h.loginLimiter.Allow(web.ClientIP(r)) {
+		writeError(w, http.StatusTooManyRequests, "rate_limited",
+			"забагато спроб — почекай хвилину")
+		return
+	}
 	var req loginRequestBody
 	if !decodeJSON(w, r, &req) {
 		return
@@ -1397,10 +1450,22 @@ func writeInternal(w http.ResponseWriter, op string, err error) {
 	writeError(w, http.StatusInternalServerError, "internal", "")
 }
 
+// maxJSONBody caps every JSON-decoded request at 64 KiB. Buyer order
+// (20 seat ids + attendee names + names) easily fits; this stops an
+// attacker from OOMing the process with a giant body.
+const maxJSONBody = 64 << 10
+
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBody)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			writeError(w, http.StatusRequestEntityTooLarge, "body_too_large",
+				fmt.Sprintf("body must be ≤ %d bytes", maxJSONBody))
+			return false
+		}
 		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
 		return false
 	}

@@ -374,6 +374,11 @@ func main() {
 
 	// GC idle rate-limit buckets so the map doesn't grow over the show's lifetime.
 	go scanner.RunGC(ctx, 10*time.Minute, 30*time.Minute)
+	// Rate-limiter bucket GC: prevents the per-IP maps from growing
+	// unbounded across the show's lifetime. Run rarely; idle entries
+	// only consume a few hundred bytes each.
+	go publicHandler.RunGC(ctx, 10*time.Minute, 30*time.Minute)
+	go authHandler.RunGC(ctx, 10*time.Minute, 30*time.Minute)
 
 	// Drop expired session rows hourly. Cheap query (indexed) with no impact
 	// on user-visible behaviour — FindSession already rejects expired tokens

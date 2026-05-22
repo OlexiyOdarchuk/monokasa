@@ -9,10 +9,11 @@ import (
 	"time"
 )
 
-// rateLimiter is an in-memory per-key token bucket. Keyed by client IP for
-// /scan/check, it stops a leaked scanner URL from being used to brute-force
-// QR payloads against the HMAC verifier.
-type rateLimiter struct {
+// Limiter is an in-memory per-key token bucket. Originally keyed by
+// client IP for /scan/check, also reused for /login/request and other
+// public-side endpoints that want abuse mitigation without pulling in
+// a dependency.
+type Limiter struct {
 	mu      sync.Mutex
 	buckets map[string]*bucket
 	rate    float64 // tokens added per second
@@ -24,15 +25,20 @@ type bucket struct {
 	last   time.Time
 }
 
-func newRateLimiter(ratePerSec, burst float64) *rateLimiter {
-	return &rateLimiter{
+// NewLimiter returns a token bucket that refills at ratePerSec tokens
+// per second up to burst tokens total. Allow consumes one token.
+func NewLimiter(ratePerSec, burst float64) *Limiter {
+	return &Limiter{
 		buckets: make(map[string]*bucket),
 		rate:    ratePerSec,
 		burst:   burst,
 	}
 }
 
-func (rl *rateLimiter) allow(key string) bool {
+// Allow reports whether the key has a token to spend. Caller decides
+// the key (IP, email, hash thereof) — Limiter only cares that it's
+// comparable as a string.
+func (rl *Limiter) Allow(key string) bool {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 	now := time.Now()
@@ -51,9 +57,9 @@ func (rl *rateLimiter) allow(key string) bool {
 	return true
 }
 
-// gc drops buckets idle longer than max — keeps the map from growing
-// unbounded across the show's lifetime.
-func (rl *rateLimiter) gc(max time.Duration) {
+// GC drops buckets idle longer than max — keeps the map from growing
+// unbounded across the show's lifetime. Caller should run on a ticker.
+func (rl *Limiter) GC(max time.Duration) {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 	now := time.Now()
@@ -64,9 +70,11 @@ func (rl *rateLimiter) gc(max time.Duration) {
 	}
 }
 
-// clientIP extracts the caller's IP, honouring X-Forwarded-For when set
-// (we always sit behind nginx/Caddy/cloudflared in practice).
-func clientIP(r *http.Request) string {
+// ClientIP extracts the caller's IP, honouring X-Forwarded-For when
+// set (we always sit behind nginx/Caddy/cloudflared in practice). When
+// XFF is unset, falls back to RemoteAddr. Callers that don't trust
+// the proxy chain should strip XFF before calling.
+func ClientIP(r *http.Request) string {
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		first, _, _ := strings.Cut(xff, ",")
 		return strings.TrimSpace(first)

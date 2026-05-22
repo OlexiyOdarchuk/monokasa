@@ -131,8 +131,20 @@ func (s *Service) HandleServe(w http.ResponseWriter, r *http.Request) {
 	}
 	path := filepath.Join(s.dir, name)
 	// Belt-and-braces: make sure the resolved path stays inside dir.
+	// Prefix-check with trailing separator so "/data/posters" doesn't
+	// match "/data/postersX" via a false-positive HasPrefix.
 	abs, err := filepath.Abs(path)
-	if err != nil || !strings.HasPrefix(abs, filepath.Clean(s.dir)) {
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	root, err := filepath.Abs(s.dir)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	rootWithSep := root + string(filepath.Separator)
+	if abs != root && !strings.HasPrefix(abs, rootWithSep) {
 		http.NotFound(w, r)
 		return
 	}

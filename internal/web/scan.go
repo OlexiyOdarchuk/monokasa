@@ -56,14 +56,14 @@ type Scanner struct {
 	store   Store
 	coder   Coder
 	token   string // shared auth token; empty disables auth
-	limiter *rateLimiter
+	limiter *Limiter
 }
 
 func NewScanner(s Store, c Coder, authToken string) *Scanner {
 	// 10 req/s sustained, burst 20 — a doorman can comfortably scan one
 	// QR per second; anything faster is either an automated probe or a
 	// stuck client. Per-IP, so multiple staff devices don't fight.
-	return &Scanner{store: s, coder: c, token: authToken, limiter: newRateLimiter(10, 20)}
+	return &Scanner{store: s, coder: c, token: authToken, limiter: NewLimiter(10, 20)}
 }
 
 func (s *Scanner) Register(mux *http.ServeMux) {
@@ -81,7 +81,7 @@ func (s *Scanner) RunGC(ctx context.Context, every, idleMax time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-tick.C:
-			s.limiter.gc(idleMax)
+			s.limiter.GC(idleMax)
 		}
 	}
 }
@@ -135,7 +135,7 @@ func (s *Scanner) handlePage(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		// Login attempts share the same per-IP token bucket as /scan/check,
 		// so a password brute-force gets throttled to ~10 attempts/s.
-		if !s.limiter.allow(clientIP(r)) {
+		if !s.limiter.Allow(ClientIP(r)) {
 			w.Header().Set("Retry-After", "1")
 			http.Error(w, "rate limited", http.StatusTooManyRequests)
 			return
@@ -212,7 +212,7 @@ func (s *Scanner) handleCheck(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
 	}
-	if !s.limiter.allow(clientIP(r)) {
+	if !s.limiter.Allow(ClientIP(r)) {
 		w.Header().Set("Retry-After", "1")
 		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return
