@@ -339,6 +339,13 @@
 		if (n >= 2 && n <= 4) return 'дні';
 		return 'днів';
 	}
+	// Has the show already started? Hide the buy form and show a notice
+	// instead — backend rejects late orders with 410 anyway, but we
+	// want the UI to match so buyers don't get confused error toasts.
+	const showStarted = $derived.by(() => {
+		if (!show) return false;
+		return new Date(show.starts_at).getTime() <= nowMs;
+	});
 
 	function formatUAH(k: number): string {
 		return (k / 100).toLocaleString('uk-UA', { minimumFractionDigits: 2 }) + ' ₴';
@@ -581,7 +588,16 @@
 			{/if}
 		</header>
 
-		{#if seatsRemaining === 0}
+		{#if showStarted}
+			<section class="rounded-2xl border border-neutral-800 bg-neutral-900 p-5 text-center">
+				<div class="text-3xl">🎬</div>
+				<h2 class="mt-2 text-lg font-semibold">Подія вже почалася</h2>
+				<p class="mt-1 text-sm text-neutral-400">
+					Продаж квитків закрито. Якщо в тебе вже є оплачений квиток —
+					він досі дійсний.
+				</p>
+			</section>
+		{:else if seatsRemaining === 0}
 			<!-- Sold out. Offer waitlist signup; server dedupes on (show, email). -->
 			<section class="rounded-2xl border border-neutral-800 bg-neutral-900 p-5 text-center">
 				<div class="text-3xl">😔</div>

@@ -2345,7 +2345,10 @@ func (s *Store) BuyerTicketsByEmail(ctx context.Context, email string) ([]BuyerT
 		    o.confirmed_at, o.cancelled_at, o.reminded_at, o.refunded_at,
 		    sh.id, sh.slug, sh.title, sh.venue, sh.starts_at,
 		    sh.description, sh.poster_url,
-		    `+resCols+`, r.cancelled_at,
+		    r.id, r.seat_id, r.tg_user_id, r.tg_chat_id,
+		    r.buyer_name, r.buyer_email, r.attendee_name, r.code,
+		    r.created_at, r.expires_at,
+		    r.confirmed_at, r.cancelled_at, r.refunded_at,
 		    s.id, s.show_id, s.row, s.col, s.x, s.y,
 		    s.label, s.category, s.price_kopecks, s.sellable,
 		    t.qr_payload, t.used_at
@@ -2355,7 +2358,8 @@ func (s *Store) BuyerTicketsByEmail(ctx context.Context, email string) ([]BuyerT
 		JOIN shows sh ON sh.id = s.show_id
 		LEFT JOIN tickets t ON t.reservation_id = r.id
 		WHERE LOWER(o.buyer_email) = ?
-		ORDER BY o.created_at DESC, r.id`, normalized)
+		ORDER BY o.created_at DESC, r.id
+		LIMIT 500`, normalized)
 	if err != nil {
 		return nil, err
 	}
@@ -2368,6 +2372,8 @@ func (s *Store) BuyerTicketsByEmail(ctx context.Context, email string) ([]BuyerT
 			orderCreatedAt, orderExpiresAt                          int64
 			orderConf, orderCancelled, orderReminded, orderRefunded sql.NullInt64
 			showStartsAt                                            int64
+			resConf, resCancelled, resRefunded                      sql.NullInt64
+			sellable                                                int
 			qrPayload                                               sql.NullString
 			ticketUsedAt                                            sql.NullInt64
 		)
@@ -2378,21 +2384,21 @@ func (s *Store) BuyerTicketsByEmail(ctx context.Context, email string) ([]BuyerT
 			&orderConf, &orderCancelled, &orderReminded, &orderRefunded,
 			&row.Show.ID, &row.Show.Slug, &row.Show.Title, &row.Show.Venue, &showStartsAt,
 			&row.Show.Description, &row.Show.PosterURL,
-			// reservation: matches resCols + cancelled_at + seat block layout
 			&row.Reservation.ID, &row.Reservation.SeatID,
 			&row.Reservation.TGUserID, &row.Reservation.TGChatID,
 			&row.Reservation.BuyerName, &row.Reservation.BuyerEmail,
 			&row.Reservation.AttendeeName, &row.Reservation.Code,
 			scanTime(&row.Reservation.CreatedAt), scanTime(&row.Reservation.ExpiresAt),
-			new(sql.NullInt64), new(sql.NullInt64), new(sql.NullInt64), // confirmed_at, refunded_at, cancelled_at
+			&resConf, &resCancelled, &resRefunded,
 			&row.Seat.ID, &row.Seat.ShowID, &row.Seat.Row, &row.Seat.Col,
 			&row.Seat.X, &row.Seat.Y,
-			&row.Seat.Label, &row.Seat.Category, &row.Seat.PriceKopecks, new(int),
+			&row.Seat.Label, &row.Seat.Category, &row.Seat.PriceKopecks, &sellable,
 			&qrPayload, &ticketUsedAt,
 		)
 		if err != nil {
 			return nil, err
 		}
+		row.Seat.Sellable = sellable != 0
 		row.Order.CreatedAt = time.Unix(orderCreatedAt, 0)
 		row.Order.ExpiresAt = time.Unix(orderExpiresAt, 0)
 		if orderConf.Valid {
@@ -2412,22 +2418,17 @@ func (s *Store) BuyerTicketsByEmail(ctx context.Context, email string) ([]BuyerT
 			row.Order.RefundedAt = &t
 		}
 		row.Show.StartsAt = time.Unix(showStartsAt, 0)
-		// Re-scan reservation cancelled/refunded via a focused query —
-		// the placeholders above kept positional alignment but we want
-		// real values for the UI's status badges.
-		// (Simpler than another set of out-args in the giant Scan.)
-		var resCancelled, resRefunded sql.NullInt64
-		if err := s.db.QueryRowContext(ctx,
-			`SELECT cancelled_at, refunded_at FROM reservations WHERE id = ?`,
-			row.Reservation.ID).Scan(&resCancelled, &resRefunded); err == nil {
-			if resCancelled.Valid {
-				t := time.Unix(resCancelled.Int64, 0)
-				row.Reservation.CancelledAt = &t
-			}
-			if resRefunded.Valid {
-				t := time.Unix(resRefunded.Int64, 0)
-				row.Reservation.RefundedAt = &t
-			}
+		if resConf.Valid {
+			t := time.Unix(resConf.Int64, 0)
+			row.Reservation.ConfirmedAt = &t
+		}
+		if resCancelled.Valid {
+			t := time.Unix(resCancelled.Int64, 0)
+			row.Reservation.CancelledAt = &t
+		}
+		if resRefunded.Valid {
+			t := time.Unix(resRefunded.Int64, 0)
+			row.Reservation.RefundedAt = &t
 		}
 		if row.Order.ConfirmedAt != nil {
 			row.Reservation.ConfirmedAt = row.Order.ConfirmedAt

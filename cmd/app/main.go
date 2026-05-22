@@ -613,38 +613,48 @@ func runSessionSweeper(ctx context.Context, st *store.Store, every time.Duration
 	}
 }
 
-// runReminderLoop wakes up periodically; when we're within
-// `remindBefore` of the active show's start, it pings every
-// paid-and-not-yet-reminded reservation once, then idles. The DB column
-// reminded_at guarantees at-most-once delivery across restarts. The
-// active-show is re-resolved each tick so admin edits to StartsAt take
-// effect without a restart.
+// runReminderLoop wakes up periodically and pings every paid-and-not-
+// yet-reminded reservation whose show starts within `remindBefore`.
+// reminded_at guarantees at-most-once delivery across restarts.
+//
+// Iterates ALL non-archived shows each tick, not just ActiveShow — for
+// multi-session productions (same play Fri/Sat/Sun) each session needs
+// its own reminders, and the active-show heuristic would miss sibling
+// dates until they became the soonest upcoming.
 func runReminderLoop(ctx context.Context, st *store.Store, tg *bot.Bot, remindBefore time.Duration) {
 	tick := time.NewTicker(1 * time.Minute)
 	defer tick.Stop()
 	check := func() {
 		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
-		show, err := st.ActiveShow(ctx)
+		shows, err := st.ListShows(ctx)
 		if err != nil {
-			return // no active show — nothing to remind about
-		}
-		until := time.Until(show.StartsAt)
-		if until > remindBefore || until < -2*time.Hour {
-			return // too early or already long over
-		}
-		items, err := st.ConfirmedNotYetReminded(ctx, show.ID)
-		if err != nil {
-			slog.Error("remind", "err", err)
+			slog.Error("remind: list shows", "err", err)
 			return
 		}
-		for _, it := range items {
-			if err := tg.NotifyShowSoon(it.Reservation.TGChatID, toBotSeat(it.Seat), show.StartsAt); err != nil {
-				slog.Warn("remind notify", "chatId", it.Reservation.TGChatID, "err", err)
+		for _, show := range shows {
+			if show.ArchivedAt != nil {
 				continue
 			}
-			if err := st.MarkReminded(ctx, it.Reservation.ID); err != nil {
-				slog.Error("mark reminded", "reservationId", it.Reservation.ID, "err", err)
+			until := time.Until(show.StartsAt)
+			if until > remindBefore || until < -2*time.Hour {
+				continue // too early or already long over
+			}
+			items, err := st.ConfirmedNotYetReminded(ctx, show.ID)
+			if err != nil {
+				slog.Error("remind", "showId", show.ID, "err", err)
+				continue
+			}
+			for _, it := range items {
+				if err := tg.NotifyShowSoon(it.Reservation.TGChatID, toBotSeat(it.Seat), show.StartsAt); err != nil {
+					slog.Warn("remind notify",
+						"chatId", it.Reservation.TGChatID, "err", err)
+					continue
+				}
+				if err := st.MarkReminded(ctx, it.Reservation.ID); err != nil {
+					slog.Error("mark reminded",
+						"reservationId", it.Reservation.ID, "err", err)
+				}
 			}
 		}
 	}

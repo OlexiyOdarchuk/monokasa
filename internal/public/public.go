@@ -710,6 +710,11 @@ func (h *Handler) createReservation(w http.ResponseWriter, r *http.Request) {
 		writeInternal(w, "load show", err)
 		return
 	}
+	if show.StartsAt.Before(time.Now()) {
+		writeError(w, http.StatusGone, "show_started",
+			"подія вже стартувала — продаж закрито")
+		return
+	}
 
 	// Fetch the seat and confirm it belongs to that show — otherwise a
 	// stale seat_id from another event could create a cross-show booking.
@@ -882,6 +887,11 @@ func (h *Handler) createOrder(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		writeInternal(w, "load show", err)
+		return
+	}
+	if show.StartsAt.Before(time.Now()) {
+		writeError(w, http.StatusGone, "show_started",
+			"подія вже стартувала — продаж закрито")
 		return
 	}
 
