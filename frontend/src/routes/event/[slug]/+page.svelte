@@ -324,6 +324,33 @@
 		return (k / 100).toLocaleString('uk-UA', { minimumFractionDigits: 2 }) + ' ₴';
 	}
 
+	// Waitlist: shown only when everything is sold. POST endpoint accepts
+	// duplicates silently (server-side ON CONFLICT) so the form stays
+	// optimistic and the user just sees "🔔 Записали тебе".
+	let waitlistEmail = $state('');
+	let waitlistSent = $state(false);
+	let waitlistError = $state('');
+	let waitlistSubmitting = $state(false);
+
+	async function joinWaitlist(e: Event) {
+		e.preventDefault();
+		if (!show) return;
+		waitlistSubmitting = true;
+		waitlistError = '';
+		try {
+			await publicApi.post('/api/public/waitlist', {
+				slug: show.slug,
+				email: waitlistEmail.trim()
+			});
+			waitlistSent = true;
+		} catch (e) {
+			if (e instanceof ApiError) waitlistError = e.detail || e.code;
+			else waitlistError = String(e);
+		} finally {
+			waitlistSubmitting = false;
+		}
+	}
+
 	function seatLabel(s: PublicSeat): string {
 		if (s.category === 'GA') return `вхід · квиток №${s.col}`;
 		return `ряд ${s.row} · місце ${s.col}`;
@@ -506,7 +533,42 @@
 			{/if}
 		</header>
 
-		{#if isGA}
+		{#if seatsRemaining === 0}
+			<!-- Sold out. Offer waitlist signup; server dedupes on (show, email). -->
+			<section class="rounded-2xl border border-neutral-800 bg-neutral-900 p-5 text-center">
+				<div class="text-3xl">😔</div>
+				<h2 class="mt-2 text-lg font-semibold">Усе зайнято</h2>
+				<p class="mt-1 text-sm text-neutral-400">
+					Тільки хтось зніме бронь — пришлемо листа. Перший, хто встигне забронювати, виграє.
+				</p>
+
+				{#if waitlistSent}
+					<div class="mt-4 inline-flex items-center gap-2 rounded-md border border-emerald-700 bg-emerald-950/40 px-4 py-2 text-sm text-emerald-200">
+						🔔 Записали тебе. Чекай листа.
+					</div>
+				{:else}
+					<form onsubmit={joinWaitlist} class="mt-4 flex flex-col items-stretch gap-2 sm:flex-row sm:justify-center">
+						<input
+							type="email"
+							required
+							bind:value={waitlistEmail}
+							placeholder="email@example.com"
+							class="w-full max-w-xs rounded-md border border-neutral-800 bg-neutral-950 px-3 py-2 focus:border-neutral-600 focus:outline-none"
+						/>
+						<button
+							type="submit"
+							disabled={waitlistSubmitting}
+							class="rounded-md bg-[var(--color-brand)] px-4 py-2 text-sm font-medium text-black hover:bg-[var(--color-brand-hover)] disabled:opacity-50"
+						>
+							{waitlistSubmitting ? '…' : '🔔 Сповістіть мене'}
+						</button>
+					</form>
+					{#if waitlistError}
+						<p class="mt-2 text-sm text-red-300">{waitlistError}</p>
+					{/if}
+				{/if}
+			</section>
+		{:else if isGA}
 			<!-- GA: quantity picker + buyer form in one panel. No seat map. -->
 			<form
 				onsubmit={submit}

@@ -244,6 +244,20 @@ var migrations = []string{
 		updated_at      INTEGER NOT NULL DEFAULT 0
 	)`,
 	`INSERT OR IGNORE INTO organizer (id) VALUES (1)`,
+	// Waiting list: a buyer can leave an email on a sold-out show and
+	// get notified when somebody else's seat frees (expired hold, user
+	// cancel, admin cancel). UNIQUE(show_id, email) prevents duplicate
+	// signups. notified_at flips once we sent the "вільне місце" email
+	// so we don't spam the same person on every cancellation.
+	`CREATE TABLE IF NOT EXISTS waiting_list (
+		id              INTEGER PRIMARY KEY,
+		show_id         INTEGER NOT NULL,
+		email           TEXT NOT NULL,
+		created_at      INTEGER NOT NULL,
+		notified_at     INTEGER,
+		UNIQUE(show_id, email)
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_waitlist_show ON waiting_list(show_id, notified_at)`,
 }
 
 // Errors.
@@ -2334,6 +2348,95 @@ func isUniqueErr(err error) bool {
 		return false
 	}
 	return strings.Contains(err.Error(), "UNIQUE constraint failed")
+}
+
+// --- waiting list ---
+
+// AddToWaitlist records a buyer's interest in being notified when a
+// seat frees up on this show. Idempotent: a second call with the same
+// (show, email) returns the existing row without resetting notified_at,
+// so a previously-notified person who tries to re-subscribe stays
+// notified-once. Returns the resulting row.
+func (s *Store) AddToWaitlist(ctx context.Context, showID int64, email string) (WaitlistEntry, error) {
+	now := time.Now().Unix()
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO waiting_list (show_id, email, created_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(show_id, email) DO NOTHING`,
+		showID, email, now)
+	if err != nil {
+		return WaitlistEntry{}, err
+	}
+	var w WaitlistEntry
+	var createdAt int64
+	var notifiedAt sql.NullInt64
+	err = s.db.QueryRowContext(ctx, `
+		SELECT id, show_id, email, created_at, notified_at
+		FROM waiting_list WHERE show_id = ? AND email = ?`,
+		showID, email).Scan(&w.ID, &w.ShowID, &w.Email, &createdAt, &notifiedAt)
+	if err != nil {
+		return WaitlistEntry{}, err
+	}
+	w.CreatedAt = time.Unix(createdAt, 0)
+	if notifiedAt.Valid {
+		t := time.Unix(notifiedAt.Int64, 0)
+		w.NotifiedAt = &t
+	}
+	return w, nil
+}
+
+// PopWaitlistForShow returns up to `limit` not-yet-notified waitlist
+// entries for the show and atomically marks them notified. Caller is
+// expected to actually send the email — there's no second commit step,
+// so a transient SMTP failure could send to a "notified=true" row that
+// the buyer never sees. The trade-off is small: SMTP retries inside
+// the same process; missed notifications are recoverable by hand from
+// the audit log if needed.
+func (s *Store) PopWaitlistForShow(ctx context.Context, showID int64, limit int) ([]WaitlistEntry, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id, show_id, email, created_at
+		FROM waiting_list
+		WHERE show_id = ? AND notified_at IS NULL
+		ORDER BY created_at ASC
+		LIMIT ?`, showID, limit)
+	if err != nil {
+		return nil, err
+	}
+	var out []WaitlistEntry
+	for rows.Next() {
+		var w WaitlistEntry
+		var createdAt int64
+		if err := rows.Scan(&w.ID, &w.ShowID, &w.Email, &createdAt); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		w.CreatedAt = time.Unix(createdAt, 0)
+		out = append(out, w)
+	}
+	rows.Close()
+	if len(out) == 0 {
+		return nil, tx.Commit()
+	}
+	now := time.Now().Unix()
+	nt := time.Unix(now, 0)
+	for i := range out {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE waiting_list SET notified_at = ? WHERE id = ?`,
+			now, out[i].ID); err != nil {
+			return nil, err
+		}
+		out[i].NotifiedAt = &nt
+	}
+	return out, tx.Commit()
 }
 
 // --- analytics ---

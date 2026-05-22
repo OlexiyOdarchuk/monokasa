@@ -121,6 +121,50 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/public/my/tickets", h.myTickets)
 
 	mux.HandleFunc("GET /api/public/organizer", h.getOrganizer)
+
+	mux.HandleFunc("POST /api/public/waitlist", h.joinWaitlist)
+}
+
+// --- POST /api/public/waitlist ---
+
+type joinWaitlistRequest struct {
+	Slug  string `json:"slug"`
+	Email string `json:"email"`
+}
+
+func (h *Handler) joinWaitlist(w http.ResponseWriter, r *http.Request) {
+	var req joinWaitlistRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.Slug == "" {
+		writeError(w, http.StatusBadRequest, "invalid_input", "slug required")
+		return
+	}
+	email, err := normalizeEmail(req.Email)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_email", err.Error())
+		return
+	}
+	show, err := h.st.LoadShowBySlug(r.Context(), req.Slug)
+	if errors.Is(err, store.ErrShowNotFound) {
+		writeError(w, http.StatusNotFound, "show_not_found", "")
+		return
+	}
+	if err != nil {
+		writeInternal(w, "load show", err)
+		return
+	}
+	entry, err := h.st.AddToWaitlist(r.Context(), show.ID, email)
+	if err != nil {
+		writeInternal(w, "add waitlist", err)
+		return
+	}
+	already := entry.NotifiedAt != nil
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":           "ok",
+		"already_notified": already,
+	})
 }
 
 // --- GET /api/public/organizer ---

@@ -233,6 +233,10 @@ func main() {
 	adminMux := http.NewServeMux()
 	adminH := admin.NewHandler(st)
 	adminH.SetHub(hub)
+	// Waitlist notifier — declared up here because the admin cancel
+	// callback below closes over it. Set later (after we know we have
+	// SMTP) but Go captures by reference, so the late assignment lands.
+	var notifyWaitlist waitlistNotifyFn
 	// Best-effort notification fan-out: when admin force-cancels a
 	// reservation, ping the buyer through whichever channels are
 	// attached to their row. Failures get logged inside; the cancel
@@ -255,6 +259,10 @@ func main() {
 			if err := emailDelivery.SendCancellationEmail(ctx, res.BuyerEmail, res.BuyerName, paySeat, sh); err != nil {
 				slog.Warn("cancel notify: email", "to", res.BuyerEmail, "err", err)
 			}
+		}
+		// Waitlist: one freed seat = one next-in-line invite.
+		if notifyWaitlist != nil {
+			notifyWaitlist(ctx, seat.ShowID, 1)
 		}
 	})
 	adminH.Register(adminMux)
@@ -342,7 +350,15 @@ func main() {
 
 	// Eagerly free seats whose HOLD has lapsed without payment, so /seats
 	// reflects reality even when no user has triggered a status read.
-	go runHoldSweeper(ctx, st, hub, 5*time.Minute)
+	// Notifies pending waitlisters as a side effect so the buyer who left
+	// their email finds out before the next person grabs it.
+	if mailer, ok := emailDelivery.(payEmail); ok {
+		pm := mailer
+		notifyWaitlist = makeWaitlistNotifier(st, &pm, cfg.BaseURL)
+	} else {
+		notifyWaitlist = func(_ context.Context, _ int64, _ int) {}
+	}
+	go runHoldSweeper(ctx, st, hub, notifyWaitlist, 5*time.Minute)
 
 	// GC idle rate-limit buckets so the map doesn't grow over the show's lifetime.
 	go scanner.RunGC(ctx, 10*time.Minute, 30*time.Minute)
@@ -418,7 +434,7 @@ func liveActiveStat(st *store.Store, pick func(store.Stats) int) int {
 // their seats become free without waiting for someone to call /seats.
 // Each freed seat is broadcast through the realtime hub so any live
 // SSE subscriber sees the map flip back to "free" without a refresh.
-func runHoldSweeper(ctx context.Context, st *store.Store, hub *realtime.Hub, every time.Duration) {
+func runHoldSweeper(ctx context.Context, st *store.Store, hub *realtime.Hub, notifyWaitlist waitlistNotifyFn, every time.Duration) {
 	tick := time.NewTicker(every)
 	defer tick.Stop()
 	sweep := func() {
@@ -433,11 +449,7 @@ func runHoldSweeper(ctx context.Context, st *store.Store, hub *realtime.Hub, eve
 			return
 		}
 		slog.Info("sweep holds: freed expired reservations", "count", len(freed))
-		for _, seat := range freed {
-			hub.Publish(seat.ShowID, realtime.Event{
-				Type: "seat_status", SeatID: seat.ID, Status: realtime.SeatFree,
-			})
-		}
+		dispatchFreedSeats(ctx, freed, hub, notifyWaitlist)
 	}
 	sweep() // fire once at startup to catch carry-over from before restart
 	for {
@@ -447,6 +459,72 @@ func runHoldSweeper(ctx context.Context, st *store.Store, hub *realtime.Hub, eve
 		case <-tick.C:
 			sweep()
 		}
+	}
+}
+
+// waitlistNotifyFn is called once per show that just had seats freed.
+// freedCount caps how many of the next-in-line waitlisters to email
+// (we don't want to wake 100 people for a single freed seat).
+type waitlistNotifyFn func(ctx context.Context, showID int64, freedCount int)
+
+// dispatchFreedSeats fans out a list of just-freed seats: SSE publish
+// for live UI updates, and one waitlist-notify call per affected show.
+// Called from every freeing path (sweep, admin cancel, bot cascade)
+// so the buyer experience stays uniform.
+func dispatchFreedSeats(ctx context.Context, freed []store.Seat, hub *realtime.Hub, notify waitlistNotifyFn) {
+	if len(freed) == 0 {
+		return
+	}
+	perShow := make(map[int64]int, 4)
+	for _, seat := range freed {
+		hub.Publish(seat.ShowID, realtime.Event{
+			Type: "seat_status", SeatID: seat.ID, Status: realtime.SeatFree,
+		})
+		perShow[seat.ShowID]++
+	}
+	if notify == nil {
+		return
+	}
+	for showID, count := range perShow {
+		notify(ctx, showID, count)
+	}
+}
+
+// makeWaitlistNotifier builds the notifyWaitlist callback. Pops the
+// next batch of unnotified waitlisters for the show, sends each one
+// the "звільнилось місце" email. mailer can be nil — without SMTP,
+// the waitlist still records signups but no email goes out.
+func makeWaitlistNotifier(st *store.Store, mailer *payEmail, baseURL string) waitlistNotifyFn {
+	if mailer == nil {
+		return func(_ context.Context, _ int64, _ int) {}
+	}
+	origin := strings.TrimRight(baseURL, "/")
+	return func(ctx context.Context, showID int64, freedCount int) {
+		// Cap at 5 even when more seats freed at once — beyond that the
+		// race to grab a seat gets unfair to anyone slower than the rest.
+		batch := min(freedCount, 5)
+		entries, err := st.PopWaitlistForShow(ctx, showID, batch)
+		if err != nil {
+			slog.Error("waitlist pop", "showId", showID, "err", err)
+			return
+		}
+		if len(entries) == 0 {
+			return
+		}
+		show, err := st.LoadShow(ctx, showID)
+		if err != nil {
+			slog.Error("waitlist: load show", "showId", showID, "err", err)
+			return
+		}
+		eventURL := origin + "/event/" + show.Slug
+		for _, e := range entries {
+			if err := mailer.SendWaitlistFreedEmail(ctx, e.Email,
+				pay.Show{Slug: show.Slug, Title: show.Title, Venue: show.Venue, StartsAt: show.StartsAt},
+				eventURL); err != nil {
+				slog.Warn("waitlist email", "to", e.Email, "err", err)
+			}
+		}
+		slog.Info("waitlist notified", "showId", showID, "count", len(entries))
 	}
 }
 
@@ -910,6 +988,36 @@ func (m buyerLoginMailer) SendLoginLink(ctx context.Context, to, link string) er
 	return m.sender.Send(ctx, email.Message{
 		To:       to,
 		Subject:  "Вхід на monokasa — твої квитки",
+		HTMLBody: body,
+	})
+}
+
+// SendWaitlistFreedEmail tells a waitlisted buyer that at least one
+// seat freed up on the show they were watching. The link points at
+// the public event page so they can race to grab a seat — the call
+// site doesn't guarantee anything is still available by the time the
+// email lands (someone else could grab it first).
+func (p payEmail) SendWaitlistFreedEmail(ctx context.Context, to string, show pay.Show, eventURL string) error {
+	body := fmt.Sprintf(`<!doctype html>
+<html><body style="font-family:system-ui,sans-serif;color:#111;line-height:1.5">
+<h2 style="margin:0 0 .5em">Звільнилось місце на «%s»!</h2>
+<p>Хтось зняв бронь — у тебе є шанс встигнути.</p>
+<p style="margin:1.5em 0">
+  <a href="%s" style="background:#fbbe2c;color:#000;padding:.7em 1.2em;border-radius:.4em;text-decoration:none;font-weight:600">
+    Подивитись вільні місця →
+  </a>
+</p>
+<p><b>Коли:</b> %s<br>
+<b>Де:</b> %s</p>
+<p style="color:#666;font-size:.875em">Поспіши — якщо хтось встигне раніше, доведеться чекати знов. Це сповіщення прийде лише раз; повторно записатись можна тільки якщо квиток забере хтось інший.</p>
+</body></html>`,
+		htmlEscape(show.Title),
+		htmlEscape(eventURL),
+		timefmt.DateTime(show.StartsAt),
+		htmlEscape(show.Venue))
+	return p.sender.Send(ctx, email.Message{
+		To:       to,
+		Subject:  fmt.Sprintf("Звільнилось місце · «%s»", show.Title),
 		HTMLBody: body,
 	})
 }

@@ -69,6 +69,12 @@ polling'у. Кожне повідомлення — `data: {"type":"seat_status"
 Keep-alive comment `: ping\n\n` кожні 25 секунд. 503 `realtime_disabled`
 якщо hub не сконфігурований. Деталі → [[50-packages/realtime]].
 
+### `POST /api/public/waitlist`
+```json
+{ "slug": "evt-1", "email": "buyer@example.com" }
+```
+Записує buyer у чергу очікування на події, де всі місця зайняті. Сервер дедуплікує по `UNIQUE(show_id, email)` — повторні запити безпечні. Відповідь: `{status:"ok", already_notified}`. Коли seat звільниться (sweep expired holds, admin cancel), бекенд відсилає email перших N waitлістерів (cap=5 за один батч).
+
 ### `GET /api/public/organizer`
 Single-row профіль для сторінки `/about`. Завжди 200, навіть якщо все порожнє — порожні поля = сигнал "не налаштовано". Відповідь: `{name, bio, contact_email, phone, website_url, telegram_url, instagram_url, facebook_url, logo_url}`.
 

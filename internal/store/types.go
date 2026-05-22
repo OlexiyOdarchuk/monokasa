@@ -222,6 +222,18 @@ type AuditEntry struct {
 	CreatedAt    time.Time
 }
 
+// WaitlistEntry is one buyer waiting for a seat to free up on a show.
+// notified_at flips when the freed-seat email goes out; the row stays
+// in the table so the same email can't re-subscribe on the same show
+// (and so admin can audit who got notified).
+type WaitlistEntry struct {
+	ID         int64
+	ShowID     int64
+	Email      string
+	CreatedAt  time.Time
+	NotifiedAt *time.Time
+}
+
 // DailySales is one row of the per-day rollup used by /admin/analytics.
 // Date is the local "YYYY-MM-DD" derived from orders.confirmed_at
 // (interpreted as UTC by SQLite). Tickets is the count of confirmed
