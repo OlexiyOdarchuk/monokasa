@@ -887,9 +887,9 @@ func (h *Handler) createOrder(w http.ResponseWriter, r *http.Request) {
 
 	// GA quantity-mode and seated seat-ids each get validated separately,
 	// then converge on a `targets []store.Seat` slice the rest of the
-	// handler treats uniformly. GA path also disallows attendee_names —
-	// GA tickets are interchangeable and the PDF won't render row/col,
-	// so per-ticket naming would be invisible.
+	// handler treats uniformly. attendee_names is accepted on either
+	// path — for GA tickets, the name prints on the PDF beside the
+	// "GA · квиток №N" callout so buyers can label group purchases.
 	var targets []store.Seat
 	var attendees []string
 
@@ -899,9 +899,9 @@ func (h *Handler) createOrder(w http.ResponseWriter, r *http.Request) {
 				"quantity is only valid for GA shows")
 			return
 		}
-		if len(req.AttendeeNames) > 0 {
+		if len(req.AttendeeNames) > 0 && len(req.AttendeeNames) != req.Quantity {
 			writeError(w, http.StatusBadRequest, "invalid_input",
-				"attendee_names not supported in GA mode")
+				"attendee_names length must match quantity")
 			return
 		}
 		picked, err := h.st.AllocateFreeSeats(r.Context(), show.ID, req.Quantity)
@@ -922,6 +922,25 @@ func (h *Handler) createOrder(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		targets = picked
+		// Normalise attendee_names if buyer sent any. Empty strings
+		// fall through as "use buyer name" the same as the seated path.
+		if len(req.AttendeeNames) > 0 {
+			attendees = make([]string, len(req.AttendeeNames))
+			for i, n := range req.AttendeeNames {
+				n = strings.TrimSpace(n)
+				if n == "" {
+					attendees[i] = ""
+					continue
+				}
+				normalized, err := normalizeName(n)
+				if err != nil {
+					writeError(w, http.StatusBadRequest, "invalid_attendee_name",
+						fmt.Sprintf("ticket %d: %s", i+1, err.Error()))
+					return
+				}
+				attendees[i] = normalized
+			}
+		}
 	} else {
 		if show.IsGA() {
 			writeError(w, http.StatusBadRequest, "invalid_input",

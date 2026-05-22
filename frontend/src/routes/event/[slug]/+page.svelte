@@ -59,6 +59,10 @@
 	// entry is non-empty — otherwise the request omits the field entirely.
 	let attendeeNames = $state<Record<number, string>>({});
 	let showAttendees = $state(false);
+	// GA mode keeps attendees in a plain index-keyed array since there
+	// are no seat ids to bind against until the server allocates them.
+	let gaAttendeeNames = $state<string[]>([]);
+	let showGAAttendees = $state(false);
 	let submitting = $state(false);
 	let success = $state<CreateOrderResponse | null>(null);
 
@@ -209,12 +213,20 @@
 		const promo = promoCode.trim();
 		try {
 			if (isGA) {
+				// Truncate or pad the attendee array to match quantity
+				// before sending; the buyer may have toggled the input
+				// section and changed the count.
+				const gaAtt = Array.from({ length: gaQuantity }, (_, i) =>
+					(gaAttendeeNames[i] ?? '').trim()
+				);
+				const anyGAFilled = gaAtt.some((n) => n.length > 0);
 				success = await publicApi.post<CreateOrderResponse>('/api/public/orders', {
 					slug: show.slug,
 					seat_ids: [],
 					quantity: gaQuantity,
 					buyer_name: buyerName.trim(),
 					buyer_email: buyerEmail.trim(),
+					...(anyGAFilled ? { attendee_names: gaAtt } : {}),
 					...(promo ? { discount_code: promo } : {})
 				});
 			} else {
@@ -688,6 +700,31 @@
 							{gaQuantity > 1 ? `${gaQuantity} PDF з QR прийдуть сюди` : 'PDF з QR прийде сюди'} після оплати.
 						</p>
 					</div>
+					{#if gaQuantity > 1}
+						<details class="mt-1 text-sm" bind:open={showGAAttendees}>
+							<summary class="cursor-pointer text-neutral-400 hover:text-neutral-200">
+								✏️ Підписати квитки на різні імена
+							</summary>
+							<div class="mt-2 space-y-2">
+								{#each Array.from({ length: gaQuantity }) as _, i (i)}
+									<input
+										type="text"
+										maxlength="60"
+										value={gaAttendeeNames[i] ?? ''}
+										oninput={(e: Event) => {
+											gaAttendeeNames[i] = (e.target as HTMLInputElement).value;
+										}}
+										placeholder={buyerName.trim() || `ім'я №${i + 1}`}
+										aria-label="Ім'я на квитку №{i + 1}"
+										class="w-full rounded-md border border-neutral-800 bg-neutral-950 px-3 py-2 text-sm focus:border-neutral-600 focus:outline-none"
+									/>
+								{/each}
+								<p class="text-xs text-neutral-500">
+									Порожні поля → ім'я покупця на квитку.
+								</p>
+							</div>
+						</details>
+					{/if}
 					<details class="mt-1 text-sm">
 						<summary class="cursor-pointer text-neutral-400 hover:text-neutral-200">🏷 У мене є промокод</summary>
 						<input
