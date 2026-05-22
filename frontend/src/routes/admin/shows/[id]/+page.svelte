@@ -31,6 +31,14 @@
 	let uploading = $state(false);
 	let uploadError = $state('');
 
+	// GA capacity adjust (separate widget — its own endpoint with
+	// its own conflict semantics: server refuses to shrink past
+	// already-booked seats).
+	let gaCapacityInput = $state(0);
+	let gaSaving = $state(false);
+	let gaError = $state('');
+	let gaMessage = $state('');
+
 	async function uploadPoster(file: File | undefined) {
 		if (!file) return;
 		uploadError = '';
@@ -89,6 +97,7 @@
 			editDescription = show.description;
 			editPosterURL = show.poster_url;
 			editSessionGroup = show.session_group ?? '';
+			gaCapacityInput = show.ga_capacity;
 			categories = await api.get<SeatCategory[]>(`/api/admin/shows/${id}/categories`);
 		} catch (e) {
 			if (e instanceof ApiError) error = e.detail || e.code;
@@ -192,6 +201,35 @@
 			else error = String(e);
 		} finally {
 			saving = false;
+		}
+	}
+
+	async function adjustCapacity(e: Event) {
+		e.preventDefault();
+		if (!show) return;
+		gaSaving = true;
+		gaError = '';
+		gaMessage = '';
+		try {
+			const r = await api.patch<{ ga_capacity: number; added: number; removed: number }>(
+				`/api/admin/shows/${id}/ga-capacity`,
+				{ ga_capacity: gaCapacityInput }
+			);
+			gaMessage =
+				r.added > 0
+					? `+${r.added} квитків додано`
+					: r.removed > 0
+						? `−${r.removed} квитків знято з пулу`
+						: 'Без змін';
+			await load();
+		} catch (e) {
+			if (e instanceof ApiError) {
+				gaError = e.code === 'seats_booked' ? e.detail || 'Місця вже продані' : e.detail || e.code;
+			} else {
+				gaError = String(e);
+			}
+		} finally {
+			gaSaving = false;
 		}
 	}
 
@@ -317,11 +355,36 @@
 				</div>
 			</a>
 		{:else}
-			<div class="rounded-lg border border-neutral-800 bg-neutral-900 p-4 opacity-70">
+			<div class="rounded-lg border border-neutral-800 bg-neutral-900 p-4">
 				<div class="font-medium">🎤 GA — без сидячих місць</div>
 				<div class="mt-1 text-sm text-neutral-400">
-					{show.ga_capacity} квитків у пулі. Покупець обирає кількість.
+					Покупець обирає кількість. Можна змінювати пул на льоту.
 				</div>
+				<form onsubmit={adjustCapacity} class="mt-3 flex items-end gap-2">
+					<div class="flex-1">
+						<label for="cap" class="block text-xs text-neutral-500">Скільки квитків</label>
+						<input
+							id="cap"
+							type="number"
+							min="1"
+							max="5000"
+							bind:value={gaCapacityInput}
+							class="mt-1 w-24 rounded-md border border-neutral-800 bg-neutral-950 px-2 py-1.5 text-sm"
+						/>
+					</div>
+					<button
+						type="submit"
+						disabled={gaSaving || gaCapacityInput === show.ga_capacity}
+						class="rounded-md bg-[var(--color-brand)] px-3 py-1.5 text-sm font-medium text-black hover:bg-[var(--color-brand-hover)] disabled:opacity-50"
+					>
+						{gaSaving ? '…' : 'Оновити'}
+					</button>
+				</form>
+				{#if gaError}
+					<p class="mt-2 text-xs text-red-300">{gaError}</p>
+				{:else if gaMessage}
+					<p class="mt-2 text-xs text-emerald-300">{gaMessage}</p>
+				{/if}
 			</div>
 		{/if}
 		<a

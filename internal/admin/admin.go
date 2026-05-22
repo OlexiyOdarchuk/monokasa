@@ -81,6 +81,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 
 	mux.HandleFunc("GET /api/admin/shows/{id}/poster-qr.png", h.posterQR)
 
+	mux.HandleFunc("PATCH /api/admin/shows/{id}/ga-capacity", h.adjustGACapacity)
+
 	mux.HandleFunc("GET /api/admin/shows/{id}/guests", h.listGuests)
 	mux.HandleFunc("GET /api/admin/shows/{id}/guests.csv", h.exportGuestsCSV)
 	mux.HandleFunc("POST /api/admin/reservations/{id}/cancel", h.cancelReservation)
@@ -868,6 +870,51 @@ func (h *Handler) markRefunded(w http.ResponseWriter, r *http.Request) {
 // Origin is reconstructed from the request (TLS / X-Forwarded-Proto
 // aware) so the QR works equally from cloudflared, custom domains, or
 // the local dev port — no BASE_URL plumbing needed.
+type gaCapacityRequest struct {
+	GACapacity int `json:"ga_capacity"`
+}
+
+type gaCapacityResponse struct {
+	GACapacity int `json:"ga_capacity"`
+	Added      int `json:"added"`
+	Removed    int `json:"removed"`
+}
+
+// adjustGACapacity grows or shrinks the pool of GA virtual seats for an
+// existing GA show. Shrink refuses when the would-be-removed seats are
+// still booked — admin must cancel those reservations first.
+func (h *Handler) adjustGACapacity(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseID(w, r)
+	if !ok {
+		return
+	}
+	var req gaCapacityRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	added, removed, err := h.st.AdjustGACapacity(r.Context(), id, req.GACapacity)
+	switch {
+	case errors.Is(err, store.ErrShowNotFound):
+		writeError(w, http.StatusNotFound, "show_not_found", "")
+		return
+	case errors.Is(err, store.ErrSeatHasReservations):
+		writeError(w, http.StatusConflict, "seats_booked",
+			"не можу зменшити — хвостові квитки вже продані або в кошику")
+		return
+	case err != nil:
+		writeError(w, http.StatusBadRequest, "invalid_input", err.Error())
+		return
+	}
+	h.audit(r, "show.ga_capacity", fmt.Sprintf("show:%d", id), map[string]any{
+		"new_capacity": req.GACapacity,
+		"added":        added,
+		"removed":      removed,
+	})
+	writeJSON(w, http.StatusOK, gaCapacityResponse{
+		GACapacity: req.GACapacity, Added: added, Removed: removed,
+	})
+}
+
 func (h *Handler) posterQR(w http.ResponseWriter, r *http.Request) {
 	id, ok := parseID(w, r)
 	if !ok {

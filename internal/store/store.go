@@ -802,6 +802,118 @@ func (s *Store) FindFreeSeat(ctx context.Context, showID int64, row, col int) (S
 	return seat, nil
 }
 
+// AdjustGACapacity grows or shrinks the GA virtual-seat pool for an
+// existing GA show. Grow path appends seats with col=oldMax+1..newSize.
+// Shrink path removes ONLY seats with no live reservation (cancelled
+// is fine, confirmed/held is not) — refuses with ErrSeatHasReservations
+// if any tail seat is still booked.
+//
+// Returns the freed Seats (for SSE broadcast — they don't really "free"
+// since they're deleted, but live SSE subscribers should update their
+// maps). Also bumps shows.ga_capacity so the buyer page label stays
+// consistent.
+func (s *Store) AdjustGACapacity(ctx context.Context, showID int64, newSize int) (added, removed int, err error) {
+	if newSize < 1 {
+		return 0, 0, fmt.Errorf("ga_capacity must be ≥ 1")
+	}
+	if newSize > 5000 {
+		return 0, 0, fmt.Errorf("ga_capacity must be ≤ 5000")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tx.Rollback()
+
+	// Verify show is GA — refuse to touch a seated show through this
+	// API; seated layout edits go through the visual editor.
+	var kind string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT kind FROM shows WHERE id = ?`, showID).Scan(&kind); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, 0, ErrShowNotFound
+		}
+		return 0, 0, err
+	}
+	if kind != "ga" {
+		return 0, 0, fmt.Errorf("AdjustGACapacity: show %d is not GA (kind=%q)", showID, kind)
+	}
+
+	// Current max col + base price from any existing seat. Both safe
+	// because the migration seeded at least one seat at create time.
+	var curMax int
+	var priceKopecks int64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COALESCE(MAX(col), 0), COALESCE(MAX(price_kopecks), 0)
+		FROM seats WHERE show_id = ?`, showID).Scan(&curMax, &priceKopecks); err != nil {
+		return 0, 0, err
+	}
+	if curMax == 0 {
+		return 0, 0, fmt.Errorf("AdjustGACapacity: show %d has no GA seats to anchor from", showID)
+	}
+
+	now := time.Now().Unix()
+	switch {
+	case newSize > curMax:
+		// Grow: append seats. Same row/category/price as existing pool.
+		for c := curMax + 1; c <= newSize; c++ {
+			x := float64(c-1)*100.0 + 50.0
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO seats(show_id, row, col, x, y, category, price_kopecks, sellable)
+				 VALUES (?, 1, ?, ?, 50.0, 'GA', ?, 1)`,
+				showID, c, x, priceKopecks); err != nil {
+				return 0, 0, err
+			}
+			added++
+		}
+	case newSize < curMax:
+		// Shrink: pop seats from the tail, but only if they have no
+		// live reservation. We check explicitly so the error explains
+		// what's blocking instead of cascading a delete.
+		var blocked int
+		if err := tx.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM reservations r
+			JOIN seats s ON s.id = r.seat_id
+			WHERE s.show_id = ?
+			  AND s.col > ?
+			  AND r.cancelled_at IS NULL
+			  AND (r.confirmed_at IS NOT NULL OR r.expires_at > ?)`,
+			showID, newSize, now).Scan(&blocked); err != nil {
+			return 0, 0, err
+		}
+		if blocked > 0 {
+			return 0, 0, ErrSeatHasReservations
+		}
+		// Detach cancelled reservations from soon-to-be-deleted seats
+		// so the FK doesn't trip. They keep order_id and become
+		// orphans by seat_id — historical record only.
+		if _, err := tx.ExecContext(ctx, `
+			DELETE FROM reservations
+			WHERE cancelled_at IS NOT NULL
+			  AND seat_id IN (
+			    SELECT id FROM seats WHERE show_id = ? AND col > ?
+			  )`, showID, newSize); err != nil {
+			return 0, 0, err
+		}
+		res, err := tx.ExecContext(ctx,
+			`DELETE FROM seats WHERE show_id = ? AND col > ?`, showID, newSize)
+		if err != nil {
+			return 0, 0, err
+		}
+		n, _ := res.RowsAffected()
+		removed = int(n)
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE shows SET ga_capacity = ? WHERE id = ?`, newSize, showID); err != nil {
+		return 0, 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, 0, err
+	}
+	return added, removed, nil
+}
+
 // AllocateFreeSeats returns up to `n` free sellable seats for a show,
 // ordered by (row, col). Used by the GA flow where the buyer doesn't pick
 // specific seats — the server hands them N from the pool. Returns
