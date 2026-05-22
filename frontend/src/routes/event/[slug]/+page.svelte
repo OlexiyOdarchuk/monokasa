@@ -29,6 +29,12 @@
 	});
 	const totalKopecks = $derived(selectedSeats.reduce((acc, s) => acc + s.price_kopecks, 0));
 
+	// Scarcity nudge: pulses on the page header when very few seats
+	// remain. Computed from the live seat map (SSE keeps it fresh).
+	const seatsRemaining = $derived(
+		(show?.seats ?? []).filter((s) => s.sellable && !s.taken).length
+	);
+
 	let buyerName = $state('');
 	let buyerEmail = $state('');
 	// Optional attendee name per seat, keyed by seat id. Empty/whitespace
@@ -49,6 +55,13 @@
 	const PAD = 60;
 	const SEATS_MAX = 20; // matches server-side soft cap on /api/public/orders
 
+	// Admin-defined categories (with colour + price) override the
+	// legacy known-colours mapping below. Fallback for unknown labels
+	// is the original hashed-hue gradient — keeps old shows visually
+	// stable even without categories.
+	const categoryByName = $derived(
+		new Map((show?.categories ?? []).map((c) => [c.name, c]))
+	);
 	const knownColors: Record<string, string> = {
 		'': '#3b82f6',
 		standard: '#3b82f6',
@@ -58,6 +71,8 @@
 		comp: '#94a3b8'
 	};
 	function categoryColor(c: string): string {
+		const cat = categoryByName.get(c);
+		if (cat) return cat.color;
 		const k = c.trim().toLowerCase();
 		if (knownColors[k] !== undefined) return knownColors[k];
 		let h = 0;
@@ -248,6 +263,37 @@
 		});
 	}
 
+	// Live "через 3 дні · 14 год" counter; ticks every minute. Returns
+	// '' when the event has already started so we don't show negative
+	// countdown.
+	let nowMs = $state(Date.now());
+	$effect(() => {
+		const t = setInterval(() => (nowMs = Date.now()), 60_000);
+		return () => clearInterval(t);
+	});
+	const countdownText = $derived.by(() => {
+		if (!show) return '';
+		const diffMs = new Date(show.starts_at).getTime() - nowMs;
+		if (diffMs <= 0) return '';
+		const mins = Math.floor(diffMs / 60_000);
+		if (mins < 60) return `через ${mins} хв`;
+		const hours = Math.floor(mins / 60);
+		if (hours < 24) return `через ${hours} год ${mins % 60} хв`;
+		const days = Math.floor(hours / 24);
+		const hRest = hours % 24;
+		return `через ${days} ${dayWord(days)}${hRest > 0 ? ` ${hRest} год` : ''}`;
+	});
+	const countdownUrgent = $derived.by(() => {
+		if (!show) return false;
+		const diffMs = new Date(show.starts_at).getTime() - nowMs;
+		return diffMs > 0 && diffMs < 24 * 60 * 60_000;
+	});
+	function dayWord(n: number): string {
+		if (n === 1) return 'день';
+		if (n >= 2 && n <= 4) return 'дні';
+		return 'днів';
+	}
+
 	function formatUAH(k: number): string {
 		return (k / 100).toLocaleString('uk-UA', { minimumFractionDigits: 2 }) + ' ₴';
 	}
@@ -410,11 +456,22 @@
 		<header class="mb-4">
 			<h1 class="text-2xl font-semibold tracking-tight sm:text-3xl">{show.title}</h1>
 			<p class="mt-1 text-sm text-neutral-400">{startsAtText(show.starts_at)}</p>
+			{#if countdownText}
+				<p class="mt-1 text-sm {countdownUrgent ? 'font-semibold text-amber-400' : 'text-neutral-500'}">
+					⏳ {countdownText}
+				</p>
+			{/if}
 			{#if show.venue}
 				<p class="text-sm text-neutral-400">📍 {show.venue}</p>
 			{/if}
 			{#if show.description}
 				<p class="mt-3 whitespace-pre-line text-sm text-neutral-300">{show.description}</p>
+			{/if}
+			{#if seatsRemaining > 0 && seatsRemaining <= 3}
+				<div class="mt-3 inline-flex animate-pulse items-center gap-2 rounded-md border border-red-700 bg-red-950/50 px-3 py-1.5 text-sm font-medium text-red-300">
+					🔥 Залишилось {seatsRemaining}
+					{seatsRemaining === 1 ? 'місце' : seatsRemaining < 5 ? 'місця' : 'місць'}!
+				</div>
 			{/if}
 		</header>
 
@@ -474,16 +531,28 @@
 		</div>
 
 		<!-- legend -->
-		<div class="mt-3 flex flex-wrap gap-3 text-xs text-neutral-400">
-			<span class="inline-flex items-center gap-1.5">
-				<span class="inline-block size-3 rounded-full bg-blue-500"></span> вільно
-			</span>
-			<span class="inline-flex items-center gap-1.5">
-				<span class="inline-block size-3 rounded-full bg-neutral-700"></span> зайнято
-			</span>
-			<span class="inline-flex items-center gap-1.5">
-				<span class="inline-block size-3 rounded-full border-2 border-white bg-blue-500"></span> обрано
-			</span>
+		<div class="mt-3 space-y-2 text-xs text-neutral-400">
+			{#if show.categories && show.categories.length > 0}
+				<div class="flex flex-wrap gap-x-3 gap-y-1">
+					{#each show.categories as cat (cat.name)}
+						<span class="inline-flex items-center gap-1.5">
+							<span
+								class="inline-block size-3 rounded-full"
+								style="background-color: {cat.color}"
+							></span>
+							{cat.name} · {formatUAH(cat.price_kopecks)}
+						</span>
+					{/each}
+				</div>
+			{/if}
+			<div class="flex flex-wrap gap-3">
+				<span class="inline-flex items-center gap-1.5">
+					<span class="inline-block size-3 rounded-full bg-neutral-700"></span> зайнято
+				</span>
+				<span class="inline-flex items-center gap-1.5">
+					<span class="inline-block size-3 rounded-full border-2 border-white bg-blue-500"></span> обрано
+				</span>
+			</div>
 		</div>
 
 		<!-- selection / form panel -->

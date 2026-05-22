@@ -162,6 +162,25 @@ type User struct {
 	CreatedAt    time.Time
 }
 
+// SeatCategory is the admin's named pricing tier — "VIP", "Standard",
+// "Balcony" — bound to one show. Seats reference it by Category name
+// (string); the matching row here provides the default price and the
+// SVG colour the buyer map renders for that group.
+//
+// PriceKopecks here is the canonical price for the tier; when admin
+// edits a category, every seat with the matching name gets a batch
+// UPDATE so per-seat price stays in sync. A seat can still hold its
+// own different price (e.g. a deliberate odd-spot), but admin should
+// just edit it separately.
+type SeatCategory struct {
+	ID           int64
+	ShowID       int64
+	Name         string
+	Color        string // CSS colour, e.g. "#3b82f6"
+	PriceKopecks int64
+	SortOrder    int
+}
+
 // BuyerTicketRow is one ticket-shaped row returned by BuyerTicketsByEmail.
 // Each row carries everything needed to render the buyer's "Мої квитки"
 // page: order context, show context, reservation+seat, and ticket

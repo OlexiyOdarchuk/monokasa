@@ -51,6 +51,7 @@ README.md — для тих, хто хоче ЗАПУСТИТИ. Цей vault �
 - [[70-decisions/multi-seat-orders]] — чому orders + reservations, а не плоско
 - [[70-decisions/attendee-names]] — як обрали B (один + опційно)
 - [[70-decisions/buyer-auth-magic-link]] — чому magic-link, не password
+- [[70-decisions/seat-categories]] — pricing tiers як окрема таблиця
 
 ### 📖 Терміни
 - [[80-glossary]] — order, reservation, hold, jar, attendee, тощо

@@ -303,13 +303,20 @@ func (h *Handler) listShows(w http.ResponseWriter, r *http.Request) {
 // --- GET /api/public/shows/{slug} ---
 
 type publicShow struct {
-	Slug        string       `json:"slug"`
-	Title       string       `json:"title"`
-	Venue       string       `json:"venue"`
-	StartsAt    time.Time    `json:"starts_at"`
-	Description string       `json:"description"`
-	PosterURL   string       `json:"poster_url"`
-	Seats       []publicSeat `json:"seats"`
+	Slug        string           `json:"slug"`
+	Title       string           `json:"title"`
+	Venue       string           `json:"venue"`
+	StartsAt    time.Time        `json:"starts_at"`
+	Description string           `json:"description"`
+	PosterURL   string           `json:"poster_url"`
+	Seats       []publicSeat     `json:"seats"`
+	Categories  []publicCategory `json:"categories"`
+}
+
+type publicCategory struct {
+	Name         string `json:"name"`
+	Color        string `json:"color"`
+	PriceKopecks int64  `json:"price_kopecks"`
 }
 
 type publicSeat struct {
@@ -352,12 +359,24 @@ func (h *Handler) getShow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	cats, err := h.st.ListSeatCategories(r.Context(), show.ID)
+	if err != nil {
+		// Non-fatal: render seats with default colour if categories
+		// query trips. Log so the operator notices.
+		slog.Warn("list categories failed", "showId", show.ID, "err", err)
+	}
 	out := publicShow{
 		Slug: show.Slug, Title: show.Title, Venue: show.Venue,
 		StartsAt:    show.StartsAt,
 		Description: show.Description,
 		PosterURL:   show.PosterURL,
 		Seats:       make([]publicSeat, 0, len(seats)),
+		Categories:  make([]publicCategory, 0, len(cats)),
+	}
+	for _, c := range cats {
+		out.Categories = append(out.Categories, publicCategory{
+			Name: c.Name, Color: c.Color, PriceKopecks: c.PriceKopecks,
+		})
 	}
 	for _, s := range seats {
 		taken := statuses[s.ID] != store.SeatFree

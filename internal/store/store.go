@@ -205,6 +205,19 @@ var migrations = []string{
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_buyer_session_token ON buyer_sessions(token)`,
 	`CREATE INDEX IF NOT EXISTS idx_buyer_session_expires ON buyer_sessions(expires_at)`,
+	// Named pricing tiers per show. seats.category (string) joins to
+	// seat_categories.name within the same show; the row provides the
+	// price + colour the buyer map renders for that tier.
+	`CREATE TABLE IF NOT EXISTS seat_categories (
+		id            INTEGER PRIMARY KEY,
+		show_id       INTEGER NOT NULL,
+		name          TEXT NOT NULL,
+		color         TEXT NOT NULL DEFAULT '#3b82f6',
+		price_kopecks INTEGER NOT NULL,
+		sort_order    INTEGER NOT NULL DEFAULT 0,
+		UNIQUE(show_id, name)
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_seat_categories_show ON seat_categories(show_id)`,
 }
 
 // Errors.
@@ -736,6 +749,93 @@ func (s *Store) RemoveSeat(ctx context.Context, seatID int64) error {
 		return ErrSeatNotFound
 	}
 	return tx.Commit()
+}
+
+// --- seat categories (pricing tiers) ---
+
+// ListSeatCategories returns the show's pricing tiers in display order.
+// Empty result is normal — events without categories just render seats
+// in the default colour.
+func (s *Store) ListSeatCategories(ctx context.Context, showID int64) ([]SeatCategory, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, show_id, name, color, price_kopecks, sort_order
+		FROM seat_categories
+		WHERE show_id = ?
+		ORDER BY sort_order, id`, showID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SeatCategory
+	for rows.Next() {
+		var c SeatCategory
+		if err := rows.Scan(&c.ID, &c.ShowID, &c.Name, &c.Color, &c.PriceKopecks, &c.SortOrder); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// UpsertSeatCategory creates or updates a tier (matched by show_id+name).
+// Side-effect: every seat in this show with seats.category = c.Name
+// gets its price_kopecks aligned to the new tier price. Single tx so
+// the price + UPDATE land atomically.
+func (s *Store) UpsertSeatCategory(ctx context.Context, c SeatCategory) (SeatCategory, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return c, err
+	}
+	defer tx.Rollback()
+
+	res, err := tx.ExecContext(ctx, `
+		INSERT INTO seat_categories(show_id, name, color, price_kopecks, sort_order)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(show_id, name) DO UPDATE SET
+			color         = excluded.color,
+			price_kopecks = excluded.price_kopecks,
+			sort_order    = excluded.sort_order`,
+		c.ShowID, c.Name, c.Color, c.PriceKopecks, c.SortOrder)
+	if err != nil {
+		return c, err
+	}
+	if id, _ := res.LastInsertId(); id != 0 {
+		c.ID = id
+	} else {
+		// Conflict update — fetch the pre-existing id.
+		if err := tx.QueryRowContext(ctx,
+			`SELECT id FROM seat_categories WHERE show_id = ? AND name = ?`,
+			c.ShowID, c.Name).Scan(&c.ID); err != nil {
+			return c, err
+		}
+	}
+	// Sync per-seat prices for any seats labelled with this tier.
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE seats SET price_kopecks = ? WHERE show_id = ? AND category = ?`,
+		c.PriceKopecks, c.ShowID, c.Name); err != nil {
+		return c, err
+	}
+	if err := tx.Commit(); err != nil {
+		return c, err
+	}
+	return c, nil
+}
+
+// DeleteSeatCategory removes a tier. Seats keep their category string
+// (becomes an orphan label) and their last price — admin can re-bind
+// them via UpsertSeatCategory with the same name later. We deliberately
+// don't blank seats.category on delete; renaming categories is a
+// common admin workflow, and losing the labels would be punitive.
+func (s *Store) DeleteSeatCategory(ctx context.Context, id int64) error {
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM seat_categories WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrShowNotFound // reuse a "not found" sentinel
+	}
+	return nil
 }
 
 // --- reservations & tickets ---

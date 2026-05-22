@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
-	import { api, type Show, type UpdateShowInput, ApiError } from '$lib/api';
+	import { api, type Show, type UpdateShowInput, type SeatCategory, ApiError } from '$lib/api';
 	import DateTimePicker from '$lib/DateTimePicker.svelte';
 
 	const id = $derived(Number(page.params.id));
@@ -9,6 +9,16 @@
 	let show = $state<Show | null>(null);
 	let loaded = $state(false);
 	let error = $state('');
+
+	// Pricing tiers (categories). Loaded alongside the show; admin
+	// edits them inline and each Save hits POST /categories which
+	// upserts and batch-updates every seat with the matching name.
+	let categories = $state<SeatCategory[]>([]);
+	let catName = $state('');
+	let catColor = $state('#3b82f6');
+	let catPrice = $state(250);
+	let catSaving = $state(false);
+	let catError = $state('');
 
 	// Edit form state (mirrors show fields; populated when show loads).
 	let editTitle = $state('');
@@ -53,6 +63,21 @@
 
 	let archiving = $state(false);
 
+	// Copy event link to clipboard with a tiny "copied!" feedback.
+	let copiedAt = $state<Date | null>(null);
+	async function copyEventLink() {
+		if (!show) return;
+		const link = `${window.location.origin}/event/${show.slug}`;
+		try {
+			await navigator.clipboard.writeText(link);
+			copiedAt = new Date();
+			setTimeout(() => (copiedAt = null), 2000);
+		} catch {
+			// Fallback for browsers without clipboard API access (e.g. http).
+			prompt('Скопіюй посилання вручну:', link);
+		}
+	}
+
 	async function load() {
 		try {
 			show = await api.get<Show>(`/api/admin/shows/${id}`);
@@ -61,11 +86,67 @@
 			editStartsAt = show.starts_at;
 			editDescription = show.description;
 			editPosterURL = show.poster_url;
+			categories = await api.get<SeatCategory[]>(`/api/admin/shows/${id}/categories`);
 		} catch (e) {
 			if (e instanceof ApiError) error = e.detail || e.code;
 			else error = String(e);
 		} finally {
 			loaded = true;
+		}
+	}
+
+	async function addCategory(e: Event) {
+		e.preventDefault();
+		if (!show) return;
+		const name = catName.trim();
+		if (!name) {
+			catError = "Назва обов'язкова";
+			return;
+		}
+		catSaving = true;
+		catError = '';
+		try {
+			const c = await api.post<SeatCategory>(`/api/admin/shows/${id}/categories`, {
+				name,
+				color: catColor,
+				price_kopecks: Math.round(catPrice * 100),
+				sort_order: categories.length
+			});
+			// Upsert: replace if exists (by name), else append.
+			const idx = categories.findIndex((x) => x.name === c.name);
+			if (idx >= 0) categories[idx] = c;
+			else categories = [...categories, c];
+			catName = '';
+		} catch (err) {
+			catError = err instanceof ApiError ? err.detail || err.code : String(err);
+		} finally {
+			catSaving = false;
+		}
+	}
+
+	async function updateCategoryPrice(c: SeatCategory, newPrice: number) {
+		try {
+			const updated = await api.post<SeatCategory>(`/api/admin/shows/${id}/categories`, {
+				name: c.name,
+				color: c.color,
+				price_kopecks: Math.round(newPrice * 100),
+				sort_order: c.sort_order
+			});
+			categories = categories.map((x) => (x.id === updated.id ? updated : x));
+		} catch (err) {
+			catError = err instanceof ApiError ? err.detail || err.code : String(err);
+		}
+	}
+
+	async function removeCategory(c: SeatCategory) {
+		if (!confirm(`Видалити категорію "${c.name}"?\n\nМісця залишать свій label, але втратять колір.`)) {
+			return;
+		}
+		try {
+			await api.del(`/api/admin/categories/${c.id}`);
+			categories = categories.filter((x) => x.id !== c.id);
+		} catch (err) {
+			catError = err instanceof ApiError ? err.detail || err.code : String(err);
 		}
 	}
 
@@ -161,6 +242,31 @@
 			</span>
 		{/if}
 	</h1>
+
+	<div class="mt-2 flex flex-wrap items-center gap-2 text-sm">
+		<a
+			href="/event/{show.slug}"
+			target="_blank"
+			rel="noopener"
+			class="text-[var(--color-brand)] hover:underline"
+		>
+			📍 Сторінка події ↗
+		</a>
+		<button
+			type="button"
+			onclick={copyEventLink}
+			class="rounded-md border border-neutral-700 px-2 py-1 text-xs text-neutral-300 hover:bg-neutral-800"
+		>
+			{copiedAt ? '✓ скопійовано' : '📋 Copy link'}
+		</button>
+		<a
+			href="/api/admin/shows/{show.id}/poster-qr.png"
+			download="qr-{show.slug}.png"
+			class="rounded-md border border-neutral-700 px-2 py-1 text-xs text-neutral-300 hover:bg-neutral-800"
+		>
+			🔳 QR для афіші
+		</a>
+	</div>
 
 	{#if show.stats}
 		<section class="mt-6 grid grid-cols-2 gap-3 sm:grid-cols-4">
@@ -303,6 +409,104 @@
 			{/if}
 		</div>
 	</form>
+
+	<!-- Pricing tiers (categories). Seats with matching `category` string
+	     inherit the colour + price; admin uses bulk-edit in the layout
+	     editor to assign categories to whole zones. -->
+	<section class="mt-10 rounded-2xl border border-neutral-800 bg-neutral-900 p-6">
+		<h2 class="text-lg font-medium">Категорії місць</h2>
+		<p class="mt-1 text-sm text-neutral-400">
+			Зони з різними цінами (VIP, Standard, Balcony…). Колір — для мапи
+			залу, ціна — для всіх місць цієї категорії одразу.
+		</p>
+
+		{#if categories.length > 0}
+			<ul class="mt-4 divide-y divide-neutral-800 rounded-lg border border-neutral-800">
+				{#each categories as c (c.id)}
+					<li class="flex items-center gap-3 p-3">
+						<span
+							class="inline-block size-6 shrink-0 rounded-full border border-neutral-700"
+							style="background-color: {c.color}"
+							aria-hidden="true"
+						></span>
+						<div class="min-w-0 flex-1">
+							<div class="text-sm font-medium">{c.name}</div>
+							<div class="text-xs text-neutral-500">
+								<span class="font-mono">{c.color}</span>
+							</div>
+						</div>
+						<input
+							type="number"
+							value={c.price_kopecks / 100}
+							min="0"
+							step="1"
+							onchange={(e: Event) =>
+								updateCategoryPrice(c, Number((e.target as HTMLInputElement).value))}
+							class="w-24 rounded-md border border-neutral-800 bg-neutral-950 px-2 py-1 text-right text-sm"
+						/>
+						<span class="text-sm text-neutral-500">₴</span>
+						<button
+							type="button"
+							onclick={() => removeCategory(c)}
+							aria-label="Видалити категорію {c.name}"
+							class="ml-2 rounded px-2 py-1 text-xs text-red-400 hover:bg-red-950/40"
+						>
+							Видалити
+						</button>
+					</li>
+				{/each}
+			</ul>
+		{:else}
+			<p class="mt-4 text-sm text-neutral-500">Поки що нема категорій.</p>
+		{/if}
+
+		<form onsubmit={addCategory} class="mt-4 grid grid-cols-[1fr_auto_auto_auto] items-end gap-2">
+			<div>
+				<label for="catn" class="block text-xs text-neutral-400">Назва</label>
+				<input
+					id="catn"
+					type="text"
+					bind:value={catName}
+					maxlength="40"
+					placeholder="VIP"
+					class="mt-1 w-full rounded-md border border-neutral-800 bg-neutral-950 px-3 py-1.5 text-sm"
+				/>
+			</div>
+			<div>
+				<label for="catc" class="block text-xs text-neutral-400">Колір</label>
+				<input
+					id="catc"
+					type="color"
+					bind:value={catColor}
+					class="mt-1 h-9 w-12 cursor-pointer rounded-md border border-neutral-800 bg-neutral-950"
+				/>
+			</div>
+			<div>
+				<label for="catp" class="block text-xs text-neutral-400">Ціна (₴)</label>
+				<input
+					id="catp"
+					type="number"
+					bind:value={catPrice}
+					min="0"
+					class="mt-1 w-24 rounded-md border border-neutral-800 bg-neutral-950 px-2 py-1.5 text-right text-sm"
+				/>
+			</div>
+			<button
+				type="submit"
+				disabled={catSaving}
+				class="rounded-md bg-[var(--color-brand)] px-4 py-1.5 text-sm font-medium text-black hover:bg-[var(--color-brand-hover)] disabled:opacity-50"
+			>
+				+ Додати
+			</button>
+		</form>
+		{#if catError}
+			<p class="mt-2 text-xs text-red-400">{catError}</p>
+		{/if}
+		<p class="mt-3 text-xs text-neutral-500">
+			📌 Підказка: у редакторі залу можна виділити декілька місць і призначити
+			їм категорію — ціни підтягнуться автоматично.
+		</p>
+	</section>
 
 	{#if !show.archived_at}
 		<div class="mt-12 border-t border-neutral-900 pt-6">

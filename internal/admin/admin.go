@@ -20,7 +20,10 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
+
+	"github.com/skip2/go-qrcode"
 
 	"github.com/OlexiyOdarchuk/monokasa/internal/auth"
 	"github.com/OlexiyOdarchuk/monokasa/internal/realtime"
@@ -70,6 +73,12 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/admin/shows/{id}/seats", h.addSeat)
 	mux.HandleFunc("PATCH /api/admin/seats", h.batchUpdateSeats)
 	mux.HandleFunc("DELETE /api/admin/seats/{id}", h.removeSeat)
+
+	mux.HandleFunc("GET /api/admin/shows/{id}/categories", h.listCategories)
+	mux.HandleFunc("POST /api/admin/shows/{id}/categories", h.upsertCategory)
+	mux.HandleFunc("DELETE /api/admin/categories/{id}", h.deleteCategory)
+
+	mux.HandleFunc("GET /api/admin/shows/{id}/poster-qr.png", h.posterQR)
 
 	mux.HandleFunc("GET /api/admin/shows/{id}/guests", h.listGuests)
 	mux.HandleFunc("GET /api/admin/shows/{id}/guests.csv", h.exportGuestsCSV)
@@ -483,6 +492,85 @@ func (h *Handler) removeSeat(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// --- seat categories ---
+
+type categoryBody struct {
+	ID           int64  `json:"id,omitempty"`
+	Name         string `json:"name"`
+	Color        string `json:"color"`
+	PriceKopecks int64  `json:"price_kopecks"`
+	SortOrder    int    `json:"sort_order"`
+}
+
+func (h *Handler) listCategories(w http.ResponseWriter, r *http.Request) {
+	showID, ok := parseID(w, r)
+	if !ok {
+		return
+	}
+	cats, err := h.st.ListSeatCategories(r.Context(), showID)
+	if err != nil {
+		writeInternal(w, "list categories", err)
+		return
+	}
+	out := make([]categoryBody, len(cats))
+	for i, c := range cats {
+		out[i] = categoryBody{
+			ID: c.ID, Name: c.Name, Color: c.Color,
+			PriceKopecks: c.PriceKopecks, SortOrder: c.SortOrder,
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (h *Handler) upsertCategory(w http.ResponseWriter, r *http.Request) {
+	showID, ok := parseID(w, r)
+	if !ok {
+		return
+	}
+	var req categoryBody
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" || req.PriceKopecks < 0 {
+		writeError(w, http.StatusBadRequest, "invalid_input",
+			"name required, price_kopecks >= 0")
+		return
+	}
+	color := strings.TrimSpace(req.Color)
+	if color == "" {
+		color = "#3b82f6"
+	}
+	c, err := h.st.UpsertSeatCategory(r.Context(), store.SeatCategory{
+		ShowID: showID, Name: name, Color: color,
+		PriceKopecks: req.PriceKopecks, SortOrder: req.SortOrder,
+	})
+	if err != nil {
+		writeInternal(w, "upsert category", err)
+		return
+	}
+	h.audit(r, "category.upsert", fmt.Sprintf("category:%d", c.ID), map[string]any{
+		"show_id": showID, "name": c.Name, "price_kopecks": c.PriceKopecks,
+	})
+	writeJSON(w, http.StatusOK, categoryBody{
+		ID: c.ID, Name: c.Name, Color: c.Color,
+		PriceKopecks: c.PriceKopecks, SortOrder: c.SortOrder,
+	})
+}
+
+func (h *Handler) deleteCategory(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseID(w, r)
+	if !ok {
+		return
+	}
+	if err := h.st.DeleteSeatCategory(r.Context(), id); err != nil {
+		writeInternal(w, "delete category", err)
+		return
+	}
+	h.audit(r, "category.delete", fmt.Sprintf("category:%d", id), nil)
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // --- guests / reservations ---
 
 type guestResponse struct {
@@ -667,6 +755,50 @@ func (h *Handler) markRefunded(w http.ResponseWriter, r *http.Request) {
 		"buyer_name": res.BuyerName, "buyer_email": res.BuyerEmail,
 	})
 	writeJSON(w, http.StatusOK, toGuestResponse(store.MyItem{Reservation: res, Seat: seat}, time.Now()))
+}
+
+// --- poster QR ---
+
+// posterQR renders a print-ready QR PNG pointing at the public event
+// page. Used by admins making physical posters — slap the PNG on the
+// flyer, viewer scans it on their phone, lands on the buy page.
+//
+// Origin is reconstructed from the request (TLS / X-Forwarded-Proto
+// aware) so the QR works equally from cloudflared, custom domains, or
+// the local dev port — no BASE_URL plumbing needed.
+func (h *Handler) posterQR(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseID(w, r)
+	if !ok {
+		return
+	}
+	show, err := h.st.LoadShow(r.Context(), id)
+	if errors.Is(err, store.ErrShowNotFound) {
+		writeError(w, http.StatusNotFound, "show_not_found", "")
+		return
+	}
+	if err != nil {
+		writeInternal(w, "load show", err)
+		return
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if p := r.Header.Get("X-Forwarded-Proto"); p != "" {
+		scheme = p
+	}
+	url := fmt.Sprintf("%s://%s/event/%s", scheme, r.Host, show.Slug)
+
+	png, err := qrcode.Encode(url, qrcode.Medium, 512)
+	if err != nil {
+		writeInternal(w, "encode qr", err)
+		return
+	}
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Disposition",
+		fmt.Sprintf(`attachment; filename="qr-%s.png"`, show.Slug))
+	_, _ = w.Write(png)
 }
 
 // --- audit ---

@@ -90,6 +90,10 @@ based підхід раніше ламав cookie в деяких браузер
 | GET | `/api/admin/shows/{id}/guests.csv` | експорт |
 | POST | `/api/admin/reservations/{id}/cancel` | cascade cancel order; шле сповіщення buyer'у |
 | POST | `/api/admin/posters` | multipart upload афіші |
+| GET | `/api/admin/shows/{id}/categories` | список цінових категорій |
+| POST | `/api/admin/shows/{id}/categories` | upsert tier (creates or updates by name); cascade-syncs seat prices |
+| DELETE | `/api/admin/categories/{id}` | видалити tier (не торкає seats.category labels) |
+| GET | `/api/admin/shows/{id}/poster-qr.png` | PNG QR-код на /event/<slug> для друкованих афіш |
 
 ## Auth
 

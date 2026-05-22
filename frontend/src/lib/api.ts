@@ -236,6 +236,12 @@ export interface PublicSeat {
 	taken: boolean;
 }
 
+export interface PublicCategory {
+	name: string;
+	color: string;
+	price_kopecks: number;
+}
+
 export interface PublicShow {
 	slug: string;
 	title: string;
@@ -244,6 +250,15 @@ export interface PublicShow {
 	description: string;
 	poster_url: string;
 	seats: PublicSeat[];
+	categories: PublicCategory[];
+}
+
+export interface SeatCategory {
+	id: number;
+	name: string;
+	color: string;
+	price_kopecks: number;
+	sort_order: number;
 }
 
 export interface CreateReservationInput {
