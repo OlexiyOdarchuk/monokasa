@@ -89,6 +89,11 @@ type Store interface {
 	// so the matcher needs this lookup. Returns ErrCodeNotFound when
 	// nothing matches (unsolicited webhook for a stale invoice).
 	FindOrderByInvoiceID(ctx context.Context, invoiceID string) (Order, []OrderItem, error)
+	// FindShowByID resolves the show that owns a given seat. Used at
+	// confirmation time so the PDF/email picks up the order's actual
+	// show, not whatever ActiveShow happens to return (which can
+	// drift between orders for sites with multiple concurrent shows).
+	FindShowByID(ctx context.Context, showID int64) (Show, error)
 	ConfirmOrder(ctx context.Context, orderID int64, qrPayloads map[int64]string) error
 	// LogAudit appends one row to the audit_log table. Pay processor
 	// logs payment.confirm here so the journal shows monobank webhook
@@ -225,9 +230,16 @@ type deliverContext struct {
 // by both webhook (processTx) and the no-webhook free-order branch.
 // Caller has already loaded the order and verified eligibility.
 func (p *Processor) deliverConfirmedOrder(ctx context.Context, order Order, items []OrderItem, dc deliverContext) error {
-	show, err := p.ShowFn(ctx)
+	// Resolve the show from the order's actual seats, not the globally-
+	// active show. Without this, PDFs (and the success-email) for an
+	// older event picked up the title/venue of whatever show happened
+	// to be "active" at confirmation time.
+	if len(items) == 0 {
+		return fmt.Errorf("deliver: order %d has no items", order.ID)
+	}
+	show, err := p.Store.FindShowByID(ctx, items[0].Seat.ShowID)
 	if err != nil {
-		return fmt.Errorf("resolve show: %w", err)
+		return fmt.Errorf("resolve show %d: %w", items[0].Seat.ShowID, err)
 	}
 	qrs := make(map[int64]string, len(items))
 	for _, it := range items {

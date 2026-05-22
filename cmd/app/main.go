@@ -969,7 +969,7 @@ func (w webStore) UseTicket(ctx context.Context, qrPayload string) (web.Ticket, 
 func (w webStore) FindReservationByTicket(ctx context.Context, ticketID int64) (web.Reservation, web.Seat, error) {
 	r, s, err := w.s.FindReservationByTicket(ctx, ticketID)
 	return web.Reservation{BuyerName: r.BuyerName, ConfirmedAt: r.ConfirmedAt},
-		web.Seat{ID: s.ID, Row: s.Row, Col: s.Col},
+		web.Seat{ID: s.ID, Row: s.Row, Col: s.Col, Category: s.Category},
 		err
 }
 
@@ -1023,6 +1023,16 @@ func (p payStore) FindOrderByInvoiceID(ctx context.Context, invoiceID string) (p
 func (p payStore) FindOrderByCode(ctx context.Context, code string) (pay.Order, []pay.OrderItem, error) {
 	o, items, err := p.s.FindOrderByCode(ctx, code)
 	return toPayOrderAndItems(o, items, err)
+}
+
+func (p payStore) FindShowByID(ctx context.Context, showID int64) (pay.Show, error) {
+	sh, err := p.s.LoadShow(ctx, showID)
+	if err != nil {
+		return pay.Show{}, err
+	}
+	return pay.Show{
+		Slug: sh.Slug, Title: sh.Title, Venue: sh.Venue, StartsAt: sh.StartsAt,
+	}, nil
 }
 
 func (p payStore) ConfirmOrder(ctx context.Context, orderID int64, qrPayloads map[int64]string) error {

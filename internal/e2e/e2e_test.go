@@ -52,8 +52,11 @@ func (p payAdapter) FindOrderByCode(ctx context.Context, code string) (pay.Order
 		payItems[i] = pay.OrderItem{
 			ReservationID: it.Reservation.ID,
 			Seat: pay.Seat{
-				ID: it.Seat.ID, Row: it.Seat.Row, Col: it.Seat.Col,
-				Price: money.New(it.Seat.PriceKopecks, currency.UAH),
+				ID:     it.Seat.ID,
+				ShowID: it.Seat.ShowID,
+				Row:    it.Seat.Row, Col: it.Seat.Col,
+				Category: it.Seat.Category,
+				Price:    money.New(it.Seat.PriceKopecks, currency.UAH),
 			},
 		}
 	}
@@ -65,6 +68,14 @@ func (p payAdapter) FindOrderByInvoiceID(_ context.Context, _ string) (pay.Order
 	// that satisfies the interface and matches "not found" semantics
 	// the tests would never hit anyway.
 	return pay.Order{}, nil, pay.ErrCodeNotFound
+}
+
+func (p payAdapter) FindShowByID(ctx context.Context, showID int64) (pay.Show, error) {
+	sh, err := p.s.LoadShow(ctx, showID)
+	if err != nil {
+		return pay.Show{}, err
+	}
+	return pay.Show{Slug: sh.Slug, Title: sh.Title, Venue: sh.Venue, StartsAt: sh.StartsAt}, nil
 }
 
 func (p payAdapter) ConfirmOrder(ctx context.Context, orderID int64, qrPayloads map[int64]string) error {

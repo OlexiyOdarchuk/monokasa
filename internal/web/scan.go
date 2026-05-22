@@ -16,9 +16,10 @@ import (
 
 // Seat is the subset of seat info shown next to a scanned ticket.
 type Seat struct {
-	ID  int64
-	Row int
-	Col int
+	ID       int64
+	Row      int
+	Col      int
+	Category string
 }
 
 // Reservation is the subset of reservation info shown next to a scanned ticket.
@@ -283,6 +284,11 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 func seatLabel(s Seat) string {
 	if s.ID == 0 {
 		return ""
+	}
+	// GA tickets have no real row/col — render "Вхід · квиток №N" so
+	// the doorman sees the same label that printed on the PDF.
+	if s.Category == "GA" {
+		return fmt.Sprintf("Вхід · квиток №%d", s.Col)
 	}
 	return fmt.Sprintf("Ряд %d · місце %d", s.Row, s.Col)
 }

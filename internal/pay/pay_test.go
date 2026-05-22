@@ -51,6 +51,7 @@ type fakeStore struct {
 	order Order
 	items []OrderItem
 	code  string
+	show  Show
 
 	failFind    error
 	failConfirm error
@@ -79,6 +80,12 @@ func (f *fakeStore) FindOrderByInvoiceID(_ context.Context, _ string) (Order, []
 	// pay_test doesn't exercise the acquiring path; just satisfy the
 	// interface with a not-found response.
 	return Order{}, nil, ErrCodeNotFound
+}
+
+func (f *fakeStore) FindShowByID(_ context.Context, _ int64) (Show, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.show, nil
 }
 
 func (f *fakeStore) ConfirmOrder(_ context.Context, orderID int64, qrPayloads map[int64]string) error {
