@@ -18,10 +18,15 @@
 ## Public (без авторизації)
 
 ### `GET /api/public/shows`
-Список не-archived подій. Відповідь: масив `{slug, title, venue, starts_at, description, poster_url, seats_free, seats_total}`. Використовується лендінгом і Bot.Store.Shows.
+Список не-archived подій. Відповідь: масив `{slug, title, venue, starts_at, description, poster_url, seats_free, seats_total, kind}`. `kind` — `"seated"` або `"ga"`; фронтенд лендингу читає його щоб підписати "місць" vs "квитків". Використовується лендінгом і Bot.Store.Shows.
 
 ### `GET /api/public/shows/{slug}`
-Деталі однієї події з seat map. Відповідь: `{slug, title, venue, ..., seats: [{id, row, col, x, y, label, category, price_kopecks, sellable, taken}]}`. `taken=true` = `held` або `sold`.
+Деталі однієї події з seat map. Відповідь: `{slug, title, venue, ..., kind, seats: [{id, row, col, x, y, label, category, price_kopecks, sellable, taken}], categories: [...]}`. `taken=true` = `held` або `sold`.
+
+Для GA (kind="ga") `seats[]` повертається **порожнім** — концептуально місць немає, є лише пул. Замість того додаються:
+- `ga_capacity` — оригінальний розмір пулу
+- `ga_price_kopecks` — uniform-ціна квитка
+- `ga_free` — скільки вільних квитків зараз
 
 ### `POST /api/public/reservations` (single-seat alias)
 ```json
@@ -32,7 +37,7 @@
 - 400 `invalid_name` / `invalid_email`
 - 404 `show_not_found`
 
-### `POST /api/public/orders` (multi-seat)
+### `POST /api/public/orders` (multi-seat або GA quantity)
 ```json
 {
   "slug": "evt-1",
@@ -42,10 +47,16 @@
   "attendee_names": ["Анна", "", "Богдан"]   // optional, length must match seat_ids
 }
 ```
+Для GA — `seat_ids` опускається, додається `"quantity": 3`:
+```json
+{ "slug": "standup", "quantity": 3, "buyer_name": "Олена", "buyer_email": "o@ex.com" }
+```
+Сервер сам обере 3 вільних квитки з пулу. Передавати обидва одночасно — 400.
+
 Атомарно тримає всі місця або фейлить.
-- 400 `too_many_seats` (>20), `duplicate_seat`, `invalid_input` (mismatched attendee_names)
-- 409 `seat_taken` / `seat_not_sellable`
-Відповідь: `{code, expires_at, pay_url, total_kopecks, items: [{seat}], buyer_name, buyer_email, tg_deep_link?}`.
+- 400 `too_many_seats` (>20), `duplicate_seat`, `invalid_input` (mismatched attendee_names, обидва seat_ids+quantity, GA з seat_ids, seated з quantity)
+- 409 `seat_taken` / `seat_not_sellable` / `not_enough_seats` (GA: вільних менше ніж quantity)
+Відповідь: `{code, expires_at, pay_url, total_kopecks, items: [{seat}], buyer_name, buyer_email, tg_deep_link?}`. Для GA `items[].seat` має `category="GA"` і `col` = номер квитка.
 
 ### `GET /api/public/reservations/{code}/status`
 Полл-ендпоінт для success-екрана. Дивиться в **orders** (бо для multi-seat reservation коди це `code.N`). Відповідь: `{status: "held"|"paid"|"expired"|"cancelled"}`.
@@ -78,7 +89,7 @@ based підхід раніше ламав cookie в деяких браузер
 |---|---|---|
 | GET | `/api/admin/me` | поточний адмін |
 | GET | `/api/admin/shows` | список подій |
-| POST | `/api/admin/shows` | створити; body містить N/M залу і дефолтну ціну |
+| POST | `/api/admin/shows` | створити; для seated body містить rows/cols+price; для GA `kind:"ga", ga_capacity:N, price_kopecks:P` |
 | GET | `/api/admin/shows/{id}` | одна подія |
 | PATCH | `/api/admin/shows/{id}` | title/venue/starts_at/description/poster_url |
 | POST | `/api/admin/shows/{id}/archive` | toggle archive |

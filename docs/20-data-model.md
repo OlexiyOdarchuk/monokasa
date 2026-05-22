@@ -41,6 +41,8 @@
 | poster_url | TEXT | відносний `/posters/<32hex>.jpg` або external https:// |
 | created_at | INTEGER | |
 | archived_at | INTEGER | nullable; non-null = ховаємо з landing і бота |
+| kind | TEXT | `"seated"` (default) або `"ga"`. GA шоу = virtual-seat pool, без мапи залу |
+| ga_capacity | INTEGER | для GA — оригінальний розмір пулу (для display). Для seated — 0 |
 
 ### seats
 | col | type | заміт |
@@ -48,9 +50,12 @@
 | id, show_id, row, col | | UNIQUE(show_id, row, col) |
 | x, y | REAL | canvas координати для drag&drop |
 | label | TEXT | "" → "Ряд R · місце C" |
-| category | TEXT | "vip", "balcony" тощо; впливає на колір |
+| category | TEXT | "vip", "balcony" тощо; впливає на колір. Для GA shows завжди `"GA"` |
 | price_kopecks | INTEGER | per-seat ціна |
 | sellable | INTEGER | 0 = проходи / технічні |
+
+Для GA shows seats створюються як virtual pool: row=1, col=1..N, всі sellable=1.
+Уся логіка hold/sold/refund/scan не знає різниці між GA і seated — це просто seats.
 
 ### orders
 | col | type | заміт |

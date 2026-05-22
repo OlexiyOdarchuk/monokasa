@@ -118,11 +118,12 @@
 							{/if}
 							{#if !soldOut}
 								{@const lowStock = show.seats_free <= 5}
+								{@const unit = show.kind === 'ga' ? 'квитків' : 'місць'}
 								<p class="mt-3 text-xs {lowStock ? 'font-medium text-amber-400' : 'text-neutral-500'}">
 									{#if lowStock}
 										🔥 Залишилось {show.seats_free} з {show.seats_total}
 									{:else}
-										{show.seats_free} / {show.seats_total} місць вільно
+										{show.seats_free} / {show.seats_total} {unit} вільно
 									{/if}
 								</p>
 							{/if}

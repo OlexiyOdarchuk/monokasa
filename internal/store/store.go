@@ -218,6 +218,14 @@ var migrations = []string{
 		UNIQUE(show_id, name)
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_seat_categories_show ON seat_categories(show_id)`,
+	// GA (general admission) shows: no seat map, just a quantity counter.
+	// kind='seated' is the historical default; kind='ga' switches the
+	// buyer UI to a quantity picker and the server to auto-allocating
+	// from a pool of virtual seats (row=1, col=1..N, category='GA').
+	// ga_capacity is the original N — kept for display ("200 квитків
+	// усього") even after seats sell.
+	`ALTER TABLE shows ADD COLUMN kind TEXT NOT NULL DEFAULT 'seated'`,
+	`ALTER TABLE shows ADD COLUMN ga_capacity INTEGER NOT NULL DEFAULT 0`,
 }
 
 // Errors.
@@ -269,13 +277,14 @@ func (s *Store) Ping(ctx context.Context) error {
 
 // --- shows ---
 
-const showCols = `id, slug, title, venue, starts_at, description, poster_url, created_at, archived_at`
+const showCols = `id, slug, title, venue, starts_at, description, poster_url, created_at, archived_at, kind, ga_capacity`
 
 func scanShow(row interface{ Scan(...any) error }, sh *Show) error {
 	var startsAt, createdAt int64
 	var archivedAt sql.NullInt64
 	if err := row.Scan(&sh.ID, &sh.Slug, &sh.Title, &sh.Venue, &startsAt,
-		&sh.Description, &sh.PosterURL, &createdAt, &archivedAt); err != nil {
+		&sh.Description, &sh.PosterURL, &createdAt, &archivedAt,
+		&sh.Kind, &sh.GACapacity); err != nil {
 		return err
 	}
 	sh.StartsAt = time.Unix(startsAt, 0)
@@ -286,6 +295,9 @@ func scanShow(row interface{ Scan(...any) error }, sh *Show) error {
 		t := time.Unix(archivedAt.Int64, 0)
 		sh.ArchivedAt = &t
 	}
+	if sh.Kind == "" {
+		sh.Kind = "seated"
+	}
 	return nil
 }
 
@@ -293,6 +305,11 @@ func scanShow(row interface{ Scan(...any) error }, sh *Show) error {
 // Seats are auto-laid-out on a default grid so the visual editor has
 // something to start from. Slug is auto-derived from Title when blank,
 // with a numeric suffix appended if the resulting slug collides.
+//
+// For GA shows (show.Kind=="ga") the rows/cols inputs are ignored; the
+// function creates `show.GACapacity` seats in a single row (row=1,
+// col=1..N), all priced at priceKopecks and tagged category="GA". The
+// caller is expected to set GACapacity before calling.
 func (s *Store) CreateShow(ctx context.Context, show Show, rows, cols int, priceKopecks int64) (int64, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -304,6 +321,9 @@ func (s *Store) CreateShow(ctx context.Context, show Show, rows, cols int, price
 	if show.CreatedAt.IsZero() {
 		show.CreatedAt = time.Unix(now, 0)
 	}
+	if show.Kind == "" {
+		show.Kind = "seated"
+	}
 	if show.Slug == "" {
 		slug, err := s.uniqueSlugTx(ctx, tx, Slugify(show.Title))
 		if err != nil {
@@ -312,10 +332,11 @@ func (s *Store) CreateShow(ctx context.Context, show Show, rows, cols int, price
 		show.Slug = slug
 	}
 	res, err := tx.ExecContext(ctx,
-		`INSERT INTO shows(slug, title, venue, starts_at, description, poster_url, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO shows(slug, title, venue, starts_at, description, poster_url, created_at, kind, ga_capacity)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		show.Slug, show.Title, show.Venue, show.StartsAt.Unix(),
-		show.Description, show.PosterURL, show.CreatedAt.Unix())
+		show.Description, show.PosterURL, show.CreatedAt.Unix(),
+		show.Kind, show.GACapacity)
 	if err != nil {
 		if isUniqueErr(err) {
 			return 0, fmt.Errorf("slug %q already exists", show.Slug)
@@ -324,15 +345,30 @@ func (s *Store) CreateShow(ctx context.Context, show Show, rows, cols int, price
 	}
 	showID, _ := res.LastInsertId()
 
-	for r := 1; r <= rows; r++ {
-		for c := 1; c <= cols; c++ {
+	if show.Kind == "ga" {
+		// One virtual row of seats. row=1, col=1..N. category="GA" so the
+		// PDF/UI can branch on label rendering. x/y kept on a single
+		// horizontal line in case anybody opens the seat editor.
+		for c := 1; c <= show.GACapacity; c++ {
 			x := float64(c-1)*100.0 + 50.0
-			y := float64(r-1)*100.0 + 50.0
 			if _, err := tx.ExecContext(ctx,
-				`INSERT INTO seats(show_id, row, col, x, y, price_kopecks, sellable)
-				 VALUES (?, ?, ?, ?, ?, ?, 1)`,
-				showID, r, c, x, y, priceKopecks); err != nil {
+				`INSERT INTO seats(show_id, row, col, x, y, category, price_kopecks, sellable)
+				 VALUES (?, 1, ?, ?, 50.0, 'GA', ?, 1)`,
+				showID, c, x, priceKopecks); err != nil {
 				return 0, err
+			}
+		}
+	} else {
+		for r := 1; r <= rows; r++ {
+			for c := 1; c <= cols; c++ {
+				x := float64(c-1)*100.0 + 50.0
+				y := float64(r-1)*100.0 + 50.0
+				if _, err := tx.ExecContext(ctx,
+					`INSERT INTO seats(show_id, row, col, x, y, price_kopecks, sellable)
+					 VALUES (?, ?, ?, ?, ?, ?, 1)`,
+					showID, r, c, x, y, priceKopecks); err != nil {
+					return 0, err
+				}
 			}
 		}
 	}
@@ -626,6 +662,39 @@ func (s *Store) FindFreeSeat(ctx context.Context, showID int64, row, col int) (S
 		return seat, ErrSeatTaken
 	}
 	return seat, nil
+}
+
+// AllocateFreeSeats returns up to `n` free sellable seats for a show,
+// ordered by (row, col). Used by the GA flow where the buyer doesn't pick
+// specific seats — the server hands them N from the pool. Returns
+// ErrSeatTaken if fewer than n free seats remain at query time (the
+// follow-up CreateOrder is still atomic, so this is a best-effort hint).
+func (s *Store) AllocateFreeSeats(ctx context.Context, showID int64, n int) ([]Seat, error) {
+	if n <= 0 {
+		return nil, fmt.Errorf("n must be positive")
+	}
+	all, err := s.Seats(ctx, showID)
+	if err != nil {
+		return nil, err
+	}
+	statuses, err := s.SeatStatuses(ctx, showID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Seat, 0, n)
+	for _, seat := range all {
+		if !seat.Sellable {
+			continue
+		}
+		if statuses[seat.ID] != SeatFree {
+			continue
+		}
+		out = append(out, seat)
+		if len(out) == n {
+			return out, nil
+		}
+	}
+	return out, ErrSeatTaken
 }
 
 // Reserve is a single-seat shortcut around CreateOrder. Keeps a stable

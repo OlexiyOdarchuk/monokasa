@@ -35,11 +35,14 @@ type Show struct {
 	StartsAt time.Time
 }
 
-// Seat is the subset of seat info this package passes through.
+// Seat is the subset of seat info this package passes through. Category
+// flows through to the PDF renderer so GA tickets can drop row/col in
+// favour of "Квиток №N".
 type Seat struct {
 	ID       int64
 	ShowID   int64
 	Row, Col int
+	Category string
 	Price    money.Money
 }
 

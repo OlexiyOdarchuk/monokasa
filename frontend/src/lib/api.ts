@@ -94,6 +94,8 @@ export interface Stats {
 	revenue_kopecks: number;
 }
 
+export type ShowKind = 'seated' | 'ga';
+
 export interface Show {
 	id: number;
 	slug: string;
@@ -104,6 +106,8 @@ export interface Show {
 	poster_url: string;
 	created_at: string;
 	archived_at?: string | null;
+	kind: ShowKind;
+	ga_capacity: number;
 	stats?: Stats | null;
 }
 
@@ -196,9 +200,14 @@ export interface CreateShowInput {
 	title: string;
 	venue: string;
 	starts_at: string;
+	// For seated shows: rows×cols grid. For GA shows: ignored — set
+	// ga_capacity instead. The backend validates which group is required
+	// based on `kind`.
 	rows: number;
 	cols: number;
 	price_kopecks: number;
+	kind?: ShowKind;
+	ga_capacity?: number;
 }
 
 export interface UpdateShowInput {
@@ -220,6 +229,7 @@ export interface PublicShowSummary {
 	poster_url: string;
 	seats_free: number;
 	seats_total: number;
+	kind: ShowKind;
 }
 
 
@@ -251,6 +261,11 @@ export interface PublicShow {
 	poster_url: string;
 	seats: PublicSeat[];
 	categories: PublicCategory[];
+	kind: ShowKind;
+	// GA-only fields. Absent / zero for seated shows.
+	ga_capacity?: number;
+	ga_price_kopecks?: number;
+	ga_free?: number;
 }
 
 export interface SeatCategory {
@@ -295,14 +310,18 @@ export interface ReservationStatusResponse {
 
 export interface CreateOrderInput {
 	slug: string;
+	// For seated shows: list of seat ids. For GA shows: leave empty and
+	// pass `quantity` instead. Backend rejects requests that mix the two.
 	seat_ids: number[];
 	buyer_name: string;
 	buyer_email: string;
 	// Optional per-ticket attendee names. If present, must align 1:1 with
 	// seat_ids — empty strings inside the slice fall back to buyer_name
 	// at render time. Omit (or pass an empty slice) to use buyer_name for
-	// every ticket in the order.
+	// every ticket in the order. Not supported for GA orders.
 	attendee_names?: string[];
+	// GA-only: how many tickets to allocate. Server picks from the pool.
+	quantity?: number;
 }
 
 export interface OrderItem {

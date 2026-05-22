@@ -52,6 +52,7 @@ README.md — для тих, хто хоче ЗАПУСТИТИ. Цей vault �
 - [[70-decisions/attendee-names]] — як обрали B (один + опційно)
 - [[70-decisions/buyer-auth-magic-link]] — чому magic-link, не password
 - [[70-decisions/seat-categories]] — pricing tiers як окрема таблиця
+- [[70-decisions/ga-mode]] — GA (general admission) як virtual-seat pool
 
 ### 📖 Терміни
 - [[80-glossary]] — order, reservation, hold, jar, attendee, тощо

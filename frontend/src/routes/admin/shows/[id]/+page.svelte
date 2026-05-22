@@ -295,22 +295,31 @@
 	{/if}
 
 	<section class="mt-6 grid gap-3 sm:grid-cols-2">
-		<a
-			href="/admin/shows/{id}/layout"
-			class="rounded-lg border border-neutral-800 bg-neutral-900 p-4 hover:bg-neutral-800/70"
-		>
-			<div class="font-medium">🎭 Редактор залу</div>
-			<div class="mt-1 text-sm text-neutral-400">
-				Drag&amp;drop місць, категорії, ціни — <span class="text-neutral-500">PR #4c</span>
+		{#if show.kind !== 'ga'}
+			<a
+				href="/admin/shows/{id}/layout"
+				class="rounded-lg border border-neutral-800 bg-neutral-900 p-4 hover:bg-neutral-800/70"
+			>
+				<div class="font-medium">🎭 Редактор залу</div>
+				<div class="mt-1 text-sm text-neutral-400">
+					Drag&amp;drop місць, категорії, ціни
+				</div>
+			</a>
+		{:else}
+			<div class="rounded-lg border border-neutral-800 bg-neutral-900 p-4 opacity-70">
+				<div class="font-medium">🎤 GA — без сидячих місць</div>
+				<div class="mt-1 text-sm text-neutral-400">
+					{show.ga_capacity} квитків у пулі. Покупець обирає кількість.
+				</div>
 			</div>
-		</a>
+		{/if}
 		<a
 			href="/admin/shows/{id}/guests"
 			class="rounded-lg border border-neutral-800 bg-neutral-900 p-4 hover:bg-neutral-800/70"
 		>
 			<div class="font-medium">👥 Список гостей</div>
 			<div class="mt-1 text-sm text-neutral-400">
-				Бронювання, скасування, CSV — <span class="text-neutral-500">PR #4d</span>
+				Бронювання, скасування, CSV
 			</div>
 		</a>
 	</section>
@@ -412,7 +421,9 @@
 
 	<!-- Pricing tiers (categories). Seats with matching `category` string
 	     inherit the colour + price; admin uses bulk-edit in the layout
-	     editor to assign categories to whole zones. -->
+	     editor to assign categories to whole zones. GA shows have a
+	     single uniform price — categories don't add value. -->
+	{#if show.kind !== 'ga'}
 	<section class="mt-10 rounded-2xl border border-neutral-800 bg-neutral-900 p-6">
 		<h2 class="text-lg font-medium">Категорії місць</h2>
 		<p class="mt-1 text-sm text-neutral-400">
@@ -507,6 +518,7 @@
 			їм категорію — ціни підтягнуться автоматично.
 		</p>
 	</section>
+	{/if}
 
 	{#if !show.archived_at}
 		<div class="mt-12 border-t border-neutral-900 pt-6">

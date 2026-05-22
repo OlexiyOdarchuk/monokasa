@@ -249,7 +249,8 @@ func main() {
 				return
 			}
 			paySeat := pay.Seat{ID: seat.ID, Row: seat.Row, Col: seat.Col,
-				Price: money.New(seat.PriceKopecks, currency.UAH)}
+				Category: seat.Category,
+				Price:    money.New(seat.PriceKopecks, currency.UAH)}
 			if err := emailDelivery.SendCancellationEmail(ctx, res.BuyerEmail, res.BuyerName, paySeat, sh); err != nil {
 				slog.Warn("cancel notify: email", "to", res.BuyerEmail, "err", err)
 			}
@@ -828,7 +829,8 @@ func (p payStore) FindOrderByCode(ctx context.Context, code string) (pay.Order, 
 			Seat: pay.Seat{
 				ID: it.Seat.ID, ShowID: it.Seat.ShowID,
 				Row: it.Seat.Row, Col: it.Seat.Col,
-				Price: money.New(it.Seat.PriceKopecks, currency.UAH),
+				Category: it.Seat.Category,
+				Price:    money.New(it.Seat.PriceKopecks, currency.UAH),
 			},
 		}
 	}
@@ -985,7 +987,7 @@ func htmlEscape(s string) string {
 func payRenderer(show pay.Show, seat pay.Seat, buyerName, qrPayload string) ([]byte, error) {
 	return ticket.RenderPDF(
 		ticket.Show{Title: show.Title, Venue: show.Venue, StartsAt: show.StartsAt},
-		ticket.Seat{Row: seat.Row, Col: seat.Col},
+		ticket.Seat{Row: seat.Row, Col: seat.Col, Category: seat.Category},
 		buyerName, qrPayload,
 	)
 }

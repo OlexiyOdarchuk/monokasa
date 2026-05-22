@@ -152,6 +152,8 @@ type showResponse struct {
 	PosterURL   string     `json:"poster_url"`
 	CreatedAt   time.Time  `json:"created_at"`
 	ArchivedAt  *time.Time `json:"archived_at,omitempty"`
+	Kind        string     `json:"kind"`         // "seated" or "ga"
+	GACapacity  int        `json:"ga_capacity"`  // pool size for GA shows
 	Stats       *statsBody `json:"stats,omitempty"`
 }
 
@@ -164,10 +166,15 @@ type statsBody struct {
 }
 
 func toShowResponse(s store.Show, stats *statsBody) showResponse {
+	kind := s.Kind
+	if kind == "" {
+		kind = "seated"
+	}
 	return showResponse{
 		ID: s.ID, Slug: s.Slug, Title: s.Title, Venue: s.Venue,
 		StartsAt: s.StartsAt, Description: s.Description, PosterURL: s.PosterURL,
 		CreatedAt: s.CreatedAt, ArchivedAt: s.ArchivedAt,
+		Kind: kind, GACapacity: s.GACapacity,
 		Stats: stats,
 	}
 }
@@ -192,6 +199,10 @@ type createShowRequest struct {
 	Rows         int       `json:"rows"`
 	Cols         int       `json:"cols"`
 	PriceKopecks int64     `json:"price_kopecks"`
+	// Kind="ga" switches to general-admission. Rows/Cols are ignored and
+	// GACapacity is used instead. Omitted/blank defaults to "seated".
+	Kind       string `json:"kind,omitempty"`
+	GACapacity int    `json:"ga_capacity,omitempty"`
 }
 
 func (h *Handler) createShow(w http.ResponseWriter, r *http.Request) {
@@ -199,13 +210,44 @@ func (h *Handler) createShow(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if req.Title == "" || req.Rows <= 0 || req.Cols <= 0 || req.PriceKopecks <= 0 {
+	if req.Title == "" || req.PriceKopecks <= 0 {
 		writeError(w, http.StatusBadRequest, "invalid_input",
-			"title, rows>0, cols>0 and price_kopecks>0 are required")
+			"title and price_kopecks>0 are required")
+		return
+	}
+	kind := req.Kind
+	if kind == "" {
+		kind = "seated"
+	}
+	switch kind {
+	case "seated":
+		if req.Rows <= 0 || req.Cols <= 0 {
+			writeError(w, http.StatusBadRequest, "invalid_input",
+				"rows>0 and cols>0 are required for seated shows")
+			return
+		}
+	case "ga":
+		if req.GACapacity <= 0 {
+			writeError(w, http.StatusBadRequest, "invalid_input",
+				"ga_capacity>0 is required for GA shows")
+			return
+		}
+		if req.GACapacity > 5000 {
+			// Sanity cap — way past any realistic small-venue capacity,
+			// and large enough that mass-creating seats stays well within
+			// transaction time. Bump if a real customer needs more.
+			writeError(w, http.StatusBadRequest, "invalid_input",
+				"ga_capacity must be ≤ 5000")
+			return
+		}
+	default:
+		writeError(w, http.StatusBadRequest, "invalid_input",
+			"kind must be 'seated' or 'ga'")
 		return
 	}
 	id, err := h.st.CreateShow(r.Context(), store.Show{
 		Title: req.Title, Venue: req.Venue, StartsAt: req.StartsAt,
+		Kind: kind, GACapacity: req.GACapacity,
 	}, req.Rows, req.Cols, req.PriceKopecks)
 	if err != nil {
 		writeInternal(w, "create show", err)
@@ -216,10 +258,17 @@ func (h *Handler) createShow(w http.ResponseWriter, r *http.Request) {
 		writeInternal(w, "load created show", err)
 		return
 	}
-	h.audit(r, "show.create", fmt.Sprintf("show:%d", id), map[string]any{
+	details := map[string]any{
 		"title": sh.Title, "venue": sh.Venue, "starts_at": sh.StartsAt,
-		"rows": req.Rows, "cols": req.Cols, "price_kopecks": req.PriceKopecks,
-	})
+		"kind": kind, "price_kopecks": req.PriceKopecks,
+	}
+	if kind == "ga" {
+		details["ga_capacity"] = req.GACapacity
+	} else {
+		details["rows"] = req.Rows
+		details["cols"] = req.Cols
+	}
+	h.audit(r, "show.create", fmt.Sprintf("show:%d", id), details)
 	writeJSON(w, http.StatusCreated, toShowResponse(sh, nil))
 }
 

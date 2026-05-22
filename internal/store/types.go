@@ -19,7 +19,17 @@ type Show struct {
 	PosterURL   string
 	CreatedAt   time.Time
 	ArchivedAt  *time.Time
+	// Kind is "seated" (default — buyers pick from a seat map) or "ga"
+	// (general admission — buyers pick a quantity, server auto-allocates
+	// from a pool of virtual seats laid out in a single row).
+	Kind string
+	// GACapacity is the original GA pool size at creation time. Used for
+	// display only; the live "free" count comes from seat statuses.
+	GACapacity int
 }
+
+// IsGA returns true for general-admission shows (no seat map).
+func (s Show) IsGA() bool { return s.Kind == "ga" }
 
 // Seat is one location in a hall. Row/Col stay the human-friendly grid
 // coordinates and remain UNIQUE(show_id, row, col). X/Y are the canvas

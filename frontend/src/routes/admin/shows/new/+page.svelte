@@ -1,13 +1,15 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
-	import { api, type Show, type CreateShowInput, ApiError } from '$lib/api';
+	import { api, type Show, type CreateShowInput, type ShowKind, ApiError } from '$lib/api';
 	import DateTimePicker from '$lib/DateTimePicker.svelte';
 
 	let title = $state('');
 	let venue = $state('');
 	let startsAtISO = $state(''); // RFC3339 UTC, populated by DateTimePicker
+	let kind = $state<ShowKind>('seated');
 	let rows = $state(5);
 	let cols = $state(6);
+	let gaCapacity = $state(100);
 	let priceUAH = $state('250');
 
 	let submitting = $state(false);
@@ -31,9 +33,11 @@
 			title: title.trim(),
 			venue: venue.trim(),
 			starts_at: startsAtISO,
-			rows,
-			cols,
-			price_kopecks: priceKopecks
+			rows: kind === 'seated' ? rows : 0,
+			cols: kind === 'seated' ? cols : 0,
+			price_kopecks: priceKopecks,
+			kind,
+			ga_capacity: kind === 'ga' ? gaCapacity : 0
 		};
 
 		submitting = true;
@@ -88,32 +92,84 @@
 		</div>
 	</div>
 
-	<div class="grid grid-cols-2 gap-4">
-		<div>
-			<label for="rows" class="block text-sm text-neutral-400">Рядів</label>
-			<input
-				id="rows"
-				type="number"
-				min="1"
-				max="100"
-				bind:value={rows}
-				required
-				class="mt-1 w-full rounded-md border border-neutral-800 bg-neutral-900 px-3 py-2 text-neutral-100 focus:border-neutral-600 focus:outline-none"
-			/>
-		</div>
-		<div>
-			<label for="cols" class="block text-sm text-neutral-400">Місць у ряді</label>
-			<input
-				id="cols"
-				type="number"
-				min="1"
-				max="100"
-				bind:value={cols}
-				required
-				class="mt-1 w-full rounded-md border border-neutral-800 bg-neutral-900 px-3 py-2 text-neutral-100 focus:border-neutral-600 focus:outline-none"
-			/>
+	<div>
+		<span class="block text-sm text-neutral-400">Тип події</span>
+		<div class="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
+			<label
+				class="flex cursor-pointer items-start gap-3 rounded-md border border-neutral-800 bg-neutral-900 p-3 hover:border-neutral-600 {kind ===
+				'seated'
+					? 'ring-2 ring-[var(--color-brand)]'
+					: ''}"
+			>
+				<input type="radio" bind:group={kind} value="seated" class="mt-1 accent-[var(--color-brand)]" />
+				<span class="flex-1 text-sm">
+					<span class="font-medium text-neutral-100">🎭 Сидячі місця</span>
+					<span class="mt-0.5 block text-xs text-neutral-500">
+						Сітка з рядами і кріслами. Покупець обирає конкретне місце.
+					</span>
+				</span>
+			</label>
+			<label
+				class="flex cursor-pointer items-start gap-3 rounded-md border border-neutral-800 bg-neutral-900 p-3 hover:border-neutral-600 {kind ===
+				'ga'
+					? 'ring-2 ring-[var(--color-brand)]'
+					: ''}"
+			>
+				<input type="radio" bind:group={kind} value="ga" class="mt-1 accent-[var(--color-brand)]" />
+				<span class="flex-1 text-sm">
+					<span class="font-medium text-neutral-100">🎤 Загальний вхід (GA)</span>
+					<span class="mt-0.5 block text-xs text-neutral-500">
+						Без сидячих місць — тільки кількість. Для standup, лекцій, клубів.
+					</span>
+				</span>
+			</label>
 		</div>
 	</div>
+
+	{#if kind === 'seated'}
+		<div class="grid grid-cols-2 gap-4">
+			<div>
+				<label for="rows" class="block text-sm text-neutral-400">Рядів</label>
+				<input
+					id="rows"
+					type="number"
+					min="1"
+					max="100"
+					bind:value={rows}
+					required
+					class="mt-1 w-full rounded-md border border-neutral-800 bg-neutral-900 px-3 py-2 text-neutral-100 focus:border-neutral-600 focus:outline-none"
+				/>
+			</div>
+			<div>
+				<label for="cols" class="block text-sm text-neutral-400">Місць у ряді</label>
+				<input
+					id="cols"
+					type="number"
+					min="1"
+					max="100"
+					bind:value={cols}
+					required
+					class="mt-1 w-full rounded-md border border-neutral-800 bg-neutral-900 px-3 py-2 text-neutral-100 focus:border-neutral-600 focus:outline-none"
+				/>
+			</div>
+		</div>
+	{:else}
+		<div>
+			<label for="gaCapacity" class="block text-sm text-neutral-400">Скільки квитків усього</label>
+			<input
+				id="gaCapacity"
+				type="number"
+				min="1"
+				max="5000"
+				bind:value={gaCapacity}
+				required
+				class="mt-1 w-full rounded-md border border-neutral-800 bg-neutral-900 px-3 py-2 text-neutral-100 focus:border-neutral-600 focus:outline-none"
+			/>
+			<p class="mt-1 text-xs text-neutral-500">
+				Скільки людей зможе купити квиток. Покупець обирає кількість, місця не фіксовані.
+			</p>
+		</div>
+	{/if}
 
 	<div>
 		<label for="price" class="block text-sm text-neutral-400">Ціна за місце (₴)</label>

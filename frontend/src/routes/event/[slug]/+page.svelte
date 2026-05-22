@@ -27,12 +27,24 @@
 		// Preserve canvas order (row/col-ish via x/y already), not click order.
 		return show.seats.filter((s) => ids.has(s.id));
 	});
-	const totalKopecks = $derived(selectedSeats.reduce((acc, s) => acc + s.price_kopecks, 0));
+	const isGA = $derived(show?.kind === 'ga');
+	// GA quantity picker. Decoupled from selectedIds so the seated path
+	// stays untouched. Clamped to [1, min(SEATS_MAX, ga_free)] on input.
+	let gaQuantity = $state(1);
+	const gaPriceKopecks = $derived(show?.ga_price_kopecks ?? 0);
+	const totalKopecks = $derived(
+		isGA
+			? gaPriceKopecks * gaQuantity
+			: selectedSeats.reduce((acc, s) => acc + s.price_kopecks, 0)
+	);
 
 	// Scarcity nudge: pulses on the page header when very few seats
-	// remain. Computed from the live seat map (SSE keeps it fresh).
+	// remain. Seated shows count free sellable seats; GA shows take the
+	// ga_free counter that the server pre-computed.
 	const seatsRemaining = $derived(
-		(show?.seats ?? []).filter((s) => s.sellable && !s.taken).length
+		isGA
+			? (show?.ga_free ?? 0)
+			: (show?.seats ?? []).filter((s) => s.sellable && !s.taken).length
 	);
 
 	let buyerName = $state('');
@@ -184,32 +196,46 @@
 
 	async function submit(e: Event) {
 		e.preventDefault();
-		if (!show || selectedSeats.length === 0) return;
+		if (!show) return;
+		if (!isGA && selectedSeats.length === 0) return;
+		if (isGA && gaQuantity < 1) return;
 		submitting = true;
 		error = '';
-		// Build the attendee_names slice 1:1 with selected seats. Skip
-		// the field entirely when every entry is empty so older code
-		// paths (server logs, single-seat alias) stay clean.
-		const attendees = selectedSeats.map((s) => (attendeeNames[s.id] ?? '').trim());
-		const anyFilled = attendees.some((n) => n.length > 0);
 		try {
-			success = await publicApi.post<CreateOrderResponse>('/api/public/orders', {
-				slug: show.slug,
-				seat_ids: selectedSeats.map((s) => s.id),
-				buyer_name: buyerName.trim(),
-				buyer_email: buyerEmail.trim(),
-				...(anyFilled ? { attendee_names: attendees } : {})
-			});
+			if (isGA) {
+				success = await publicApi.post<CreateOrderResponse>('/api/public/orders', {
+					slug: show.slug,
+					seat_ids: [],
+					quantity: gaQuantity,
+					buyer_name: buyerName.trim(),
+					buyer_email: buyerEmail.trim()
+				});
+			} else {
+				// Build the attendee_names slice 1:1 with selected seats. Skip
+				// the field entirely when every entry is empty so older code
+				// paths (server logs, single-seat alias) stay clean.
+				const attendees = selectedSeats.map((s) => (attendeeNames[s.id] ?? '').trim());
+				const anyFilled = attendees.some((n) => n.length > 0);
+				success = await publicApi.post<CreateOrderResponse>('/api/public/orders', {
+					slug: show.slug,
+					seat_ids: selectedSeats.map((s) => s.id),
+					buyer_name: buyerName.trim(),
+					buyer_email: buyerEmail.trim(),
+					...(anyFilled ? { attendee_names: attendees } : {})
+				});
+			}
 			payStatus = 'held';
 		} catch (e) {
 			if (
 				e instanceof ApiError &&
-				(e.code === 'seat_taken' || e.code === 'seat_not_sellable')
+				(e.code === 'seat_taken' || e.code === 'seat_not_sellable' || e.code === 'not_enough_seats')
 			) {
-				error = 'Одне з обраних місць щойно зайняли. Онови мапу й обери інше.';
-				// Re-pull seat statuses, wipe selection — user must reconfirm.
+				error =
+					e.code === 'not_enough_seats'
+						? 'Замало вільних квитків. Зменш кількість і спробуй ще.'
+						: 'Одне з обраних місць щойно зайняли. Онови мапу й обери інше.';
 				load();
-				clearSelection();
+				if (!isGA) clearSelection();
 			} else if (e instanceof ApiError) {
 				error = e.detail || e.code;
 			} else {
@@ -299,6 +325,7 @@
 	}
 
 	function seatLabel(s: PublicSeat): string {
+		if (s.category === 'GA') return `вхід · квиток №${s.col}`;
 		return `ряд ${s.row} · місце ${s.col}`;
 	}
 </script>
@@ -470,11 +497,120 @@
 			{#if seatsRemaining > 0 && seatsRemaining <= 3}
 				<div class="mt-3 inline-flex animate-pulse items-center gap-2 rounded-md border border-red-700 bg-red-950/50 px-3 py-1.5 text-sm font-medium text-red-300">
 					🔥 Залишилось {seatsRemaining}
-					{seatsRemaining === 1 ? 'місце' : seatsRemaining < 5 ? 'місця' : 'місць'}!
+					{#if isGA}
+						{seatsRemaining === 1 ? 'квиток' : seatsRemaining < 5 ? 'квитки' : 'квитків'}!
+					{:else}
+						{seatsRemaining === 1 ? 'місце' : seatsRemaining < 5 ? 'місця' : 'місць'}!
+					{/if}
 				</div>
 			{/if}
 		</header>
 
+		{#if isGA}
+			<!-- GA: quantity picker + buyer form in one panel. No seat map. -->
+			<form
+				onsubmit={submit}
+				class="rounded-2xl border border-neutral-800 bg-neutral-900 p-5"
+			>
+				<div class="text-sm text-neutral-400">
+					Вільно ще {seatsRemaining}
+					{seatsRemaining === 1 ? 'квиток' : seatsRemaining < 5 ? 'квитки' : 'квитків'}
+					з {show.ga_capacity ?? 0}
+				</div>
+
+				<div class="mt-4">
+					<span class="block text-sm text-neutral-400">Скільки квитків</span>
+					<div class="mt-2 flex items-center gap-3">
+						<button
+							type="button"
+							onclick={() => (gaQuantity = Math.max(1, gaQuantity - 1))}
+							disabled={gaQuantity <= 1}
+							class="size-10 rounded-md border border-neutral-700 text-lg font-semibold hover:bg-neutral-800 disabled:opacity-40"
+							aria-label="Менше квитків"
+						>
+							−
+						</button>
+						<input
+							type="number"
+							min="1"
+							max={Math.min(SEATS_MAX, seatsRemaining)}
+							bind:value={gaQuantity}
+							class="w-20 rounded-md border border-neutral-800 bg-neutral-950 px-3 py-2 text-center text-lg font-semibold focus:border-neutral-600 focus:outline-none"
+							aria-label="Кількість квитків"
+						/>
+						<button
+							type="button"
+							onclick={() =>
+								(gaQuantity = Math.min(SEATS_MAX, seatsRemaining, gaQuantity + 1))}
+							disabled={gaQuantity >= Math.min(SEATS_MAX, seatsRemaining)}
+							class="size-10 rounded-md border border-neutral-700 text-lg font-semibold hover:bg-neutral-800 disabled:opacity-40"
+							aria-label="Більше квитків"
+						>
+							+
+						</button>
+						<span class="ml-2 text-sm text-neutral-500">
+							× {formatUAH(gaPriceKopecks)}
+						</span>
+					</div>
+					<p class="mt-1 text-xs text-neutral-500">
+						Місця не фіксовані — кожен квиток дає вхід.
+					</p>
+				</div>
+
+				<div class="mt-4 flex items-center justify-between rounded-lg border border-neutral-800 bg-neutral-950 px-3 py-2">
+					<span class="text-sm text-neutral-400">До оплати</span>
+					<span class="text-lg font-semibold">{formatUAH(totalKopecks)}</span>
+				</div>
+
+				<div class="mt-4 space-y-3">
+					<div>
+						<label for="n-ga" class="block text-sm text-neutral-400">Ім'я та прізвище</label>
+						<input
+							id="n-ga"
+							type="text"
+							bind:value={buyerName}
+							required
+							minlength="2"
+							maxlength="60"
+							placeholder="Олена Петренко"
+							class="mt-1 w-full rounded-md border border-neutral-800 bg-neutral-950 px-3 py-2 text-base focus:border-neutral-600 focus:outline-none"
+						/>
+					</div>
+					<div>
+						<label for="e-ga" class="block text-sm text-neutral-400">Email для квитків</label>
+						<input
+							id="e-ga"
+							type="email"
+							bind:value={buyerEmail}
+							required
+							placeholder="email@example.com"
+							class="mt-1 w-full rounded-md border border-neutral-800 bg-neutral-950 px-3 py-2 text-base focus:border-neutral-600 focus:outline-none"
+						/>
+						<p class="mt-1 text-xs text-neutral-500">
+							{gaQuantity > 1 ? `${gaQuantity} PDF з QR прийдуть сюди` : 'PDF з QR прийде сюди'} після оплати.
+						</p>
+					</div>
+				</div>
+
+				{#if error}
+					<div class="mt-3 rounded-md border border-red-900 bg-red-950/50 p-3 text-sm text-red-300">
+						{error}
+					</div>
+				{/if}
+
+				<button
+					type="submit"
+					disabled={submitting || seatsRemaining === 0}
+					class="mt-5 w-full rounded-md bg-[var(--color-brand)] px-4 py-3 text-base font-medium text-black hover:bg-[var(--color-brand-hover)] disabled:opacity-50"
+				>
+					{submitting
+						? 'Бронюю…'
+						: seatsRemaining === 0
+							? 'Квитків більше нема'
+							: `Забронювати ${gaQuantity > 1 ? `${gaQuantity} і платити` : 'і платити'}`}
+				</button>
+			</form>
+		{:else}
 		<!-- canvas -->
 		<div class="rounded-lg border border-neutral-800 bg-neutral-950 p-2">
 			<svg
@@ -684,6 +820,7 @@
 					{error}
 				</div>
 			{/if}
+		{/if}
 		{/if}
 	</main>
 {/if}

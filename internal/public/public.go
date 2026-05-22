@@ -262,6 +262,9 @@ type publicShowSummary struct {
 	PosterURL   string    `json:"poster_url"`
 	SeatsFree   int       `json:"seats_free"`
 	SeatsTotal  int       `json:"seats_total"`
+	// Kind tells the lander whether this card links to a seat-map page
+	// or a quantity picker. "seated" or "ga".
+	Kind string `json:"kind"`
 }
 
 func (h *Handler) listShows(w http.ResponseWriter, r *http.Request) {
@@ -286,6 +289,10 @@ func (h *Handler) listShows(w http.ResponseWriter, r *http.Request) {
 			slog.Warn("public list: stats failed", "showId", sh.ID, "err", err)
 			continue
 		}
+		kind := sh.Kind
+		if kind == "" {
+			kind = "seated"
+		}
 		out = append(out, publicShowSummary{
 			Slug: sh.Slug, Title: sh.Title, Venue: sh.Venue,
 			StartsAt:    sh.StartsAt,
@@ -293,6 +300,7 @@ func (h *Handler) listShows(w http.ResponseWriter, r *http.Request) {
 			PosterURL:   sh.PosterURL,
 			SeatsFree:   st.Free,
 			SeatsTotal:  st.Total,
+			Kind:        kind,
 		})
 	}
 	// Sort by start, soonest first.
@@ -311,6 +319,20 @@ type publicShow struct {
 	PosterURL   string           `json:"poster_url"`
 	Seats       []publicSeat     `json:"seats"`
 	Categories  []publicCategory `json:"categories"`
+	// Kind is "seated" or "ga". Frontend renders a quantity picker for
+	// "ga" instead of the seat map.
+	Kind string `json:"kind"`
+	// GACapacity is the pool size at show creation. Used for the
+	// "усього N квитків" label on the buyer page.
+	GACapacity int `json:"ga_capacity,omitempty"`
+	// GAPrice is the per-ticket price for GA shows. For seated shows
+	// every seat carries its own price, so this stays 0.
+	GAPrice int64 `json:"ga_price_kopecks,omitempty"`
+	// GAFree is the live count of unsold/unheld GA tickets. Trivial to
+	// compute on the frontend by counting Seats, but having it pre-counted
+	// makes the quantity picker simpler and survives if Seats is omitted
+	// in future for bandwidth.
+	GAFree int `json:"ga_free,omitempty"`
 }
 
 type publicCategory struct {
@@ -365,6 +387,10 @@ func (h *Handler) getShow(w http.ResponseWriter, r *http.Request) {
 		// query trips. Log so the operator notices.
 		slog.Warn("list categories failed", "showId", show.ID, "err", err)
 	}
+	kind := show.Kind
+	if kind == "" {
+		kind = "seated"
+	}
 	out := publicShow{
 		Slug: show.Slug, Title: show.Title, Venue: show.Venue,
 		StartsAt:    show.StartsAt,
@@ -372,20 +398,41 @@ func (h *Handler) getShow(w http.ResponseWriter, r *http.Request) {
 		PosterURL:   show.PosterURL,
 		Seats:       make([]publicSeat, 0, len(seats)),
 		Categories:  make([]publicCategory, 0, len(cats)),
+		Kind:        kind,
+		GACapacity:  show.GACapacity,
 	}
 	for _, c := range cats {
 		out.Categories = append(out.Categories, publicCategory{
 			Name: c.Name, Color: c.Color, PriceKopecks: c.PriceKopecks,
 		})
 	}
+	gaFree := 0
 	for _, s := range seats {
 		taken := statuses[s.ID] != store.SeatFree
+		if kind == "ga" {
+			// Price is uniform across the pool, but read it from the
+			// first seat we see so a future "raise GA price" admin tweak
+			// still flows through to the buyer.
+			if out.GAPrice == 0 && s.PriceKopecks > 0 {
+				out.GAPrice = s.PriceKopecks
+			}
+			if !taken && s.Sellable {
+				gaFree++
+			}
+			// Don't ship per-seat rows to GA buyers — the picker only
+			// cares about the free count, and shipping rows would leak
+			// "seat 47 of 200 is taken" which is meaningless for GA.
+			continue
+		}
 		out.Seats = append(out.Seats, publicSeat{
 			ID: s.ID, Row: s.Row, Col: s.Col,
 			X: s.X, Y: s.Y, Label: s.Label, Category: s.Category,
 			PriceKopecks: s.PriceKopecks, Sellable: s.Sellable,
 			Taken: taken,
 		})
+	}
+	if kind == "ga" {
+		out.GAFree = gaFree
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -541,6 +588,10 @@ type createOrderRequest struct {
 	// inside fall back to BuyerName at render time. Omit the field
 	// entirely (or pass an empty slice) to use BuyerName for every ticket.
 	AttendeeNames []string `json:"attendee_names,omitempty"`
+	// Quantity is the GA-mode shortcut: buyer doesn't pick specific
+	// seats, server allocates Quantity free virtual seats from the pool.
+	// Mutually exclusive with SeatIDs — providing both is an error.
+	Quantity int `json:"quantity,omitempty"`
 }
 
 type orderItemResponse struct {
@@ -573,44 +624,27 @@ func (h *Handler) createOrder(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_email", err.Error())
 		return
 	}
-	if req.Slug == "" || len(req.SeatIDs) == 0 {
-		writeError(w, http.StatusBadRequest, "invalid_input", "slug and seat_ids required")
+	if req.Slug == "" {
+		writeError(w, http.StatusBadRequest, "invalid_input", "slug required")
 		return
 	}
-	if len(req.SeatIDs) > 20 {
-		// Soft cap — keep one purchase from monopolising the room and
-		// blowing up the email batch / Telegram chat message count.
+	if len(req.SeatIDs) > 0 && req.Quantity > 0 {
+		writeError(w, http.StatusBadRequest, "invalid_input",
+			"pass either seat_ids or quantity, not both")
+		return
+	}
+	if len(req.SeatIDs) == 0 && req.Quantity <= 0 {
+		writeError(w, http.StatusBadRequest, "invalid_input",
+			"seat_ids or quantity required")
+		return
+	}
+	// Soft cap on both paths — keep one purchase from monopolising the
+	// room and blowing up the email batch / Telegram chat message count.
+	if len(req.SeatIDs) > 20 || req.Quantity > 20 {
 		writeError(w, http.StatusBadRequest, "too_many_seats",
 			"максимум 20 місць за одну покупку")
 		return
 	}
-	// AttendeeNames are optional. Accept either omitted/empty (every
-	// ticket prints BuyerName) or a slice matching SeatIDs 1:1.
-	var attendees []string
-	if len(req.AttendeeNames) > 0 {
-		if len(req.AttendeeNames) != len(req.SeatIDs) {
-			writeError(w, http.StatusBadRequest, "invalid_input",
-				"attendee_names length must match seat_ids")
-			return
-		}
-		attendees = make([]string, len(req.AttendeeNames))
-		for i, n := range req.AttendeeNames {
-			n = strings.TrimSpace(n)
-			if n == "" {
-				// Empty entry — fall back to buyer name at render time.
-				attendees[i] = ""
-				continue
-			}
-			normalized, err := normalizeName(n)
-			if err != nil {
-				writeError(w, http.StatusBadRequest, "invalid_attendee_name",
-					fmt.Sprintf("seat %d: %s", i+1, err.Error()))
-				return
-			}
-			attendees[i] = normalized
-		}
-	}
-
 	show, err := h.st.LoadShowBySlug(r.Context(), req.Slug)
 	if errors.Is(err, store.ErrShowNotFound) {
 		writeError(w, http.StatusNotFound, "show_not_found", "")
@@ -621,40 +655,109 @@ func (h *Handler) createOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	allSeats, err := h.st.Seats(r.Context(), show.ID)
-	if err != nil {
-		writeInternal(w, "list seats", err)
-		return
-	}
-	byID := make(map[int64]store.Seat, len(allSeats))
-	for _, s := range allSeats {
-		byID[s.ID] = s
-	}
-	seenIDs := make(map[int64]struct{}, len(req.SeatIDs))
-	targets := make([]store.Seat, 0, len(req.SeatIDs))
-	for _, id := range req.SeatIDs {
-		if _, dup := seenIDs[id]; dup {
-			writeError(w, http.StatusBadRequest, "duplicate_seat",
-				"seat included twice")
+	// GA quantity-mode and seated seat-ids each get validated separately,
+	// then converge on a `targets []store.Seat` slice the rest of the
+	// handler treats uniformly. GA path also disallows attendee_names —
+	// GA tickets are interchangeable and the PDF won't render row/col,
+	// so per-ticket naming would be invisible.
+	var targets []store.Seat
+	var attendees []string
+
+	if req.Quantity > 0 {
+		if !show.IsGA() {
+			writeError(w, http.StatusBadRequest, "invalid_input",
+				"quantity is only valid for GA shows")
 			return
 		}
-		seenIDs[id] = struct{}{}
-		s, ok := byID[id]
-		if !ok {
-			writeError(w, http.StatusNotFound, "seat_not_found",
-				"seat does not belong to this show")
+		if len(req.AttendeeNames) > 0 {
+			writeError(w, http.StatusBadRequest, "invalid_input",
+				"attendee_names not supported in GA mode")
 			return
 		}
-		if !s.Sellable {
-			writeError(w, http.StatusConflict, "seat_not_sellable", "")
+		picked, err := h.st.AllocateFreeSeats(r.Context(), show.ID, req.Quantity)
+		if errors.Is(err, store.ErrSeatTaken) {
+			writeError(w, http.StatusConflict, "not_enough_seats",
+				"замало вільних квитків")
 			return
 		}
-		if s.PriceKopecks < h.priceMin {
-			writeInternal(w, "seat below min price",
-				fmt.Errorf("seat %d price %d < min %d", s.ID, s.PriceKopecks, h.priceMin))
+		if err != nil {
+			writeInternal(w, "allocate ga seats", err)
 			return
 		}
-		targets = append(targets, s)
+		for _, s := range picked {
+			if s.PriceKopecks < h.priceMin {
+				writeInternal(w, "seat below min price",
+					fmt.Errorf("seat %d price %d < min %d", s.ID, s.PriceKopecks, h.priceMin))
+				return
+			}
+		}
+		targets = picked
+	} else {
+		if show.IsGA() {
+			writeError(w, http.StatusBadRequest, "invalid_input",
+				"GA shows require quantity, not seat_ids")
+			return
+		}
+		// AttendeeNames are optional. Accept either omitted/empty (every
+		// ticket prints BuyerName) or a slice matching SeatIDs 1:1.
+		if len(req.AttendeeNames) > 0 {
+			if len(req.AttendeeNames) != len(req.SeatIDs) {
+				writeError(w, http.StatusBadRequest, "invalid_input",
+					"attendee_names length must match seat_ids")
+				return
+			}
+			attendees = make([]string, len(req.AttendeeNames))
+			for i, n := range req.AttendeeNames {
+				n = strings.TrimSpace(n)
+				if n == "" {
+					attendees[i] = ""
+					continue
+				}
+				normalized, err := normalizeName(n)
+				if err != nil {
+					writeError(w, http.StatusBadRequest, "invalid_attendee_name",
+						fmt.Sprintf("seat %d: %s", i+1, err.Error()))
+					return
+				}
+				attendees[i] = normalized
+			}
+		}
+
+		allSeats, err := h.st.Seats(r.Context(), show.ID)
+		if err != nil {
+			writeInternal(w, "list seats", err)
+			return
+		}
+		byID := make(map[int64]store.Seat, len(allSeats))
+		for _, s := range allSeats {
+			byID[s.ID] = s
+		}
+		seenIDs := make(map[int64]struct{}, len(req.SeatIDs))
+		targets = make([]store.Seat, 0, len(req.SeatIDs))
+		for _, id := range req.SeatIDs {
+			if _, dup := seenIDs[id]; dup {
+				writeError(w, http.StatusBadRequest, "duplicate_seat",
+					"seat included twice")
+				return
+			}
+			seenIDs[id] = struct{}{}
+			s, ok := byID[id]
+			if !ok {
+				writeError(w, http.StatusNotFound, "seat_not_found",
+					"seat does not belong to this show")
+				return
+			}
+			if !s.Sellable {
+				writeError(w, http.StatusConflict, "seat_not_sellable", "")
+				return
+			}
+			if s.PriceKopecks < h.priceMin {
+				writeInternal(w, "seat below min price",
+					fmt.Errorf("seat %d price %d < min %d", s.ID, s.PriceKopecks, h.priceMin))
+				return
+			}
+			targets = append(targets, s)
+		}
 	}
 
 	code, err := h.coder.NewCode()

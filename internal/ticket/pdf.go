@@ -25,10 +25,13 @@ type Show struct {
 	StartsAt time.Time
 }
 
-// Seat is the subset of seat info the ticket needs to print.
+// Seat is the subset of seat info the ticket needs to print. Category=="GA"
+// switches the renderer to general-admission layout (no row/col, just
+// "Квиток №N").
 type Seat struct {
-	Row int
-	Col int
+	Row      int
+	Col      int
+	Category string
 }
 
 // RenderPDF returns an A6 ticket with a navy header band, big seat
@@ -80,11 +83,19 @@ func RenderPDF(show Show, seat Seat, buyerName, qrPayload string) ([]byte, error
 		pdf.CellFormat(pageW, 5, buyerName, "", 1, "C", false, 0, "")
 	}
 
-	// Seat callout.
-	pdf.SetFont("DejaVu", "", 11)
-	pdf.CellFormat(pageW, 5, "МІСЦЕ", "", 1, "C", false, 0, "")
-	pdf.SetFont("DejaVu", "B", 32)
-	pdf.CellFormat(pageW, 14, fmt.Sprintf("ряд %d · %d", seat.Row, seat.Col), "", 1, "C", false, 0, "")
+	// Seat callout. GA shows render "GA · квиток №N" since there is no
+	// row/col — every ticket is a guaranteed entry from a single pool.
+	if seat.Category == "GA" {
+		pdf.SetFont("DejaVu", "", 11)
+		pdf.CellFormat(pageW, 5, "ВХІД", "", 1, "C", false, 0, "")
+		pdf.SetFont("DejaVu", "B", 32)
+		pdf.CellFormat(pageW, 14, fmt.Sprintf("GA · квиток №%d", seat.Col), "", 1, "C", false, 0, "")
+	} else {
+		pdf.SetFont("DejaVu", "", 11)
+		pdf.CellFormat(pageW, 5, "МІСЦЕ", "", 1, "C", false, 0, "")
+		pdf.SetFont("DejaVu", "B", 32)
+		pdf.CellFormat(pageW, 14, fmt.Sprintf("ряд %d · %d", seat.Row, seat.Col), "", 1, "C", false, 0, "")
+	}
 
 	// QR.
 	imgOpts := gofpdf.ImageOptions{ImageType: "PNG", ReadDpi: false}
