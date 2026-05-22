@@ -309,10 +309,16 @@ export interface CreateOrderResponse {
 // 401 — the public buyer flow shouldn't even reach a 401, and bouncing
 // an anonymous visitor to an admin page would be confusing. Treats all
 // 4xx/5xx as plain ApiError instances.
+//
+// Uses same-origin credentials so the buyer's magic-link session cookie
+// (monokasa_buyer) ride along to /api/public/my* — without it the
+// frontend gets 401 on whoami and re-renders the login form even
+// though the cookie was just set. Same-origin is safe: cookies only
+// go to our own domain.
 export const publicApi = {
 	async get<T>(path: string): Promise<T> {
 		const r = await fetch(path, {
-			credentials: 'omit',
+			credentials: 'same-origin',
 			headers: { Accept: 'application/json' }
 		});
 		return handlePublicResponse<T>(r);
@@ -320,7 +326,7 @@ export const publicApi = {
 	async post<T>(path: string, body: unknown): Promise<T> {
 		const r = await fetch(path, {
 			method: 'POST',
-			credentials: 'omit',
+			credentials: 'same-origin',
 			headers: {
 				Accept: 'application/json',
 				'Content-Type': 'application/json'
