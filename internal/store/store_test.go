@@ -794,6 +794,81 @@ func TestAdminCancelReservationNotFound(t *testing.T) {
 	}
 }
 
+func TestAdminCancelHeldMultiSeatCascades(t *testing.T) {
+	// Held (unpaid) multi-seat order: cancelling one row dies the whole
+	// basket. Buyer would otherwise be mid-payment with a moving total.
+	s := newTestStore(t)
+	ctx := context.Background()
+	showID, _ := s.CreateShow(ctx, Show{Title: "T", StartsAt: time.Now()}, 1, 3, 100)
+	seats, _ := s.Seats(ctx, showID)
+	_, reservations, err := s.CreateOrder(ctx, seats, 0, 0, "Buyer", "b@x.com", nil, "casc1234", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, freed, err := s.AdminCancelReservation(ctx, reservations[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(freed) != 3 {
+		t.Errorf("freed = %d seats, want 3 (cascade)", len(freed))
+	}
+	// All peers should be cancelled too.
+	for _, r := range reservations[1:] {
+		got, _, err := s.FindReservationByCode(ctx, r.Code)
+		if !errors.Is(err, ErrAlreadyClosed) {
+			t.Errorf("peer %q: status %+v err %v, want cancelled", r.Code, got, err)
+		}
+	}
+}
+
+func TestAdminCancelConfirmedMultiSeatPerSeat(t *testing.T) {
+	// Confirmed multi-seat order: cancel one, leave the rest valid.
+	// "One of my five guests can't come" use case.
+	s := newTestStore(t)
+	ctx := context.Background()
+	showID, _ := s.CreateShow(ctx, Show{Title: "T", StartsAt: time.Now()}, 1, 3, 100)
+	seats, _ := s.Seats(ctx, showID)
+	order, reservations, err := s.CreateOrder(ctx, seats, 0, 0, "Buyer", "b@x.com", nil, "conf1234", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	qrs := map[int64]string{}
+	for _, r := range reservations {
+		qrs[r.ID] = "qr-" + r.Code
+	}
+	if _, err := s.ConfirmOrder(ctx, order.ID, qrs); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, freed, err := s.AdminCancelReservation(ctx, reservations[1].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(freed) != 1 {
+		t.Errorf("freed = %d seats, want 1 (per-seat, no cascade)", len(freed))
+	}
+
+	// Cancelled row is cancelled.
+	if _, _, err := s.FindReservationByCode(ctx, reservations[1].Code); !errors.Is(err, ErrAlreadyClosed) {
+		t.Errorf("targeted row: err %v, want ErrAlreadyClosed", err)
+	}
+	// Peers stay confirmed and uncancelled.
+	for _, idx := range []int{0, 2} {
+		got, _, err := s.FindReservationByCode(ctx, reservations[idx].Code)
+		if err != nil {
+			t.Errorf("peer %d: err %v", idx, err)
+			continue
+		}
+		if got.ConfirmedAt == nil {
+			t.Errorf("peer %d should stay confirmed", idx)
+		}
+		if got.CancelledAt != nil {
+			t.Errorf("peer %d should NOT be cancelled", idx)
+		}
+	}
+}
+
 func TestCreateOrderMultiSeat(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

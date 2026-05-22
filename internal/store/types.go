@@ -62,6 +62,10 @@ type Reservation struct {
 	ExpiresAt    time.Time
 	ConfirmedAt  *time.Time
 	CancelledAt  *time.Time
+	// RefundedAt records that admin manually returned this ticket's
+	// money in monobank. Per-seat granularity matters for multi-seat
+	// orders where only some attendees ask for a refund.
+	RefundedAt *time.Time
 }
 
 // Ticket is the QR-bearing artifact issued after a confirmed payment.
@@ -110,13 +114,11 @@ const (
 )
 
 // MyItem couples a user's reservation with its seat for /my output.
-// OrderRefundedAt is populated for admin guest listings (so the UI can
-// show a "повернуто" badge per row). Bot /my and reminder paths leave
-// it nil — they don't query orders.refunded_at.
+// Refund state now lives on Reservation.RefundedAt directly (per-seat
+// granularity); MyItem stays a plain pair.
 type MyItem struct {
-	Reservation     Reservation
-	Seat            Seat
-	OrderRefundedAt *time.Time
+	Reservation Reservation
+	Seat        Seat
 }
 
 // Stats is an admin snapshot of a single show.

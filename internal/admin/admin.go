@@ -532,8 +532,8 @@ func toGuestResponse(item store.MyItem, now time.Time) guestResponse {
 			BuyerName: item.Reservation.BuyerName, TGUserID: item.Reservation.TGUserID,
 			CreatedAt: item.Reservation.CreatedAt, ExpiresAt: item.Reservation.ExpiresAt,
 			ConfirmedAt: item.Reservation.ConfirmedAt, CancelledAt: item.Reservation.CancelledAt,
-			RefundedAt: item.OrderRefundedAt,
-			Status:     reservationStatus(item.Reservation, now),
+			RefundedAt:  item.Reservation.RefundedAt,
+			Status:      reservationStatus(item.Reservation, now),
 		},
 		Seat: seatBriefBody{
 			ID: item.Seat.ID, Row: item.Seat.Row, Col: item.Seat.Col,
@@ -637,15 +637,16 @@ func (h *Handler) cancelReservation(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toGuestResponse(store.MyItem{Reservation: res, Seat: seat}, time.Now()))
 }
 
-// markRefunded stamps orders.refunded_at — pure bookkeeping. Seat
-// status is untouched (use cancel to free a seat). Refusable when the
-// order isn't confirmed, or already marked.
+// markRefunded stamps reservations.refunded_at — pure bookkeeping for
+// a single ticket. Seat status is untouched (use cancel for that).
+// Refusable when the parent order isn't confirmed, or this row was
+// already marked.
 func (h *Handler) markRefunded(w http.ResponseWriter, r *http.Request) {
 	id, ok := parseID(w, r)
 	if !ok {
 		return
 	}
-	order, err := h.st.MarkOrderRefunded(r.Context(), id)
+	res, seat, err := h.st.MarkReservationRefunded(r.Context(), id)
 	switch {
 	case errors.Is(err, store.ErrCodeNotFound):
 		writeError(w, http.StatusNotFound, "reservation_not_found", "")
@@ -661,15 +662,11 @@ func (h *Handler) markRefunded(w http.ResponseWriter, r *http.Request) {
 		writeInternal(w, "mark refunded", err)
 		return
 	}
-	h.audit(r, "order.refund_marked", fmt.Sprintf("order:%d", order.ID), map[string]any{
-		"code": order.Code, "total_kopecks": order.TotalKopecks,
-		"buyer_name": order.BuyerName, "buyer_email": order.BuyerEmail,
+	h.audit(r, "reservation.refund_marked", fmt.Sprintf("reservation:%d", id), map[string]any{
+		"code": res.Code, "price_kopecks": seat.PriceKopecks,
+		"buyer_name": res.BuyerName, "buyer_email": res.BuyerEmail,
 	})
-	writeJSON(w, http.StatusOK, map[string]any{
-		"order_id":     order.ID,
-		"code":         order.Code,
-		"refunded_at":  order.RefundedAt,
-	})
+	writeJSON(w, http.StatusOK, toGuestResponse(store.MyItem{Reservation: res, Seat: seat}, time.Now()))
 }
 
 // --- audit ---

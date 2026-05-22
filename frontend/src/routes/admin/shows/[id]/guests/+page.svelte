@@ -69,9 +69,8 @@
 		}
 	}
 
-	// Refund mark — purely bookkeeping. Doesn't free seat, doesn't change
-	// status. After click, the row carries refunded_at so the badge
-	// replaces the button.
+	// Refund mark — purely bookkeeping. Per-seat: marks only this
+	// reservation, peers in the same multi-seat order are unaffected.
 	async function markRefunded(g: Guest) {
 		if (
 			!confirm(
@@ -81,15 +80,8 @@
 		)
 			return;
 		try {
-			await api.post(`/api/admin/reservations/${g.reservation.id}/refund`);
-			// Optimistic: stamp the row locally. The endpoint returns the
-			// order, not the guest row, so a full update would need a
-			// refetch; one bit of state is enough for the badge.
-			guests = guests.map((x) =>
-				x.reservation.id === g.reservation.id
-					? { ...x, reservation: { ...x.reservation, refunded_at: new Date().toISOString() } }
-					: x
-			);
+			const updated = await api.post<Guest>(`/api/admin/reservations/${g.reservation.id}/refund`);
+			guests = guests.map((x) => (x.reservation.id === updated.reservation.id ? updated : x));
 		} catch (e) {
 			if (e instanceof ApiError) error = e.detail || e.code;
 			else error = String(e);
