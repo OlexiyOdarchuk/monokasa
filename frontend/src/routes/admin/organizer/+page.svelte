@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { api, type Organizer, ApiError } from '$lib/api';
+	import { safeImageSrc } from '$lib/safe';
 
 	let loaded = $state(false);
 	let saving = $state(false);
@@ -184,7 +185,7 @@
 			/>
 			{#if logoURL}
 				<img
-					src={logoURL}
+					src={safeImageSrc(logoURL)}
 					alt="Прев'ю логотипу"
 					class="mt-3 max-h-32 rounded-md border border-neutral-800"
 					onerror={(e: Event) => ((e.target as HTMLImageElement).style.display = 'none')}

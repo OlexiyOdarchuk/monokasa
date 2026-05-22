@@ -1763,12 +1763,16 @@ func (s *Store) ConfirmOrder(ctx context.Context, orderID int64, qrPayloads map[
 
 // LinkOrderToTGChat associates a web-buyer order with a Telegram chat so
 // the bot can deliver the PDFs after payment in addition to (or instead
-// of) the email channel. Idempotent: re-linking the same chat is a
-// no-op; linking a different chat overwrites — the most recent /start
-// wins.
+// of) the email channel. Idempotent: re-linking the same TG user is a
+// no-op (chat id refreshed).
 //
-// Both the order row and every reservation row in it get the new chat
-// ids (reservations stay denormalised for legacy queries). Returns
+// Refuses to overwrite a different already-linked TG user — otherwise
+// anyone who learns or guesses the order code (forwarded screenshot,
+// shared link) could hijack ticket delivery to their own chat by
+// invoking /start res_<code>. Returns ErrNotYourBooking in that case.
+//
+// Both the order row and every reservation row in it get the chat id
+// (reservations stay denormalised for legacy queries). Returns
 // ErrCodeNotFound for missing codes, ErrAlreadyClosed for cancelled.
 func (s *Store) LinkOrderToTGChat(ctx context.Context, code string, tgUserID, tgChatID int64) (Order, []OrderItem, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -1780,6 +1784,11 @@ func (s *Store) LinkOrderToTGChat(ctx context.Context, code string, tgUserID, tg
 	o, items, err := s.findOrderByCodeTx(ctx, tx, code)
 	if err != nil {
 		return o, nil, err
+	}
+	// Refuse takeover when a different TG user is already attached.
+	// Zero is "no one linked yet" — web-buyer orders start that way.
+	if o.TGUserID != 0 && o.TGUserID != tgUserID {
+		return o, nil, ErrNotYourBooking
 	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE orders SET tg_user_id = ?, tg_chat_id = ? WHERE id = ?`,

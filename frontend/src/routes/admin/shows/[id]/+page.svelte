@@ -2,6 +2,7 @@
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
 	import { api, type Show, type UpdateShowInput, type SeatCategory, ApiError } from '$lib/api';
+	import { safeImageSrc } from '$lib/safe';
 	import DateTimePicker from '$lib/DateTimePicker.svelte';
 
 	const id = $derived(Number(page.params.id));
@@ -391,7 +392,7 @@
 					</p>
 				</details>
 				{#if editPosterURL}
-					<img src={editPosterURL} alt="Прев'ю постера" class="max-h-48 rounded-md border border-neutral-800" onerror={(e: Event) => ((e.target as HTMLImageElement).style.display = 'none')} />
+					<img src={safeImageSrc(editPosterURL)} alt="Прев'ю постера" class="max-h-48 rounded-md border border-neutral-800" onerror={(e: Event) => ((e.target as HTMLImageElement).style.display = 'none')} />
 				{/if}
 				{#if uploadError}
 					<p class="text-xs text-red-400">{uploadError}</p>

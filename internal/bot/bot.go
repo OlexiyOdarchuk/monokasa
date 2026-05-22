@@ -1045,6 +1045,13 @@ func (b *Bot) linkReservation(c tele.Context, code string) error {
 		return c.Send("Цю бронь не знайдено. Можливо, посилання застаріле.")
 	case errors.Is(err, ErrAlreadyClosed):
 		return c.Send("Цю бронь вже скасовано.")
+	case errors.Is(err, ErrNotYourBooking):
+		// Another TG user already linked this order — refuse takeover
+		// so a leaked code can't redirect ticket delivery.
+		slog.Warn("link order: refused — already linked to another user",
+			"code", code, "sender", sender.ID)
+		return c.Send("Цю бронь вже прив'язано до іншого користувача. " +
+			"Якщо це твоя бронь і ти втратив доступ — напиши організатору.")
 	case err != nil:
 		slog.Error("link order", "code", code, "err", err)
 		return c.Send("Внутрішня помилка, спробуй пізніше.")

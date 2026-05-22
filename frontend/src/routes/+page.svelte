@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { publicApi, type PublicShowSummary, ApiError } from '$lib/api';
+	import { safeImageSrc } from '$lib/safe';
 
 	let shows = $state<PublicShowSummary[]>([]);
 	let loaded = $state(false);
@@ -85,7 +86,7 @@
 						{#if show.poster_url}
 							<div class="aspect-[16/9] overflow-hidden bg-neutral-950">
 								<img
-									src={show.poster_url}
+									src={safeImageSrc(show.poster_url)}
 									alt={show.title}
 									class="h-full w-full object-cover transition group-hover:scale-[1.02]"
 									loading="lazy"

@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { publicApi, type Organizer, ApiError } from '$lib/api';
+	import { safeHref, safeImageSrc } from '$lib/safe';
 
 	let o = $state<Organizer | null>(null);
 	let loaded = $state(false);
@@ -31,13 +32,6 @@
 				o.logo_url)
 	);
 
-	function safeHref(url: string): string | undefined {
-		const u = url.trim();
-		if (!u) return undefined;
-		if (u.startsWith('http://') || u.startsWith('https://') || u.startsWith('/')) return u;
-		// Avoid javascript:/data: schemes — only allow https-style absolute or relative.
-		return 'https://' + u;
-	}
 </script>
 
 <svelte:head>
@@ -68,7 +62,7 @@
 		<section class="mt-6">
 			{#if o.logo_url}
 				<img
-					src={o.logo_url}
+					src={safeImageSrc(o.logo_url)}
 					alt={o.name || 'Логотип'}
 					class="mb-5 h-24 w-24 rounded-xl border border-neutral-800 object-cover"
 					onerror={(e: Event) => ((e.target as HTMLImageElement).style.display = 'none')}

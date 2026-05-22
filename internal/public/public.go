@@ -1236,9 +1236,17 @@ func (h *Handler) loginLogout(w http.ResponseWriter, r *http.Request) {
 	if ck, err := r.Cookie(buyerSessionCookie); err == nil {
 		_ = h.st.DeleteBuyerSession(r.Context(), ck.Value)
 	}
+	// Mirror every attribute of the set-side cookie so browsers actually
+	// delete it. A cookie with a different Path or SameSite is treated
+	// as a distinct cookie and the original survives.
 	http.SetCookie(w, &http.Cookie{
-		Name: buyerSessionCookie, Value: "", Path: "/",
-		HttpOnly: true, MaxAge: -1, Secure: h.cookieSecure(r),
+		Name:     buyerSessionCookie,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   h.cookieSecure(r),
+		MaxAge:   -1,
 	})
 	w.WriteHeader(http.StatusNoContent)
 }

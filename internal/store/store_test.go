@@ -1087,13 +1087,17 @@ func TestLinkReservationToTGChat(t *testing.T) {
 	if linked.TGUserID != 12345 || linked.TGChatID != 67890 {
 		t.Errorf("link did not persist: %+v", linked)
 	}
-	// Re-link to a different chat is fine (latest wins).
-	relinked, _, err := s.LinkOrderToTGChat(ctx, r.Code, 99, 88)
+	// Same user re-link is fine (chat id may have changed).
+	relinked, _, err := s.LinkOrderToTGChat(ctx, r.Code, 12345, 88)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if relinked.TGChatID != 88 {
-		t.Errorf("relink TGChatID = %d, want 88", relinked.TGChatID)
+		t.Errorf("same-user relink TGChatID = %d, want 88", relinked.TGChatID)
+	}
+	// Different user re-link is REFUSED — prevents code-leak takeover.
+	if _, _, err := s.LinkOrderToTGChat(ctx, r.Code, 99, 100); !errors.Is(err, ErrNotYourBooking) {
+		t.Errorf("different-user relink: got %v, want ErrNotYourBooking", err)
 	}
 }
 

@@ -10,6 +10,7 @@
 		type ReservationStatusResponse,
 		ApiError
 	} from '$lib/api';
+	import { safeHref, safeImageSrc } from '$lib/safe';
 
 	const slug = $derived(page.params.slug);
 
@@ -480,7 +481,7 @@
 			</div>
 
 			<a
-				href={success.pay_url}
+				href={safeHref(success.pay_url)}
 				target="_blank"
 				rel="noopener"
 				class="mt-5 block w-full rounded-lg bg-[var(--color-brand)] px-4 py-3 text-base font-medium text-black hover:bg-[var(--color-brand-hover)]"
@@ -490,7 +491,7 @@
 
 			{#if success.tg_deep_link}
 				<a
-					href={success.tg_deep_link}
+					href={safeHref(success.tg_deep_link)}
 					target="_blank"
 					rel="noopener"
 					class="mt-3 block w-full rounded-lg border border-sky-700 bg-sky-950/40 px-4 py-3 text-sm text-sky-200 hover:bg-sky-950/70"
@@ -513,7 +514,7 @@
 		{#if show.poster_url}
 			<div class="mb-4 overflow-hidden rounded-xl border border-neutral-800 bg-neutral-950">
 				<img
-					src={show.poster_url}
+					src={safeImageSrc(show.poster_url)}
 					alt={show.title}
 					class="aspect-[16/9] w-full object-cover"
 					onerror={(e: Event) => ((e.target as HTMLImageElement).style.display = 'none')}
