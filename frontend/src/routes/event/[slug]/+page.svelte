@@ -48,6 +48,23 @@
 			: (show?.seats ?? []).filter((s) => s.sellable && !s.taken).length
 	);
 
+	// Brief "you just picked X" toast above the seat map — gives buyer
+	// feedback when the seat tap is far from the cart. Auto-dismisses
+	// after a couple of seconds.
+	let pickToast = $state('');
+	let pickToastTimer: ReturnType<typeof setTimeout> | null = null;
+	function showPickToast(text: string) {
+		pickToast = text;
+		if (pickToastTimer) clearTimeout(pickToastTimer);
+		pickToastTimer = setTimeout(() => {
+			pickToast = '';
+		}, 1800);
+	}
+
+	// Sticky bottom drawer (mobile-first cart). Collapsed by default;
+	// taps to expand into the full buyer form on a partial-screen panel.
+	let cartOpen = $state(false);
+
 	let buyerName = $state('');
 	let buyerEmail = $state('');
 	// Optional promo code. Empty = no discount. Server validates +
@@ -101,16 +118,139 @@
 		return `hsl(${h % 360}, 65%, 55%)`;
 	}
 
-	const viewBox = $derived.by(() => {
-		if (!show || show.seats.length === 0) return '0 0 600 400';
+	// Base viewBox covers the whole hall — what we'd show at 1× zoom.
+	const baseView = $derived.by(() => {
+		if (!show || show.seats.length === 0) return { x: 0, y: 0, w: 600, h: 400 };
 		let maxX = 0;
 		let maxY = 0;
 		for (const s of show.seats) {
 			if (s.x > maxX) maxX = s.x;
 			if (s.y > maxY) maxY = s.y;
 		}
-		return `0 0 ${maxX + PAD} ${maxY + PAD + 40}`;
+		return { x: 0, y: 0, w: maxX + PAD, h: maxY + PAD + 40 };
 	});
+
+	// Zoom + pan state for the SVG seat map. zoom=1 is full-hall;
+	// 4 is the cap — beyond that seat labels go pixel-jaggy. panX/panY
+	// are in viewBox units (not screen px) so they stay stable across
+	// device sizes.
+	let zoom = $state(1);
+	let panX = $state(0);
+	let panY = $state(0);
+	const MIN_ZOOM = 1;
+	const MAX_ZOOM = 4;
+
+	const viewBox = $derived.by(() => {
+		const v = baseView;
+		const vw = v.w / zoom;
+		const vh = v.h / zoom;
+		const maxPanX = v.w - vw;
+		const maxPanY = v.h - vh;
+		const x = Math.max(0, Math.min(maxPanX, panX));
+		const y = Math.max(0, Math.min(maxPanY, panY));
+		return `${x} ${y} ${vw} ${vh}`;
+	});
+
+	// Pan/zoom touch state. Tracking which-finger-is-where is enough
+	// to handle the two gestures we care about: 1-finger drag and
+	// 2-finger pinch. We treat tap as "if pointer didn't move > 6px,
+	// it was a tap, fire the click handler" — otherwise drag suppresses.
+	let svgEl = $state<SVGSVGElement | null>(null);
+	let dragState: {
+		mode: 'pan' | 'pinch' | null;
+		startX: number;
+		startY: number;
+		startPanX: number;
+		startPanY: number;
+		startDist: number;
+		startZoom: number;
+		moved: boolean;
+	} = {
+		mode: null,
+		startX: 0,
+		startY: 0,
+		startPanX: 0,
+		startPanY: 0,
+		startDist: 0,
+		startZoom: 1,
+		moved: false
+	};
+
+	function pxPerUnit(): number {
+		// How many viewBox units one screen px represents at current zoom.
+		if (!svgEl) return 1;
+		const rect = svgEl.getBoundingClientRect();
+		if (rect.width === 0) return 1;
+		return baseView.w / zoom / rect.width;
+	}
+
+	function clampPan() {
+		const vw = baseView.w / zoom;
+		const vh = baseView.h / zoom;
+		const maxPanX = baseView.w - vw;
+		const maxPanY = baseView.h - vh;
+		if (panX < 0) panX = 0;
+		else if (panX > maxPanX) panX = maxPanX;
+		if (panY < 0) panY = 0;
+		else if (panY > maxPanY) panY = maxPanY;
+	}
+
+	function onTouchStart(e: TouchEvent) {
+		if (e.touches.length === 1) {
+			dragState.mode = 'pan';
+			dragState.startX = e.touches[0].clientX;
+			dragState.startY = e.touches[0].clientY;
+			dragState.startPanX = panX;
+			dragState.startPanY = panY;
+			dragState.moved = false;
+		} else if (e.touches.length === 2) {
+			dragState.mode = 'pinch';
+			const dx = e.touches[0].clientX - e.touches[1].clientX;
+			const dy = e.touches[0].clientY - e.touches[1].clientY;
+			dragState.startDist = Math.hypot(dx, dy);
+			dragState.startZoom = zoom;
+			dragState.moved = true; // pinch never registers as tap
+		}
+	}
+	function onTouchMove(e: TouchEvent) {
+		if (dragState.mode === 'pan' && e.touches.length === 1) {
+			const dx = e.touches[0].clientX - dragState.startX;
+			const dy = e.touches[0].clientY - dragState.startY;
+			if (Math.hypot(dx, dy) > 6) dragState.moved = true;
+			const ppu = pxPerUnit();
+			panX = dragState.startPanX - dx * ppu;
+			panY = dragState.startPanY - dy * ppu;
+			clampPan();
+			e.preventDefault();
+		} else if (dragState.mode === 'pinch' && e.touches.length === 2) {
+			const dx = e.touches[0].clientX - e.touches[1].clientX;
+			const dy = e.touches[0].clientY - e.touches[1].clientY;
+			const dist = Math.hypot(dx, dy);
+			if (dragState.startDist > 0) {
+				const factor = dist / dragState.startDist;
+				zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, dragState.startZoom * factor));
+				clampPan();
+			}
+			e.preventDefault();
+		}
+	}
+	function onTouchEnd() {
+		dragState.mode = null;
+	}
+	function onWheel(e: WheelEvent) {
+		// Desktop zoom via wheel — keep this on for Mini Apps opened in
+		// Telegram Desktop. Mobile path is touchstart/move/end above.
+		e.preventDefault();
+		const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+		zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom * factor));
+		clampPan();
+	}
+
+	function resetView() {
+		zoom = 1;
+		panX = 0;
+		panY = 0;
+	}
 
 	async function load() {
 		try {
@@ -186,6 +326,13 @@
 
 	function toggleSeat(s: PublicSeat) {
 		if (!s.sellable || s.taken) return;
+		// Pan/pinch drags shouldn't fire a click — guard with the
+		// drag tracker. If the gesture moved at all, treat this as a
+		// drag-end, not a tap.
+		if (dragState.moved) {
+			dragState.moved = false;
+			return;
+		}
 		if (selectedIds.has(s.id)) {
 			selectedIds.delete(s.id);
 			return;
@@ -196,6 +343,10 @@
 		}
 		error = '';
 		selectedIds.add(s.id);
+		const seatLabelText = s.label || `ряд ${s.row} · місце ${s.col}`;
+		showPickToast(
+			`✓ ${seatLabelText}${s.category ? ` · ${s.category}` : ''} · ${formatUAH(s.price_kopecks)}`
+		);
 	}
 
 	function clearSelection() {
@@ -772,13 +923,63 @@
 				</button>
 			</form>
 		{:else}
-		<!-- canvas -->
-		<div class="rounded-lg border border-neutral-800 bg-neutral-950 p-2">
+		<!-- canvas: SVG seat map with touch zoom/pan + tap toast -->
+		<div class="relative rounded-lg border border-neutral-800 bg-neutral-950 p-2">
+			{#if pickToast}
+				<div
+					class="pointer-events-none absolute left-1/2 top-3 z-10 -translate-x-1/2 rounded-full border border-emerald-700 bg-emerald-950/90 px-3 py-1 text-xs font-medium text-emerald-200 shadow-lg backdrop-blur-sm"
+					role="status"
+					aria-live="polite"
+				>
+					{pickToast}
+				</div>
+			{/if}
+			<!-- Zoom controls. Visible on every screen size — pinch on
+			     mobile still works, these are the accessible fallback. -->
+			<div class="pointer-events-none absolute right-3 top-3 z-10 flex flex-col gap-1">
+				<button
+					type="button"
+					aria-label="Збільшити"
+					onclick={() => {
+						zoom = Math.min(MAX_ZOOM, zoom * 1.4);
+						clampPan();
+					}}
+					class="pointer-events-auto size-8 rounded-md border border-neutral-700 bg-neutral-900/90 text-base font-semibold text-neutral-200 backdrop-blur hover:bg-neutral-800"
+				>
+					+
+				</button>
+				<button
+					type="button"
+					aria-label="Зменшити"
+					onclick={() => {
+						zoom = Math.max(MIN_ZOOM, zoom / 1.4);
+						clampPan();
+					}}
+					class="pointer-events-auto size-8 rounded-md border border-neutral-700 bg-neutral-900/90 text-base font-semibold text-neutral-200 backdrop-blur hover:bg-neutral-800"
+				>
+					−
+				</button>
+				{#if zoom !== 1 || panX !== 0 || panY !== 0}
+					<button
+						type="button"
+						aria-label="Скинути масштаб"
+						onclick={resetView}
+						class="pointer-events-auto size-8 rounded-md border border-neutral-700 bg-neutral-900/90 text-xs text-neutral-200 backdrop-blur hover:bg-neutral-800"
+					>
+						⤢
+					</button>
+				{/if}
+			</div>
 			<svg
+				bind:this={svgEl}
 				viewBox={viewBox}
-				class="block w-full max-h-[65vh] select-none"
+				class="block w-full max-h-[65vh] select-none touch-none"
 				role="img"
 				aria-label="Мапа зали"
+				ontouchstart={onTouchStart}
+				ontouchmove={onTouchMove}
+				ontouchend={onTouchEnd}
+				onwheel={onWheel}
 			>
 				<rect x="0" y="0" width="100%" height="32" fill="#1a1a1a" />
 				<text x="50%" y="20" text-anchor="middle" fill="#9ca3af" font-size="14" font-family="system-ui">
@@ -855,6 +1056,7 @@
 		<!-- selection / form panel -->
 		{#if selectedSeats.length > 0}
 			<form
+				id="cart-form"
 				onsubmit={submit}
 				class="mt-5 rounded-2xl border border-neutral-800 bg-neutral-900 p-5"
 			>
@@ -998,4 +1200,36 @@
 			<a href="/about" class="hover:text-neutral-400">Про організатора</a>
 		</footer>
 	</main>
+	<!-- Sticky cart CTA: thin bar at the bottom of the viewport that
+	     summarises the basket and scrolls to the form on tap. Only
+	     visible when the buyer has something in the cart AND no success
+	     screen is up. Mobile-first sizing; small enough on desktop to
+	     feel like a docked toolbar, not an intrusive overlay. -->
+	{#if !success && !showStarted && selectedSeats.length > 0}
+		<div class="fixed inset-x-0 bottom-0 z-30 border-t border-neutral-800 bg-neutral-950/95 px-4 py-3 backdrop-blur-md">
+			<div class="mx-auto flex max-w-3xl items-center gap-3">
+				<div class="min-w-0 flex-1">
+					<div class="text-sm font-medium text-neutral-100">
+						{selectedSeats.length}
+						{selectedSeats.length === 1 ? 'місце' : selectedSeats.length < 5 ? 'місця' : 'місць'} · {formatUAH(totalKopecks)}
+					</div>
+					<div class="truncate text-xs text-neutral-500">
+						{selectedSeats.map((s) => seatLabel(s)).join(', ')}
+					</div>
+				</div>
+				<button
+					type="button"
+					onclick={() => {
+						document.getElementById('cart-form')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+						setTimeout(() => {
+							(document.getElementById('n') as HTMLInputElement | null)?.focus();
+						}, 250);
+					}}
+					class="shrink-0 rounded-md bg-[var(--color-brand)] px-4 py-2 text-sm font-medium text-black hover:bg-[var(--color-brand-hover)]"
+				>
+					Оформити →
+				</button>
+			</div>
+		</div>
+	{/if}
 {/if}
