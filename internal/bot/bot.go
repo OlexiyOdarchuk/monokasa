@@ -212,8 +212,8 @@ type Bot struct {
 	jarLink    string
 	hold       time.Duration
 	adminTGID  int64
-	reconciler Reconciler   // optional — nil if MONO_TOKEN missing
-	jar        JarLookup    // optional — nil if jar link unparseable
+	reconciler Reconciler    // optional — nil if MONO_TOKEN missing
+	jar        JarLookup     // optional — nil if jar link unparseable
 	hub        *realtime.Hub // optional — nil-safe Publish, skipped for tests
 	showFn     ShowFn
 	// onSeatsFreed fires after any user-cancel that releases seats. Main.go

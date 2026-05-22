@@ -26,7 +26,7 @@ const (
 // Event is the wire shape pushed to SSE subscribers. JSON-encoded in
 // the handler; the struct is the single source of truth for field names.
 type Event struct {
-	Type   string     `json:"type"`    // always "seat_status" for now
+	Type   string     `json:"type"` // always "seat_status" for now
 	SeatID int64      `json:"seat_id"`
 	Status SeatStatus `json:"status"`
 }

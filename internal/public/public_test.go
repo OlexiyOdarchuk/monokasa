@@ -215,7 +215,7 @@ func TestCreateReservationTakenSeatIs409(t *testing.T) {
 	}
 }
 
-func TestCreateReservationLowercasesEmailDomain(t *testing.T) {
+func TestCreateReservationLowercasesEmail(t *testing.T) {
 	h := setup(t)
 	_, seats := h.seedShow(t, "Concert")
 	resp := h.createReservation(t, map[string]any{
@@ -230,7 +230,10 @@ func TestCreateReservationLowercasesEmailDomain(t *testing.T) {
 		BuyerEmail string `json:"buyer_email"`
 	}
 	json.NewDecoder(resp.Body).Decode(&body)
-	if body.BuyerEmail != "User@example.com" {
-		t.Errorf("email = %q, want User@example.com (domain lowercased)", body.BuyerEmail)
+	// Full lowercase: case-sensitive local-parts technically exist per
+	// RFC but no real provider honours them, and our /my login flow
+	// needs case-insensitive lookups to work.
+	if body.BuyerEmail != "user@example.com" {
+		t.Errorf("email = %q, want user@example.com", body.BuyerEmail)
 	}
 }

@@ -154,15 +154,15 @@ func (h *Handler) audit(r *http.Request, action, target string, details map[stri
 // --- shows ---
 
 type showResponse struct {
-	ID          int64      `json:"id"`
-	Slug        string     `json:"slug"`
-	Title       string     `json:"title"`
-	Venue       string     `json:"venue"`
-	StartsAt    time.Time  `json:"starts_at"`
-	Description string     `json:"description"`
-	PosterURL   string     `json:"poster_url"`
-	CreatedAt   time.Time  `json:"created_at"`
-	ArchivedAt  *time.Time `json:"archived_at,omitempty"`
+	ID           int64      `json:"id"`
+	Slug         string     `json:"slug"`
+	Title        string     `json:"title"`
+	Venue        string     `json:"venue"`
+	StartsAt     time.Time  `json:"starts_at"`
+	Description  string     `json:"description"`
+	PosterURL    string     `json:"poster_url"`
+	CreatedAt    time.Time  `json:"created_at"`
+	ArchivedAt   *time.Time `json:"archived_at,omitempty"`
 	Kind         string     `json:"kind"`          // "seated" or "ga"
 	GACapacity   int        `json:"ga_capacity"`   // pool size for GA shows
 	SessionGroup string     `json:"session_group"` // empty = standalone
@@ -693,8 +693,8 @@ func toGuestResponse(item store.MyItem, now time.Time) guestResponse {
 			BuyerName: item.Reservation.BuyerName, TGUserID: item.Reservation.TGUserID,
 			CreatedAt: item.Reservation.CreatedAt, ExpiresAt: item.Reservation.ExpiresAt,
 			ConfirmedAt: item.Reservation.ConfirmedAt, CancelledAt: item.Reservation.CancelledAt,
-			RefundedAt:  item.Reservation.RefundedAt,
-			Status:      reservationStatus(item.Reservation, now),
+			RefundedAt: item.Reservation.RefundedAt,
+			Status:     reservationStatus(item.Reservation, now),
 		},
 		Seat: seatBriefBody{
 			ID: item.Seat.ID, Row: item.Seat.Row, Col: item.Seat.Col,
@@ -1027,16 +1027,16 @@ func (h *Handler) analytics(w http.ResponseWriter, r *http.Request) {
 // --- discount codes ---
 
 type discountResponse struct {
-	ID         int64      `json:"id"`
-	Code       string     `json:"code"`
-	Kind       string     `json:"kind"`  // "percent" or "fixed"
-	Value      int64      `json:"value"`
-	Scope      string     `json:"scope"` // "order" or "ticket"
-	MaxUses    int        `json:"max_uses"`
-	UsedCount  int        `json:"used_count"`
-	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
-	Active     bool       `json:"active"`
-	CreatedAt  time.Time  `json:"created_at"`
+	ID        int64      `json:"id"`
+	Code      string     `json:"code"`
+	Kind      string     `json:"kind"` // "percent" or "fixed"
+	Value     int64      `json:"value"`
+	Scope     string     `json:"scope"` // "order" or "ticket"
+	MaxUses   int        `json:"max_uses"`
+	UsedCount int        `json:"used_count"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+	Active    bool       `json:"active"`
+	CreatedAt time.Time  `json:"created_at"`
 }
 
 func toDiscountResponse(d store.DiscountCode) discountResponse {

@@ -224,13 +224,13 @@ type BuyerTicketRow struct {
 // keep the schema light, the column carries whatever context the
 // action needed.
 type AuditEntry struct {
-	ID           int64
-	ActorUserID  int64
-	ActorEmail   string
-	Action       string // e.g. "show.create", "reservation.cancel"
-	Target       string // e.g. "show:42", "reservation:123"
-	Details      string // JSON, may be ""
-	CreatedAt    time.Time
+	ID          int64
+	ActorUserID int64
+	ActorEmail  string
+	Action      string // e.g. "show.create", "reservation.cancel"
+	Target      string // e.g. "show:42", "reservation:123"
+	Details     string // JSON, may be ""
+	CreatedAt   time.Time
 }
 
 // DiscountCode is an admin-defined promo applied at checkout. Kind
@@ -240,27 +240,27 @@ type AuditEntry struct {
 // otherwise UsedCount is checked + incremented atomically inside the
 // CreateOrder tx so we never oversell a 100-use code.
 type DiscountCode struct {
-	ID         int64
-	Code       string
-	Kind       string // "percent" or "fixed"
-	Value      int64  // percent points 1..100, OR kopecks
+	ID    int64
+	Code  string
+	Kind  string // "percent" or "fixed"
+	Value int64  // percent points 1..100, OR kopecks
 	// Scope is "order" (default — discount applies to cart total) or
 	// "ticket" (discount caps at one seat's price, so a 100% comp code
 	// can't accidentally give the whole cart away).
-	Scope      string
-	MaxUses    int
-	UsedCount  int
-	ExpiresAt  *time.Time
-	Active     bool
-	CreatedAt  time.Time
+	Scope     string
+	MaxUses   int
+	UsedCount int
+	ExpiresAt *time.Time
+	Active    bool
+	CreatedAt time.Time
 }
 
 // AppliedDiscount is the resolved discount captured on one order. The
 // label survives even after the parent DiscountCode row gets deleted or
 // renamed — orders.discount_code stores the original code string.
 type AppliedDiscount struct {
-	Code     string
-	Kopecks  int64
+	Code    string
+	Kopecks int64
 }
 
 // WaitlistEntry is one buyer waiting for a seat to free up on a show.

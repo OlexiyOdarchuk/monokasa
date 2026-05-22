@@ -2365,11 +2365,11 @@ func (s *Store) BuyerTicketsByEmail(ctx context.Context, email string) ([]BuyerT
 	for rows.Next() {
 		var row BuyerTicketRow
 		var (
-			orderCreatedAt, orderExpiresAt                                       int64
-			orderConf, orderCancelled, orderReminded, orderRefunded              sql.NullInt64
-			showStartsAt                                                         int64
-			qrPayload                                                            sql.NullString
-			ticketUsedAt                                                         sql.NullInt64
+			orderCreatedAt, orderExpiresAt                          int64
+			orderConf, orderCancelled, orderReminded, orderRefunded sql.NullInt64
+			showStartsAt                                            int64
+			qrPayload                                               sql.NullString
+			ticketUsedAt                                            sql.NullInt64
 		)
 		err := rows.Scan(
 			&row.Order.ID, &row.Order.Code, &row.Order.BuyerName, &row.Order.BuyerEmail,
@@ -2674,11 +2674,17 @@ func (s *Store) DeleteDiscountCode(ctx context.Context, id int64) error {
 // so a previously-notified person who tries to re-subscribe stays
 // notified-once. Returns the resulting row.
 func (s *Store) AddToWaitlist(ctx context.Context, showID int64, email string) (WaitlistEntry, error) {
+	// Lowercase the full address so Foo@x.com and foo@x.com collapse
+	// to one waitlist row. RFC technically allows case-sensitive local
+	// parts but no major mail provider honours that, and the UNIQUE
+	// constraint here is case-sensitive in SQLite by default.
+	email = strings.ToLower(email)
 	now := time.Now().Unix()
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO waiting_list (show_id, email, created_at)
 		VALUES (?, ?, ?)
-		ON CONFLICT(show_id, email) DO NOTHING`,
+		ON CONFLICT(show_id, email) DO UPDATE
+		SET notified_at = NULL, created_at = excluded.created_at`,
 		showID, email, now)
 	if err != nil {
 		return WaitlistEntry{}, err
@@ -2701,24 +2707,16 @@ func (s *Store) AddToWaitlist(ctx context.Context, showID int64, email string) (
 	return w, nil
 }
 
-// PopWaitlistForShow returns up to `limit` not-yet-notified waitlist
-// entries for the show and atomically marks them notified. Caller is
-// expected to actually send the email — there's no second commit step,
-// so a transient SMTP failure could send to a "notified=true" row that
-// the buyer never sees. The trade-off is small: SMTP retries inside
-// the same process; missed notifications are recoverable by hand from
-// the audit log if needed.
-func (s *Store) PopWaitlistForShow(ctx context.Context, showID int64, limit int) ([]WaitlistEntry, error) {
+// NextUnnotifiedWaitlist returns up to `limit` unnotified waitlist
+// entries for the show, ordered by signup time (FIFO). Does NOT mark
+// them notified — caller is expected to send the email and then call
+// MarkWaitlistNotified on success. Splitting these prevents a silent
+// loss if SMTP fails between mark and send.
+func (s *Store) NextUnnotifiedWaitlist(ctx context.Context, showID int64, limit int) ([]WaitlistEntry, error) {
 	if limit <= 0 {
 		limit = 10
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
-	rows, err := tx.QueryContext(ctx, `
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, show_id, email, created_at
 		FROM waiting_list
 		WHERE show_id = ? AND notified_at IS NULL
@@ -2727,32 +2725,28 @@ func (s *Store) PopWaitlistForShow(ctx context.Context, showID int64, limit int)
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 	var out []WaitlistEntry
 	for rows.Next() {
 		var w WaitlistEntry
 		var createdAt int64
 		if err := rows.Scan(&w.ID, &w.ShowID, &w.Email, &createdAt); err != nil {
-			rows.Close()
 			return nil, err
 		}
 		w.CreatedAt = time.Unix(createdAt, 0)
 		out = append(out, w)
 	}
-	rows.Close()
-	if len(out) == 0 {
-		return nil, tx.Commit()
-	}
-	now := time.Now().Unix()
-	nt := time.Unix(now, 0)
-	for i := range out {
-		if _, err := tx.ExecContext(ctx,
-			`UPDATE waiting_list SET notified_at = ? WHERE id = ?`,
-			now, out[i].ID); err != nil {
-			return nil, err
-		}
-		out[i].NotifiedAt = &nt
-	}
-	return out, tx.Commit()
+	return out, rows.Err()
+}
+
+// MarkWaitlistNotified flips notified_at to now() on a single waitlist
+// row. Called after successful email send. Idempotent — repeated calls
+// just refresh the timestamp.
+func (s *Store) MarkWaitlistNotified(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE waiting_list SET notified_at = ? WHERE id = ?`,
+		time.Now().Unix(), id)
+	return err
 }
 
 // --- analytics ---

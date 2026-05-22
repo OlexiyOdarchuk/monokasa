@@ -524,9 +524,9 @@ func makeWaitlistNotifier(st *store.Store, mailer *payEmail, baseURL string) wai
 		// Cap at 5 even when more seats freed at once — beyond that the
 		// race to grab a seat gets unfair to anyone slower than the rest.
 		batch := min(freedCount, 5)
-		entries, err := st.PopWaitlistForShow(ctx, showID, batch)
+		entries, err := st.NextUnnotifiedWaitlist(ctx, showID, batch)
 		if err != nil {
-			slog.Error("waitlist pop", "showId", showID, "err", err)
+			slog.Error("waitlist next", "showId", showID, "err", err)
 			return
 		}
 		if len(entries) == 0 {
@@ -538,14 +538,25 @@ func makeWaitlistNotifier(st *store.Store, mailer *payEmail, baseURL string) wai
 			return
 		}
 		eventURL := origin + "/event/" + show.Slug
+		sent := 0
 		for _, e := range entries {
 			if err := mailer.SendWaitlistFreedEmail(ctx, e.Email,
 				pay.Show{Slug: show.Slug, Title: show.Title, Venue: show.Venue, StartsAt: show.StartsAt},
 				eventURL); err != nil {
+				// Don't mark on failure — next freed seat will retry
+				// this entry. Better repeat email on the rare success-
+				// after-retry than silently lose a real subscriber.
 				slog.Warn("waitlist email", "to", e.Email, "err", err)
+				continue
 			}
+			if err := st.MarkWaitlistNotified(ctx, e.ID); err != nil {
+				slog.Error("waitlist mark notified", "id", e.ID, "err", err)
+				continue
+			}
+			sent++
 		}
-		slog.Info("waitlist notified", "showId", showID, "count", len(entries))
+		slog.Info("waitlist notified", "showId", showID,
+			"attempted", len(entries), "sent", sent)
 	}
 }
 

@@ -1016,8 +1016,41 @@ func (h *Handler) createOrder(w http.ResponseWriter, r *http.Request) {
 	}
 
 	promo := strings.TrimSpace(req.DiscountCode)
-	order, _, err := h.st.CreateOrderWithDiscount(r.Context(), targets, 0, 0,
-		name, email, attendees, code, h.hold, promo)
+	var order store.Order
+	// GA shows can lose the race between AllocateFreeSeats and the
+	// CreateOrder atomic check — under load, a concurrent buyer might
+	// grab one of our picked seats. Retry up to 3 times with fresh
+	// allocations before surrendering. Seated orders pass through
+	// unchanged (single attempt — buyer chose specific seats).
+	gaRetries := 0
+	maxGARetries := 3
+	for {
+		order, _, err = h.st.CreateOrderWithDiscount(r.Context(), targets, 0, 0,
+			name, email, attendees, code, h.hold, promo)
+		if !show.IsGA() || !errors.Is(err, store.ErrSeatTaken) || gaRetries >= maxGARetries {
+			break
+		}
+		gaRetries++
+		picked, allocErr := h.st.AllocateFreeSeats(r.Context(), show.ID, req.Quantity)
+		if errors.Is(allocErr, store.ErrSeatTaken) {
+			writeError(w, http.StatusConflict, "not_enough_seats",
+				"замало вільних квитків")
+			return
+		}
+		if allocErr != nil {
+			writeInternal(w, "ga retry allocate", allocErr)
+			return
+		}
+		targets = picked
+		// Fresh code each attempt so the second attempt doesn't trip
+		// the "order code already exists" guard from the first.
+		newCode, codeErr := h.coder.NewCode()
+		if codeErr != nil {
+			writeInternal(w, "ga retry mint code", codeErr)
+			return
+		}
+		code = newCode
+	}
 	switch {
 	case errors.Is(err, store.ErrSeatTaken):
 		writeError(w, http.StatusConflict, "seat_taken", "одне з місць щойно зайняли")
@@ -1113,8 +1146,15 @@ func normalizeName(in string) (string, error) {
 }
 
 // normalizeEmail parses with net/mail.ParseAddress so we accept whatever
-// RFC 5322 considers valid, then strips the display name and lowercases
-// the domain (keeps the local-part as-typed — case-sensitive servers exist).
+// RFC 5322 considers valid, strips the display name, and lowercases
+// the whole address.
+//
+// The RFC says local-parts MAY be case-sensitive, but no major mail
+// provider actually honours that, and case-insensitivity is what every
+// other place in our flow assumes (buyer types "Olena@gmail" at order
+// time and "olena@gmail" when logging in — both should resolve to the
+// same /my tickets). Storing canonical lowercase trades RFC purity for
+// not stranding buyers behind a stray Shift key.
 func normalizeEmail(in string) (string, error) {
 	in = strings.TrimSpace(in)
 	if in == "" {
@@ -1124,11 +1164,7 @@ func normalizeEmail(in string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("invalid email")
 	}
-	at := strings.LastIndex(addr.Address, "@")
-	if at < 0 {
-		return "", fmt.Errorf("invalid email")
-	}
-	return addr.Address[:at] + "@" + strings.ToLower(addr.Address[at+1:]), nil
+	return strings.ToLower(addr.Address), nil
 }
 
 // jarPrefillURL mirrors the bot-side helper (kept in lockstep): appends
@@ -1335,13 +1371,13 @@ func (h *Handler) myWhoami(w http.ResponseWriter, r *http.Request) {
 }
 
 type buyerTicketResponse struct {
-	OrderID         int64                 `json:"order_id"`
-	OrderCode       string                `json:"order_code"`
-	OrderStatus     string                `json:"order_status"`
-	TotalKopecks    int64                 `json:"total_kopecks"`
-	CreatedAt       time.Time             `json:"created_at"`
-	Show            buyerTicketShow       `json:"show"`
-	Items           []buyerTicketItem     `json:"items"`
+	OrderID      int64             `json:"order_id"`
+	OrderCode    string            `json:"order_code"`
+	OrderStatus  string            `json:"order_status"`
+	TotalKopecks int64             `json:"total_kopecks"`
+	CreatedAt    time.Time         `json:"created_at"`
+	Show         buyerTicketShow   `json:"show"`
+	Items        []buyerTicketItem `json:"items"`
 }
 
 type buyerTicketShow struct {
@@ -1353,16 +1389,16 @@ type buyerTicketShow struct {
 }
 
 type buyerTicketItem struct {
-	ReservationID   int64      `json:"reservation_id"`
-	Row             int        `json:"row"`
-	Col             int        `json:"col"`
-	Label           string     `json:"label,omitempty"`
-	AttendeeName    string     `json:"attendee_name,omitempty"`
-	PriceKopecks    int64      `json:"price_kopecks"`
-	CancelledAt     *time.Time `json:"cancelled_at,omitempty"`
-	RefundedAt      *time.Time `json:"refunded_at,omitempty"`
-	QRPayload       string     `json:"qr_payload,omitempty"`
-	UsedAt          *time.Time `json:"used_at,omitempty"`
+	ReservationID int64      `json:"reservation_id"`
+	Row           int        `json:"row"`
+	Col           int        `json:"col"`
+	Label         string     `json:"label,omitempty"`
+	AttendeeName  string     `json:"attendee_name,omitempty"`
+	PriceKopecks  int64      `json:"price_kopecks"`
+	CancelledAt   *time.Time `json:"cancelled_at,omitempty"`
+	RefundedAt    *time.Time `json:"refunded_at,omitempty"`
+	QRPayload     string     `json:"qr_payload,omitempty"`
+	UsedAt        *time.Time `json:"used_at,omitempty"`
 }
 
 // myTickets returns every order under the current buyer's email,
