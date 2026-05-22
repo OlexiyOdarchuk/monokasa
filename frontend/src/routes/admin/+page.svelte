@@ -44,6 +44,12 @@
 			📊 Аналітика
 		</a>
 		<a
+			href="/admin/discounts"
+			class="rounded-md border border-neutral-700 px-3 py-2 text-sm text-neutral-300 hover:bg-neutral-800"
+		>
+			🏷 Промокоди
+		</a>
+		<a
 			href="/admin/organizer"
 			class="rounded-md border border-neutral-700 px-3 py-2 text-sm text-neutral-300 hover:bg-neutral-800"
 		>

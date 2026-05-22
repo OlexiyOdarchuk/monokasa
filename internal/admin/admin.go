@@ -92,6 +92,11 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /api/admin/organizer", h.saveOrganizer)
 
 	mux.HandleFunc("GET /api/admin/analytics", h.analytics)
+
+	mux.HandleFunc("GET /api/admin/discounts", h.listDiscounts)
+	mux.HandleFunc("POST /api/admin/discounts", h.createDiscount)
+	mux.HandleFunc("PATCH /api/admin/discounts/{id}", h.updateDiscount)
+	mux.HandleFunc("DELETE /api/admin/discounts/{id}", h.deleteDiscount)
 }
 
 // --- /me ---
@@ -1004,6 +1009,138 @@ func (h *Handler) analytics(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// --- discount codes ---
+
+type discountResponse struct {
+	ID         int64      `json:"id"`
+	Code       string     `json:"code"`
+	Kind       string     `json:"kind"` // "percent" or "fixed"
+	Value      int64      `json:"value"`
+	MaxUses    int        `json:"max_uses"`
+	UsedCount  int        `json:"used_count"`
+	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
+	Active     bool       `json:"active"`
+	CreatedAt  time.Time  `json:"created_at"`
+}
+
+func toDiscountResponse(d store.DiscountCode) discountResponse {
+	return discountResponse{
+		ID: d.ID, Code: d.Code, Kind: d.Kind, Value: d.Value,
+		MaxUses: d.MaxUses, UsedCount: d.UsedCount, ExpiresAt: d.ExpiresAt,
+		Active: d.Active, CreatedAt: d.CreatedAt,
+	}
+}
+
+func (h *Handler) listDiscounts(w http.ResponseWriter, r *http.Request) {
+	codes, err := h.st.ListDiscountCodes(r.Context())
+	if err != nil {
+		writeInternal(w, "list discounts", err)
+		return
+	}
+	out := make([]discountResponse, len(codes))
+	for i, c := range codes {
+		out[i] = toDiscountResponse(c)
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+type discountInput struct {
+	Code      string     `json:"code"`
+	Kind      string     `json:"kind"`
+	Value     int64      `json:"value"`
+	MaxUses   int        `json:"max_uses"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+	Active    bool       `json:"active"`
+}
+
+func (h *Handler) createDiscount(w http.ResponseWriter, r *http.Request) {
+	var req discountInput
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	code := strings.ToUpper(strings.TrimSpace(req.Code))
+	if code == "" {
+		writeError(w, http.StatusBadRequest, "invalid_input", "code required")
+		return
+	}
+	if err := validateDiscount(req.Kind, req.Value); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_input", err.Error())
+		return
+	}
+	saved, err := h.st.CreateDiscountCode(r.Context(), store.DiscountCode{
+		Code: code, Kind: req.Kind, Value: req.Value,
+		MaxUses: req.MaxUses, ExpiresAt: req.ExpiresAt, Active: req.Active,
+	})
+	if err != nil {
+		// UNIQUE collision → 409 so the SPA can show "цей код вже існує".
+		if strings.Contains(err.Error(), "already exists") {
+			writeError(w, http.StatusConflict, "code_taken", err.Error())
+			return
+		}
+		writeInternal(w, "create discount", err)
+		return
+	}
+	h.audit(r, "discount.create", fmt.Sprintf("discount:%d", saved.ID), map[string]any{
+		"code": saved.Code, "kind": saved.Kind, "value": saved.Value,
+	})
+	writeJSON(w, http.StatusCreated, toDiscountResponse(saved))
+}
+
+func (h *Handler) updateDiscount(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseID(w, r)
+	if !ok {
+		return
+	}
+	var req discountInput
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if err := validateDiscount(req.Kind, req.Value); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_input", err.Error())
+		return
+	}
+	if err := h.st.UpdateDiscountCode(r.Context(), store.DiscountCode{
+		ID: id, Kind: req.Kind, Value: req.Value,
+		MaxUses: req.MaxUses, ExpiresAt: req.ExpiresAt, Active: req.Active,
+	}); err != nil {
+		writeInternal(w, "update discount", err)
+		return
+	}
+	h.audit(r, "discount.update", fmt.Sprintf("discount:%d", id), map[string]any{
+		"kind": req.Kind, "value": req.Value, "active": req.Active,
+	})
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) deleteDiscount(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseID(w, r)
+	if !ok {
+		return
+	}
+	if err := h.st.DeleteDiscountCode(r.Context(), id); err != nil {
+		writeInternal(w, "delete discount", err)
+		return
+	}
+	h.audit(r, "discount.delete", fmt.Sprintf("discount:%d", id), nil)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func validateDiscount(kind string, value int64) error {
+	switch kind {
+	case "percent":
+		if value < 1 || value > 100 {
+			return errors.New("percent value must be 1..100")
+		}
+	case "fixed":
+		if value <= 0 {
+			return errors.New("fixed value must be > 0 kopecks")
+		}
+	default:
+		return errors.New("kind must be 'percent' or 'fixed'")
+	}
+	return nil
 }
 
 // --- organizer profile ---

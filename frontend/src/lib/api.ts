@@ -188,6 +188,27 @@ export interface BuyerTicket {
 	items: BuyerTicketItem[];
 }
 
+export interface DiscountCode {
+	id: number;
+	code: string;
+	kind: 'percent' | 'fixed';
+	value: number; // percent 1..100, OR kopecks for fixed
+	max_uses: number; // 0 = unlimited
+	used_count: number;
+	expires_at?: string | null;
+	active: boolean;
+	created_at: string;
+}
+
+export interface DiscountInput {
+	code: string;
+	kind: 'percent' | 'fixed';
+	value: number;
+	max_uses: number;
+	expires_at?: string | null;
+	active: boolean;
+}
+
 export interface DailySales {
 	date: string; // YYYY-MM-DD
 	tickets: number;
@@ -367,6 +388,8 @@ export interface CreateOrderInput {
 	attendee_names?: string[];
 	// GA-only: how many tickets to allocate. Server picks from the pool.
 	quantity?: number;
+	// Optional admin-defined promo. Backend dedupes uses atomically.
+	discount_code?: string;
 }
 
 export interface OrderItem {
@@ -382,6 +405,8 @@ export interface CreateOrderResponse {
 	buyer_name: string;
 	buyer_email: string;
 	tg_deep_link?: string;
+	discount_code?: string;
+	discount_kopecks?: number;
 }
 
 // publicApi mirrors api.* but does NOT auto-redirect to /admin/login on

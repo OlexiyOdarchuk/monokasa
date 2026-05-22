@@ -49,6 +49,10 @@
 
 	let buyerName = $state('');
 	let buyerEmail = $state('');
+	// Optional promo code. Empty = no discount. Server validates +
+	// applies inside the order-create tx; on error we surface the
+	// reason via the existing `error` slot.
+	let promoCode = $state('');
 	// Optional attendee name per seat, keyed by seat id. Empty/whitespace
 	// falls back to buyerName at render time. Only sent when at least one
 	// entry is non-empty — otherwise the request omits the field entirely.
@@ -201,6 +205,7 @@
 		if (isGA && gaQuantity < 1) return;
 		submitting = true;
 		error = '';
+		const promo = promoCode.trim();
 		try {
 			if (isGA) {
 				success = await publicApi.post<CreateOrderResponse>('/api/public/orders', {
@@ -208,7 +213,8 @@
 					seat_ids: [],
 					quantity: gaQuantity,
 					buyer_name: buyerName.trim(),
-					buyer_email: buyerEmail.trim()
+					buyer_email: buyerEmail.trim(),
+					...(promo ? { discount_code: promo } : {})
 				});
 			} else {
 				// Build the attendee_names slice 1:1 with selected seats. Skip
@@ -221,7 +227,8 @@
 					seat_ids: selectedSeats.map((s) => s.id),
 					buyer_name: buyerName.trim(),
 					buyer_email: buyerEmail.trim(),
-					...(anyFilled ? { attendee_names: attendees } : {})
+					...(anyFilled ? { attendee_names: attendees } : {}),
+					...(promo ? { discount_code: promo } : {})
 				});
 			}
 			payStatus = 'held';
@@ -456,8 +463,14 @@
 				{/each}
 			</ul>
 
-			<div class="mt-4 flex items-center justify-between rounded-lg border border-neutral-800 bg-neutral-950 px-3 py-2 text-left">
-				<span class="text-sm text-neutral-400">Сума</span>
+			{#if success.discount_kopecks && success.discount_kopecks > 0}
+				<div class="mt-4 flex items-center justify-between rounded-lg border border-emerald-900 bg-emerald-950/40 px-3 py-2 text-left">
+					<span class="text-sm text-emerald-300">🏷 {success.discount_code}</span>
+					<span class="text-sm font-semibold text-emerald-300">−{formatUAH(success.discount_kopecks)}</span>
+				</div>
+			{/if}
+			<div class="mt-2 flex items-center justify-between rounded-lg border border-neutral-800 bg-neutral-950 px-3 py-2 text-left">
+				<span class="text-sm text-neutral-400">До оплати</span>
 				<span class="text-base font-semibold">{formatUAH(success.total_kopecks)}</span>
 			</div>
 
@@ -652,6 +665,16 @@
 							{gaQuantity > 1 ? `${gaQuantity} PDF з QR прийдуть сюди` : 'PDF з QR прийде сюди'} після оплати.
 						</p>
 					</div>
+					<details class="mt-1 text-sm">
+						<summary class="cursor-pointer text-neutral-400 hover:text-neutral-200">🏷 У мене є промокод</summary>
+						<input
+							type="text"
+							bind:value={promoCode}
+							maxlength="40"
+							placeholder="EARLYBIRD"
+							class="mt-2 w-full rounded-md border border-neutral-800 bg-neutral-950 px-3 py-2 text-base uppercase focus:border-neutral-600 focus:outline-none"
+						/>
+					</details>
 				</div>
 
 				{#if error}
@@ -846,6 +869,16 @@
 							PDF з QR прийде сюди після оплати. На вході — покажи з телефону.
 						</p>
 					</div>
+					<details class="text-sm">
+						<summary class="cursor-pointer text-neutral-400 hover:text-neutral-200">🏷 У мене є промокод</summary>
+						<input
+							type="text"
+							bind:value={promoCode}
+							maxlength="40"
+							placeholder="EARLYBIRD"
+							class="mt-2 w-full rounded-md border border-neutral-800 bg-neutral-950 px-3 py-2 text-base uppercase focus:border-neutral-600 focus:outline-none"
+						/>
+					</details>
 				</div>
 
 				{#if error}

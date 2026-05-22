@@ -112,6 +112,12 @@ type Order struct {
 	// to actually free the seat); refund_at is purely bookkeeping so the
 	// organizer can answer "did I give this person their money back".
 	RefundedAt *time.Time
+	// DiscountCode is the promo code applied at checkout (empty if none).
+	// Survives even after the parent discount_codes row gets deleted.
+	DiscountCode string
+	// DiscountKopecks is the amount subtracted from sum(seat prices)
+	// to arrive at TotalKopecks. Zero when no discount applied.
+	DiscountKopecks int64
 }
 
 // SeatStatus is one of "free", "held", "sold".
@@ -220,6 +226,32 @@ type AuditEntry struct {
 	Target       string // e.g. "show:42", "reservation:123"
 	Details      string // JSON, may be ""
 	CreatedAt    time.Time
+}
+
+// DiscountCode is an admin-defined promo applied at checkout. Kind
+// is "percent" (Value=1..100, applied to seat-sum) or "fixed" (Value
+// is kopecks subtracted from the total). Both clamp at the seat-sum
+// (a discount can't pay the buyer money). MaxUses=0 means unlimited;
+// otherwise UsedCount is checked + incremented atomically inside the
+// CreateOrder tx so we never oversell a 100-use code.
+type DiscountCode struct {
+	ID         int64
+	Code       string
+	Kind       string // "percent" or "fixed"
+	Value      int64  // percent points 1..100, OR kopecks
+	MaxUses    int
+	UsedCount  int
+	ExpiresAt  *time.Time
+	Active     bool
+	CreatedAt  time.Time
+}
+
+// AppliedDiscount is the resolved discount captured on one order. The
+// label survives even after the parent DiscountCode row gets deleted or
+// renamed — orders.discount_code stores the original code string.
+type AppliedDiscount struct {
+	Code     string
+	Kopecks  int64
 }
 
 // WaitlistEntry is one buyer waiting for a seat to free up on a show.

@@ -258,6 +258,25 @@ var migrations = []string{
 		UNIQUE(show_id, email)
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_waitlist_show ON waiting_list(show_id, notified_at)`,
+	// Discount codes: admin-defined promos buyers can apply at checkout.
+	// kind='percent' values are 1..100; kind='fixed' values are kopecks.
+	// max_uses=0 means unlimited; used_count is incremented atomically
+	// inside CreateOrder so we never go over.
+	// COLLATE NOCASE on `code` lets buyers type EARLYBIRD/earlybird
+	// interchangeably; UNIQUE still applies case-insensitively.
+	`CREATE TABLE IF NOT EXISTS discount_codes (
+		id              INTEGER PRIMARY KEY,
+		code            TEXT NOT NULL UNIQUE COLLATE NOCASE,
+		kind            TEXT NOT NULL DEFAULT 'percent',
+		value           INTEGER NOT NULL DEFAULT 0,
+		max_uses        INTEGER NOT NULL DEFAULT 0,
+		used_count      INTEGER NOT NULL DEFAULT 0,
+		expires_at      INTEGER,
+		active          INTEGER NOT NULL DEFAULT 1,
+		created_at      INTEGER NOT NULL DEFAULT 0
+	)`,
+	`ALTER TABLE orders ADD COLUMN discount_code TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE orders ADD COLUMN discount_kopecks INTEGER NOT NULL DEFAULT 0`,
 }
 
 // Errors.
@@ -1358,6 +1377,31 @@ func (s *Store) CreateOrder(
 	buyerName, buyerEmail string, attendeeNames []string,
 	code string, hold time.Duration,
 ) (Order, []Reservation, error) {
+	return s.CreateOrderWithDiscount(ctx, seats, tgUserID, tgChatID,
+		buyerName, buyerEmail, attendeeNames, code, hold, "")
+}
+
+// ErrDiscountNotFound and friends signal why a buyer-supplied promo
+// code couldn't be applied. The handler converts these into 400s with
+// stable error codes so the SPA can show a friendly message.
+var (
+	ErrDiscountNotFound = errors.New("discount code does not exist")
+	ErrDiscountInactive = errors.New("discount code is not active")
+	ErrDiscountExpired  = errors.New("discount code has expired")
+	ErrDiscountUsedUp   = errors.New("discount code has reached its max uses")
+)
+
+// CreateOrderWithDiscount is the discount-aware variant of CreateOrder.
+// When discountCode != "", the tx looks the code up, validates it,
+// computes the kopecks discount, increments used_count atomically, and
+// stores the (code, kopecks) on the order. Total stored in the order
+// is the post-discount amount the pay processor will match against
+// the monobank transaction. discountCode is case-insensitive.
+func (s *Store) CreateOrderWithDiscount(
+	ctx context.Context, seats []Seat, tgUserID, tgChatID int64,
+	buyerName, buyerEmail string, attendeeNames []string,
+	code string, hold time.Duration, discountCode string,
+) (Order, []Reservation, error) {
 	if len(seats) == 0 {
 		return Order{}, nil, errors.New("CreateOrder: empty seats")
 	}
@@ -1403,11 +1447,73 @@ func (s *Store) CreateOrder(
 		total += seat.PriceKopecks
 	}
 
+	// Apply discount, if any. Lookup → validate → compute → increment
+	// uses, all inside the order tx so we never overshoot max_uses on
+	// race. The discount code stored in `orders.discount_code` is the
+	// canonical (DB) spelling so admins see it consistently in the
+	// audit log even if the buyer typed it lowercase.
+	var discountKopecks int64
+	var discountStored string
+	if discountCode != "" {
+		var (
+			discountID         int64
+			canonicalCode      string
+			kind               string
+			value              int64
+			maxUses, usedCount int
+			expiresAt          sql.NullInt64
+			activeInt          int
+		)
+		err := tx.QueryRowContext(ctx, `
+			SELECT id, code, kind, value, max_uses, used_count, expires_at, active
+			FROM discount_codes WHERE code = ? COLLATE NOCASE`,
+			discountCode).Scan(&discountID, &canonicalCode, &kind, &value,
+			&maxUses, &usedCount, &expiresAt, &activeInt)
+		if errors.Is(err, sql.ErrNoRows) {
+			return Order{}, nil, ErrDiscountNotFound
+		}
+		if err != nil {
+			return Order{}, nil, err
+		}
+		if activeInt == 0 {
+			return Order{}, nil, ErrDiscountInactive
+		}
+		if expiresAt.Valid && expiresAt.Int64 <= now.Unix() {
+			return Order{}, nil, ErrDiscountExpired
+		}
+		if maxUses > 0 && usedCount >= maxUses {
+			return Order{}, nil, ErrDiscountUsedUp
+		}
+		switch kind {
+		case "percent":
+			discountKopecks = total * value / 100
+		case "fixed":
+			discountKopecks = value
+		default:
+			return Order{}, nil, fmt.Errorf("unknown discount kind %q", kind)
+		}
+		// Clamp — a discount can never take the buyer's total below
+		// zero (or even below the pay processor's MinPrice, but the
+		// public handler guards that separately).
+		if discountKopecks > total {
+			discountKopecks = total
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE discount_codes SET used_count = used_count + 1 WHERE id = ?`,
+			discountID); err != nil {
+			return Order{}, nil, err
+		}
+		total -= discountKopecks
+		discountStored = canonicalCode
+	}
+
 	orderRes, err := tx.ExecContext(ctx, `
 		INSERT INTO orders(code, buyer_name, buyer_email, tg_user_id, tg_chat_id,
-		                   total_kopecks, created_at, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		code, buyerName, buyerEmail, tgUserID, tgChatID, total, now.Unix(), expires.Unix())
+		                   total_kopecks, discount_code, discount_kopecks,
+		                   created_at, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		code, buyerName, buyerEmail, tgUserID, tgChatID, total,
+		discountStored, discountKopecks, now.Unix(), expires.Unix())
 	if err != nil {
 		if isUniqueErr(err) {
 			return Order{}, nil, fmt.Errorf("order code %q already exists", code)
@@ -1471,10 +1577,12 @@ func (s *Store) FindOrderByCode(ctx context.Context, code string) (Order, []Orde
 	var createdAt, expiresAt int64
 	err := s.db.QueryRowContext(ctx, `
 		SELECT id, code, buyer_name, buyer_email, tg_user_id, tg_chat_id,
-		       total_kopecks, created_at, expires_at, confirmed_at, cancelled_at, reminded_at
+		       total_kopecks, discount_code, discount_kopecks,
+		       created_at, expires_at, confirmed_at, cancelled_at, reminded_at
 		FROM orders WHERE code = ?`, code).Scan(
 		&o.ID, &o.Code, &o.BuyerName, &o.BuyerEmail, &o.TGUserID, &o.TGChatID,
-		&o.TotalKopecks, &createdAt, &expiresAt, &conf, &cancelled, &reminded)
+		&o.TotalKopecks, &o.DiscountCode, &o.DiscountKopecks,
+		&createdAt, &expiresAt, &conf, &cancelled, &reminded)
 	if errors.Is(err, sql.ErrNoRows) {
 		return o, nil, ErrCodeNotFound
 	}
@@ -2348,6 +2456,95 @@ func isUniqueErr(err error) bool {
 		return false
 	}
 	return strings.Contains(err.Error(), "UNIQUE constraint failed")
+}
+
+// --- discount codes ---
+
+const discountCols = `id, code, kind, value, max_uses, used_count, expires_at, active, created_at`
+
+func scanDiscount(row interface{ Scan(...any) error }, d *DiscountCode) error {
+	var expiresAt sql.NullInt64
+	var createdAt int64
+	var activeInt int
+	if err := row.Scan(&d.ID, &d.Code, &d.Kind, &d.Value, &d.MaxUses,
+		&d.UsedCount, &expiresAt, &activeInt, &createdAt); err != nil {
+		return err
+	}
+	d.Active = activeInt != 0
+	d.CreatedAt = time.Unix(createdAt, 0)
+	if expiresAt.Valid {
+		t := time.Unix(expiresAt.Int64, 0)
+		d.ExpiresAt = &t
+	}
+	return nil
+}
+
+// ListDiscountCodes returns all promo codes — admin-only, no pagination
+// (admins rarely have more than a few dozen). Newest first.
+func (s *Store) ListDiscountCodes(ctx context.Context) ([]DiscountCode, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+discountCols+` FROM discount_codes ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DiscountCode
+	for rows.Next() {
+		var d DiscountCode
+		if err := scanDiscount(rows, &d); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// CreateDiscountCode inserts a new promo. kind∈{"percent","fixed"}.
+// For "percent" value∈[1,100]; for "fixed" value is kopecks (>0).
+// expiresAt nil = no expiry, maxUses 0 = unlimited.
+func (s *Store) CreateDiscountCode(ctx context.Context, d DiscountCode) (DiscountCode, error) {
+	now := time.Now().Unix()
+	var expiresAt any = nil
+	if d.ExpiresAt != nil {
+		expiresAt = d.ExpiresAt.Unix()
+	}
+	res, err := s.db.ExecContext(ctx, `
+		INSERT INTO discount_codes (code, kind, value, max_uses, expires_at, active, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		d.Code, d.Kind, d.Value, d.MaxUses, expiresAt, boolToInt(d.Active), now)
+	if err != nil {
+		if isUniqueErr(err) {
+			return DiscountCode{}, fmt.Errorf("discount code %q already exists", d.Code)
+		}
+		return DiscountCode{}, err
+	}
+	id, _ := res.LastInsertId()
+	d.ID = id
+	d.CreatedAt = time.Unix(now, 0)
+	return d, nil
+}
+
+// UpdateDiscountCode swaps fields on an existing row. Code (the string)
+// is immutable to keep historical orders.discount_code references readable.
+// Use DeleteDiscountCode + CreateDiscountCode to rename.
+func (s *Store) UpdateDiscountCode(ctx context.Context, d DiscountCode) error {
+	var expiresAt any = nil
+	if d.ExpiresAt != nil {
+		expiresAt = d.ExpiresAt.Unix()
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE discount_codes
+		SET kind=?, value=?, max_uses=?, expires_at=?, active=?
+		WHERE id=?`,
+		d.Kind, d.Value, d.MaxUses, expiresAt, boolToInt(d.Active), d.ID)
+	return err
+}
+
+// DeleteDiscountCode removes a code row. Past orders that used the code
+// keep their orders.discount_code label since we copy it at order time.
+func (s *Store) DeleteDiscountCode(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM discount_codes WHERE id = ?`, id)
+	return err
 }
 
 // --- waiting list ---

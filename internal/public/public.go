@@ -669,6 +669,9 @@ type createOrderRequest struct {
 	// seats, server allocates Quantity free virtual seats from the pool.
 	// Mutually exclusive with SeatIDs — providing both is an error.
 	Quantity int `json:"quantity,omitempty"`
+	// DiscountCode is an optional admin-defined promo. Server validates
+	// + applies + increments used_count atomically with the order.
+	DiscountCode string `json:"discount_code,omitempty"`
 }
 
 type orderItemResponse struct {
@@ -676,14 +679,16 @@ type orderItemResponse struct {
 }
 
 type createOrderResponse struct {
-	Code         string              `json:"code"`
-	ExpiresAt    time.Time           `json:"expires_at"`
-	PayURL       string              `json:"pay_url"`
-	TotalKopecks int64               `json:"total_kopecks"`
-	Items        []orderItemResponse `json:"items"`
-	BuyerName    string              `json:"buyer_name"`
-	BuyerEmail   string              `json:"buyer_email"`
-	TGDeepLink   string              `json:"tg_deep_link,omitempty"`
+	Code            string              `json:"code"`
+	ExpiresAt       time.Time           `json:"expires_at"`
+	PayURL          string              `json:"pay_url"`
+	TotalKopecks    int64               `json:"total_kopecks"`
+	Items           []orderItemResponse `json:"items"`
+	BuyerName       string              `json:"buyer_name"`
+	BuyerEmail      string              `json:"buyer_email"`
+	TGDeepLink      string              `json:"tg_deep_link,omitempty"`
+	DiscountCode    string              `json:"discount_code,omitempty"`
+	DiscountKopecks int64               `json:"discount_kopecks,omitempty"`
 }
 
 func (h *Handler) createOrder(w http.ResponseWriter, r *http.Request) {
@@ -843,13 +848,27 @@ func (h *Handler) createOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	order, _, err := h.st.CreateOrder(r.Context(), targets, 0, 0, name, email, attendees, code, h.hold)
+	promo := strings.TrimSpace(req.DiscountCode)
+	order, _, err := h.st.CreateOrderWithDiscount(r.Context(), targets, 0, 0,
+		name, email, attendees, code, h.hold, promo)
 	switch {
 	case errors.Is(err, store.ErrSeatTaken):
 		writeError(w, http.StatusConflict, "seat_taken", "одне з місць щойно зайняли")
 		return
 	case errors.Is(err, store.ErrSeatNotSellable):
 		writeError(w, http.StatusConflict, "seat_not_sellable", "")
+		return
+	case errors.Is(err, store.ErrDiscountNotFound):
+		writeError(w, http.StatusBadRequest, "discount_not_found", "промокод не знайдено")
+		return
+	case errors.Is(err, store.ErrDiscountInactive):
+		writeError(w, http.StatusBadRequest, "discount_inactive", "промокод вимкнено")
+		return
+	case errors.Is(err, store.ErrDiscountExpired):
+		writeError(w, http.StatusBadRequest, "discount_expired", "термін дії промокоду минув")
+		return
+	case errors.Is(err, store.ErrDiscountUsedUp):
+		writeError(w, http.StatusBadRequest, "discount_used_up", "промокод вичерпано")
 		return
 	case err != nil:
 		writeInternal(w, "create order", err)
@@ -882,14 +901,16 @@ func (h *Handler) createOrder(w http.ResponseWriter, r *http.Request) {
 		"total", order.TotalKopecks, "buyer", name, "email", email)
 
 	writeJSON(w, http.StatusCreated, createOrderResponse{
-		Code:         order.Code,
-		ExpiresAt:    order.ExpiresAt,
-		PayURL:       payURL,
-		TotalKopecks: order.TotalKopecks,
-		Items:        items,
-		BuyerName:    name,
-		BuyerEmail:   email,
-		TGDeepLink:   tgLink,
+		Code:            order.Code,
+		ExpiresAt:       order.ExpiresAt,
+		PayURL:          payURL,
+		TotalKopecks:    order.TotalKopecks,
+		Items:           items,
+		BuyerName:       name,
+		BuyerEmail:      email,
+		TGDeepLink:      tgLink,
+		DiscountCode:    order.DiscountCode,
+		DiscountKopecks: order.DiscountKopecks,
 	})
 }
 

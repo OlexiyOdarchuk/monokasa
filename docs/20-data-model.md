@@ -25,7 +25,7 @@
         └──────────┘
 ```
 
-Окремо: `users` (адмін-логіни) + `sessions` (auth-токени) + `organizer` (single-row профіль для /about).
+Окремо: `users` (адмін-логіни) + `sessions` (auth-токени) + `organizer` (single-row профіль для /about) + `discount_codes` (промокоди) + `waiting_list` (буфер email'ів для sold-out подій).
 
 ## Кожна таблиця
 

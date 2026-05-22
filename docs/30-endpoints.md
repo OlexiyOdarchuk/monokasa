@@ -48,6 +48,8 @@
   "attendee_names": ["Анна", "", "Богдан"]   // optional, length must match seat_ids
 }
 ```
+Опційно у body: `"discount_code": "EARLYBIRD"` — backend валідіює і apply'ить atomic'ом разом з створенням ордеру. Помилки: 400 `discount_not_found` / `discount_inactive` / `discount_expired` / `discount_used_up`. Відповідь додатково містить `discount_code` і `discount_kopecks` коли застосовано.
+
 Для GA — `seat_ids` опускається, додається `"quantity": 3`:
 ```json
 { "slug": "standup", "quantity": 3, "buyer_name": "Олена", "buyer_email": "o@ex.com" }
@@ -118,6 +120,10 @@ based підхід раніше ламав cookie в деяких браузер
 | GET | `/api/admin/organizer` | single-row профіль (name/bio/socials) |
 | PUT | `/api/admin/organizer` | overwrite профіль (всі поля опційні; bio ≤2000 chars) |
 | GET | `/api/admin/analytics?days=N` | агрегати: daily_sales[], total_*, конверсія, per_show[]; days∈[1,365] |
+| GET | `/api/admin/discounts` | список промокодів (newest first) |
+| POST | `/api/admin/discounts` | створити; `{code, kind:'percent'\|'fixed', value, max_uses, expires_at?, active}` |
+| PATCH | `/api/admin/discounts/{id}` | оновити kind/value/max_uses/expires_at/active (code immutable) |
+| DELETE | `/api/admin/discounts/{id}` | видалити (історичні orders зберігають назву) |
 
 ## Auth
 
