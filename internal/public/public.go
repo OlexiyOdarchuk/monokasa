@@ -38,43 +38,53 @@ type LoginMailer interface {
 
 // Handler is the buyer-side API surface.
 type Handler struct {
-	st             *store.Store
-	coder          *token.Coder
-	jarLink        string // monobank jar URL; pay link is jarLink?a=…&t=…
-	hold           time.Duration
-	priceMin       int64  // minimum price kopecks; reservations below this are rejected
-	botUsername    string // optional; when set, ReservationResponse carries a TG deep link
-	hub            *realtime.Hub
-	baseURL        string // public origin used when composing magic-link emails
-	loginMailer    LoginMailer
-	secureCookies  bool
+	st                 *store.Store
+	coder              *token.Coder
+	jarLink            string // monobank jar URL; pay link is jarLink?a=…&t=…
+	hold               time.Duration
+	priceMin           int64  // minimum price kopecks; reservations below this are rejected
+	botUsername        string // optional; when set, ReservationResponse carries a TG deep link
+	hub                *realtime.Hub
+	baseURL            string // public origin used when composing magic-link emails
+	loginMailer        LoginMailer
+	secureCookies      bool
+	freeOrderConfirmer FreeOrderConfirmer // optional; called for 0-kopeck orders so 100%-off promos auto-issue tickets
 }
 
+// FreeOrderConfirmer is the hook the handler calls after creating an
+// order whose post-discount total is zero. monobank can't issue
+// 0-kopeck invoices, so the pay processor needs to confirm + deliver
+// PDFs synchronously rather than waiting for a webhook that never
+// arrives. main.go wires this to pay.Processor.ConfirmFreeOrder.
+type FreeOrderConfirmer func(ctx context.Context, orderCode string) error
+
 type Config struct {
-	Store         *store.Store
-	Coder         *token.Coder
-	JarLink       string
-	Hold          time.Duration
-	MinPrice      int64
-	BotUsername   string        // optional Telegram bot @-handle (no leading "@")
-	Hub           *realtime.Hub // optional; SSE seat updates skipped if nil
-	BaseURL       string        // e.g. https://monokasa.app — needed for magic-link emails
-	LoginMailer   LoginMailer   // optional; magic-link login disabled when nil
-	SecureCookies bool          // true forces Secure cookie attribute in production
+	Store              *store.Store
+	Coder              *token.Coder
+	JarLink            string
+	Hold               time.Duration
+	MinPrice           int64
+	BotUsername        string        // optional Telegram bot @-handle (no leading "@")
+	Hub                *realtime.Hub // optional; SSE seat updates skipped if nil
+	BaseURL            string        // e.g. https://monokasa.app — needed for magic-link emails
+	LoginMailer        LoginMailer   // optional; magic-link login disabled when nil
+	SecureCookies      bool          // true forces Secure cookie attribute in production
+	FreeOrderConfirmer FreeOrderConfirmer
 }
 
 func NewHandler(c Config) *Handler {
 	return &Handler{
-		st:            c.Store,
-		coder:         c.Coder,
-		jarLink:       c.JarLink,
-		hold:          c.Hold,
-		priceMin:      c.MinPrice,
-		botUsername:   c.BotUsername,
-		hub:           c.Hub,
-		baseURL:       strings.TrimRight(c.BaseURL, "/"),
-		loginMailer:   c.LoginMailer,
-		secureCookies: c.SecureCookies,
+		st:                 c.Store,
+		coder:              c.Coder,
+		jarLink:            c.JarLink,
+		hold:               c.Hold,
+		priceMin:           c.MinPrice,
+		botUsername:        c.BotUsername,
+		hub:                c.Hub,
+		baseURL:            strings.TrimRight(c.BaseURL, "/"),
+		loginMailer:        c.LoginMailer,
+		secureCookies:      c.SecureCookies,
+		freeOrderConfirmer: c.FreeOrderConfirmer,
 	}
 }
 
@@ -989,6 +999,19 @@ func (h *Handler) createOrder(w http.ResponseWriter, r *http.Request) {
 	slog.Info("public order created",
 		"code", order.Code, "slug", show.Slug, "seats", len(targets),
 		"total", order.TotalKopecks, "buyer", name, "email", email)
+
+	// 0-kopeck orders (100% discount, comp tickets) never get a real
+	// monobank transaction — confirm + deliver tickets synchronously
+	// here so the buyer's success screen flips straight to "paid".
+	// If the hook isn't wired or fails, we still return success: the
+	// order stays held and the buyer will see a stuck "waiting" UI,
+	// but at least the seats are reserved and admin can resolve.
+	if order.TotalKopecks == 0 && h.freeOrderConfirmer != nil {
+		if err := h.freeOrderConfirmer(r.Context(), order.Code); err != nil {
+			slog.Error("free order confirm failed",
+				"code", order.Code, "err", err)
+		}
+	}
 
 	writeJSON(w, http.StatusCreated, createOrderResponse{
 		Code:            order.Code,

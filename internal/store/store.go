@@ -311,7 +311,12 @@ var (
 type Store struct{ db *sql.DB }
 
 func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path+"?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)")
+	// busy_timeout(5000) makes concurrent writers retry up to 5s instead
+	// of returning SQLITE_BUSY immediately — without it, the second of
+	// two simultaneous order-creates surfaces as a 500 to the buyer.
+	// foreign_keys + journal_mode(WAL) stay as before.
+	db, err := sql.Open("sqlite",
+		path+"?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, err
 	}
@@ -319,9 +324,31 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("schema: %w", err)
 	}
 	for _, m := range migrations {
-		_, _ = db.Exec(m) // duplicate-column errors are expected and ignored
+		// Idempotent migrations: ALTER TABLE ADD COLUMN on an existing
+		// column returns "duplicate column name", CREATE INDEX/TABLE
+		// IF NOT EXISTS is silent, INSERT OR IGNORE skips conflicts.
+		// Anything else is a real bug — surface it instead of letting
+		// schema drift land silently in prod.
+		if _, err := db.Exec(m); err != nil {
+			msg := err.Error()
+			if !strings.Contains(msg, "duplicate column name") &&
+				!strings.Contains(msg, "already exists") {
+				return nil, fmt.Errorf("migration %q: %w", firstLine(m), err)
+			}
+		}
 	}
 	return &Store{db: db}, nil
+}
+
+// firstLine returns the first non-blank line of s for use in error
+// messages — keeps migration diagnostics readable without printing
+// a multi-line CREATE TABLE statement.
+func firstLine(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexByte(s, '\n'); i > 0 {
+		return s[:i]
+	}
+	return s
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -1593,8 +1620,10 @@ func (s *Store) CreateOrderWithDiscount(
 		ID: orderID, Code: code,
 		BuyerName: buyerName, BuyerEmail: buyerEmail,
 		TGUserID: tgUserID, TGChatID: tgChatID,
-		TotalKopecks: total,
-		CreatedAt:    now, ExpiresAt: expires,
+		TotalKopecks:    total,
+		DiscountCode:    discountStored,
+		DiscountKopecks: discountKopecks,
+		CreatedAt:       now, ExpiresAt: expires,
 	}, reservations, nil
 }
 
@@ -1885,11 +1914,14 @@ func (s *Store) Stats(ctx context.Context, showID int64) (Stats, error) {
 		                     AND r.expires_at > ? THEN 1 ELSE 0 END), 0),
 		  COALESCE(SUM(CASE WHEN r.confirmed_at IS NOT NULL THEN s.price_kopecks ELSE 0 END), 0)
 		FROM reservations r JOIN seats s ON s.id = r.seat_id
-		WHERE s.show_id = ?`,
+		WHERE s.show_id = ? AND s.sellable = 1`,
 		time.Now().Unix(), showID).Scan(&st.Sold, &st.Held, &st.RevenueKopecks); err != nil {
 		return st, err
 	}
-	st.Free = st.Total - st.Sold - st.Held
+	// Total filters by sellable=1; Sold/Held now do the same in SQL so
+	// Free is guaranteed non-negative even if admin flips a sold seat
+	// to non-sellable retroactively.
+	st.Free = max(0, st.Total-st.Sold-st.Held)
 	return st, nil
 }
 

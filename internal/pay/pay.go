@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"strings"
 	"time"
 
@@ -48,13 +49,15 @@ type Seat struct {
 
 // Order is the subset of order info the processor reasons about.
 type Order struct {
-	ID           int64
-	Code         string
-	BuyerName    string
-	BuyerEmail   string
-	TGChatID     int64
-	TotalKopecks int64
-	ConfirmedAt  *time.Time
+	ID              int64
+	Code            string
+	BuyerName       string
+	BuyerEmail      string
+	TGChatID        int64
+	TotalKopecks    int64
+	DiscountCode    string
+	DiscountKopecks int64
+	ConfirmedAt     *time.Time
 }
 
 // OrderItem is one seat inside an order. ReservationID is what we mint
@@ -148,6 +151,124 @@ func (p *Processor) ReconcileTx(ctx context.Context, tx bank.Transaction) (bool,
 	return matched, err
 }
 
+// ConfirmFreeOrder is the no-webhook path for orders whose post-discount
+// total is zero — a 100%-off promo, comp ticket, etc. monobank can't
+// issue 0-kopeck invoices and the regular processTx requires
+// Amount > 0, so the public handler calls this synchronously right
+// after CreateOrderWithDiscount and the buyer drops straight onto the
+// "paid" screen.
+//
+// Behaviour mirrors processTx after the amount check: load order,
+// confirm in store (writes Ticket rows + QRs), broadcast SSE, audit,
+// render PDFs, deliver via Telegram + email. Returns the items so the
+// caller can include them in the API response if it wants.
+func (p *Processor) ConfirmFreeOrder(ctx context.Context, code string) ([]OrderItem, error) {
+	order, items, err := p.Store.FindOrderByCode(ctx, code)
+	if err != nil {
+		return nil, err
+	}
+	if order.TotalKopecks != 0 {
+		return nil, fmt.Errorf("ConfirmFreeOrder: order %q total %d != 0", code, order.TotalKopecks)
+	}
+	if order.ConfirmedAt != nil {
+		// Already confirmed — idempotent return, no double-delivery.
+		return items, nil
+	}
+	if err := p.deliverConfirmedOrder(ctx, order, items, deliverContext{
+		AuditAction: "payment.free",
+		AuditExtra: map[string]any{
+			"discount_code":    order.DiscountCode,
+			"discount_kopecks": order.DiscountKopecks,
+		},
+	}); err != nil {
+		return nil, err
+	}
+	metrics.IssuedFromWebhook() // same bucket — semantically "issued out-of-band"
+	return items, nil
+}
+
+// deliverContext bundles the metadata that differs between confirm
+// callers (webhook vs free-order) so the shared delivery code below
+// stays caller-agnostic.
+type deliverContext struct {
+	AuditAction string         // e.g. "payment.confirm" or "payment.free"
+	AuditExtra  map[string]any // merged into the audit details blob
+}
+
+// deliverConfirmedOrder is the shared confirm+render+deliver path used
+// by both webhook (processTx) and the no-webhook free-order branch.
+// Caller has already loaded the order and verified eligibility.
+func (p *Processor) deliverConfirmedOrder(ctx context.Context, order Order, items []OrderItem, dc deliverContext) error {
+	show, err := p.ShowFn(ctx)
+	if err != nil {
+		return fmt.Errorf("resolve show: %w", err)
+	}
+	qrs := make(map[int64]string, len(items))
+	for _, it := range items {
+		qrs[it.ReservationID] = p.Coder.QRPayload(it.ReservationID, it.Seat.ID)
+	}
+	if err := p.Store.ConfirmOrder(ctx, order.ID, qrs); err != nil {
+		return err
+	}
+	for _, it := range items {
+		p.Hub.Publish(it.Seat.ShowID, realtime.Event{
+			Type: "seat_status", SeatID: it.Seat.ID, Status: realtime.SeatSold,
+		})
+	}
+	details := map[string]any{
+		"code": order.Code, "seats": len(items),
+		"total_kopecks": order.TotalKopecks,
+	}
+	maps.Copy(details, dc.AuditExtra)
+	auditJSON, _ := json.Marshal(details)
+	if err := p.Store.LogAudit(ctx, dc.AuditAction,
+		fmt.Sprintf("order:%d", order.ID), order.BuyerEmail, string(auditJSON)); err != nil {
+		slog.Error("audit write failed", "code", order.Code, "err", err)
+	}
+	pdfs := make([][]byte, 0, len(items))
+	for _, it := range items {
+		name := it.AttendeeName
+		if name == "" {
+			name = order.BuyerName
+		}
+		pdf, err := p.Renderer(show, it.Seat, name, qrs[it.ReservationID])
+		if err != nil {
+			slog.Error("render pdf", "code", order.Code, "seatId", it.Seat.ID, "err", err)
+			continue
+		}
+		pdfs = append(pdfs, pdf)
+	}
+	if order.TGChatID != 0 {
+		for i, it := range items {
+			if i >= len(pdfs) {
+				break
+			}
+			if err := p.Notifier.SendTicket(order.TGChatID, it.Seat, pdfs[i]); err != nil {
+				return err
+			}
+		}
+	}
+	if order.BuyerEmail != "" && p.Email != nil {
+		batch := make([]EmailItem, 0, len(pdfs))
+		for i, it := range items {
+			if i >= len(pdfs) {
+				break
+			}
+			batch = append(batch, EmailItem{Seat: it.Seat, PDF: pdfs[i]})
+		}
+		if err := p.Email.SendTicketBatchEmail(ctx, order.BuyerEmail, order.BuyerName, batch, show); err != nil {
+			slog.Error("send ticket batch email",
+				"code", order.Code, "to", order.BuyerEmail, "err", err)
+		}
+	}
+	slog.Info("order confirmed",
+		"code", order.Code, "seats", len(items),
+		"buyer", order.BuyerName, "email", order.BuyerEmail,
+		"chatId", order.TGChatID, "total", order.TotalKopecks,
+		"path", dc.AuditAction)
+	return nil
+}
+
 func (p *Processor) processTx(ctx context.Context, t bank.Transaction) (bool, error) {
 	if t.Amount.Minor <= 0 {
 		return false, nil // outflow, not interesting
@@ -181,113 +302,15 @@ func (p *Processor) processTx(ctx context.Context, t bank.Transaction) (bool, er
 		return false, nil
 	}
 
-	// Resolve the show before Confirm so a transient failure doesn't
-	// leave us with a confirmed order and no rendered PDFs.
-	show, err := p.ShowFn(ctx)
-	if err != nil {
-		return false, fmt.Errorf("resolve show: %w", err)
-	}
-
-	// Mint a QR per reservation. ConfirmOrder writes Ticket rows
-	// pointing at these payloads — same atomic transaction.
-	qrs := make(map[int64]string, len(items))
-	for _, it := range items {
-		qrs[it.ReservationID] = p.Coder.QRPayload(it.ReservationID, it.Seat.ID)
-	}
-	if err := p.Store.ConfirmOrder(ctx, order.ID, qrs); err != nil {
+	if err := p.deliverConfirmedOrder(ctx, order, items, deliverContext{
+		AuditAction: "payment.confirm",
+		AuditExtra: map[string]any{
+			"paid_kopecks": t.Amount.Minor,
+			"tx_id":        t.ID,
+		},
+	}); err != nil {
 		return false, err
 	}
-
-	// Broadcast each confirmed seat as "sold" — live SSE subscribers
-	// flip them on the map without a reload. Publish is non-blocking
-	// and nil-safe; do it before render so a slow PDF stage doesn't
-	// delay the wire event.
-	for _, it := range items {
-		p.Hub.Publish(it.Seat.ShowID, realtime.Event{
-			Type: "seat_status", SeatID: it.Seat.ID, Status: realtime.SeatSold,
-		})
-	}
-
-	// Audit trail: one row per confirmed order. Buyer email goes in the
-	// actor slot so the journal shows "who paid". Details carry the
-	// monobank tx id and amount for quick reconciliation by hand.
-	auditDetails, _ := json.Marshal(map[string]any{
-		"code": order.Code, "seats": len(items),
-		"total_kopecks": order.TotalKopecks,
-		"paid_kopecks":  t.Amount.Minor,
-		"tx_id":         t.ID,
-	})
-	if err := p.Store.LogAudit(ctx, "payment.confirm",
-		fmt.Sprintf("order:%d", order.ID), order.BuyerEmail, string(auditDetails)); err != nil {
-		slog.Error("audit write failed", "code", order.Code, "err", err)
-	} else {
-		slog.Info("audit", "action", "payment.confirm",
-			"target", fmt.Sprintf("order:%d", order.ID), "actor", order.BuyerEmail)
-	}
-
-	// Render each PDF; if any render fails we still log_warn and
-	// continue — the rest of the order shouldn't be held hostage.
-	pdfs := make([][]byte, 0, len(items))
-	for _, it := range items {
-		// Per-ticket attendee wins; empty attendee falls back to the
-		// order's buyer name. Multi-seat web flow is the only path that
-		// fills AttendeeName today — bot/single-seat both leave it ""
-		// and end up printing BuyerName.
-		name := it.AttendeeName
-		if name == "" {
-			name = order.BuyerName
-		}
-		pdf, err := p.Renderer(show, it.Seat, name, qrs[it.ReservationID])
-		if err != nil {
-			slog.Error("render pdf",
-				"code", code, "seatId", it.Seat.ID, "err", err)
-			continue
-		}
-		pdfs = append(pdfs, pdf)
-	}
-
-	// Telegram delivery: one document per seat. Stops on first send
-	// error — Telegram is usually all-or-nothing per chat.
-	if order.TGChatID != 0 {
-		for i, it := range items {
-			if i >= len(pdfs) {
-				break
-			}
-			if err := p.Notifier.SendTicket(order.TGChatID, it.Seat, pdfs[i]); err != nil {
-				return false, err
-			}
-		}
-	}
-
-	// Email delivery: single message with N attachments. Failure
-	// doesn't block — order is already confirmed in the DB.
-	if order.BuyerEmail != "" {
-		if p.Email == nil {
-			slog.Warn("buyer has email but no SMTP configured — ticket only in DB",
-				"code", code, "email", order.BuyerEmail)
-		} else {
-			batch := make([]EmailItem, 0, len(pdfs))
-			for i, it := range items {
-				if i >= len(pdfs) {
-					break
-				}
-				batch = append(batch, EmailItem{Seat: it.Seat, PDF: pdfs[i]})
-			}
-			if err := p.Email.SendTicketBatchEmail(ctx, order.BuyerEmail, order.BuyerName, batch, show); err != nil {
-				slog.Error("send ticket batch email",
-					"code", code, "to", order.BuyerEmail, "err", err)
-			}
-		}
-	}
-
-	slog.Info("order confirmed",
-		"code", code,
-		"seats", len(items),
-		"buyer", order.BuyerName,
-		"email", order.BuyerEmail,
-		"chatId", order.TGChatID,
-		"paid", t.Amount,
-		"need", order.TotalKopecks)
 	return true, nil
 }
 

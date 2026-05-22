@@ -299,6 +299,13 @@ func main() {
 		BaseURL:       cfg.BaseURL,
 		LoginMailer:   loginMailer,
 		SecureCookies: cfg.SecureCookies,
+		// 100%-discount / 0-kopeck orders need synchronous confirm
+		// (no webhook will arrive). Wire to the pay processor's
+		// no-amount-check confirm path so tickets get issued + emailed.
+		FreeOrderConfirmer: func(ctx context.Context, code string) error {
+			_, err := processor.ConfirmFreeOrder(ctx, code)
+			return err
+		},
 	})
 
 	mux := http.NewServeMux()
@@ -909,11 +916,13 @@ func (p payStore) FindOrderByCode(ctx context.Context, code string) (pay.Order, 
 	o, items, err := p.s.FindOrderByCode(ctx, code)
 	payOrder := pay.Order{
 		ID: o.ID, Code: o.Code,
-		BuyerName:    o.BuyerName,
-		BuyerEmail:   o.BuyerEmail,
-		TGChatID:     o.TGChatID,
-		TotalKopecks: o.TotalKopecks,
-		ConfirmedAt:  o.ConfirmedAt,
+		BuyerName:       o.BuyerName,
+		BuyerEmail:      o.BuyerEmail,
+		TGChatID:        o.TGChatID,
+		TotalKopecks:    o.TotalKopecks,
+		DiscountCode:    o.DiscountCode,
+		DiscountKopecks: o.DiscountKopecks,
+		ConfirmedAt:     o.ConfirmedAt,
 	}
 	switch {
 	case errors.Is(err, store.ErrCodeNotFound):
