@@ -2261,6 +2261,57 @@ func isUniqueErr(err error) bool {
 	return strings.Contains(err.Error(), "UNIQUE constraint failed")
 }
 
+// --- analytics ---
+
+// DailySales returns per-day ticket count + revenue for all confirmed
+// orders whose confirmed_at falls in [from, to). Days with no sales
+// are not in the result — the caller fills the gap so a sparse week
+// still gets a "0" bar. Ordered ascending by date.
+func (s *Store) DailySales(ctx context.Context, from, to time.Time) ([]DailySales, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT
+			strftime('%Y-%m-%d', o.confirmed_at, 'unixepoch') AS day,
+			COUNT(r.id) AS tickets,
+			COALESCE(SUM(s.price_kopecks), 0) AS revenue
+		FROM orders o
+		JOIN reservations r ON r.order_id = o.id AND r.cancelled_at IS NULL
+		JOIN seats s ON s.id = r.seat_id
+		WHERE o.confirmed_at IS NOT NULL
+		  AND o.confirmed_at >= ? AND o.confirmed_at < ?
+		GROUP BY day
+		ORDER BY day ASC`,
+		from.Unix(), to.Unix())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []DailySales{}
+	for rows.Next() {
+		var d DailySales
+		if err := rows.Scan(&d.Date, &d.Tickets, &d.RevenueKopecks); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// Conversion returns "how many orders were created in [from, to) vs how
+// many of those got paid". The 'paid' count uses the same created_at
+// filter, NOT confirmed_at — so a slow buyer who paid the next day
+// still counts toward the cohort that created the order.
+func (s *Store) Conversion(ctx context.Context, from, to time.Time) (ConversionStats, error) {
+	var c ConversionStats
+	err := s.db.QueryRowContext(ctx, `
+		SELECT
+			COUNT(*) AS total,
+			COUNT(confirmed_at) AS paid
+		FROM orders
+		WHERE created_at >= ? AND created_at < ?`,
+		from.Unix(), to.Unix()).Scan(&c.TotalOrders, &c.PaidOrders)
+	return c, err
+}
+
 // --- organizer (single-row profile) ---
 
 const organizerCols = `name, bio, contact_email, phone, website_url, telegram_url, instagram_url, facebook_url, logo_url, updated_at`

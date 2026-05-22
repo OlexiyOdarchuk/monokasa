@@ -38,6 +38,12 @@
 	<h1 class="text-2xl font-semibold tracking-tight">Події</h1>
 	<div class="flex items-center gap-2">
 		<a
+			href="/admin/analytics"
+			class="rounded-md border border-neutral-700 px-3 py-2 text-sm text-neutral-300 hover:bg-neutral-800"
+		>
+			📊 Аналітика
+		</a>
+		<a
 			href="/admin/organizer"
 			class="rounded-md border border-neutral-700 px-3 py-2 text-sm text-neutral-300 hover:bg-neutral-800"
 		>

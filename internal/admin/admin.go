@@ -90,6 +90,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 
 	mux.HandleFunc("GET /api/admin/organizer", h.getOrganizer)
 	mux.HandleFunc("PUT /api/admin/organizer", h.saveOrganizer)
+
+	mux.HandleFunc("GET /api/admin/analytics", h.analytics)
 }
 
 // --- /me ---
@@ -890,6 +892,116 @@ func (h *Handler) listAudit(w http.ResponseWriter, r *http.Request) {
 		if e.Details != "" {
 			out[i].Details = json.RawMessage(e.Details)
 		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// --- analytics ---
+
+type dailySalesBody struct {
+	Date           string `json:"date"` // YYYY-MM-DD
+	Tickets        int    `json:"tickets"`
+	RevenueKopecks int64  `json:"revenue_kopecks"`
+}
+
+type perShowBody struct {
+	ID             int64  `json:"id"`
+	Slug           string `json:"slug"`
+	Title          string `json:"title"`
+	Total          int    `json:"total"`
+	Sold           int    `json:"sold"`
+	Held           int    `json:"held"`
+	Free           int    `json:"free"`
+	RevenueKopecks int64  `json:"revenue_kopecks"`
+}
+
+type analyticsResponse struct {
+	From              time.Time        `json:"from"`
+	To                time.Time        `json:"to"`
+	Days              int              `json:"days"`
+	DailySales        []dailySalesBody `json:"daily_sales"`
+	TotalTickets      int              `json:"total_tickets"`
+	TotalRevenue      int64            `json:"total_revenue_kopecks"`
+	OrdersCreated     int              `json:"orders_created"`
+	OrdersPaid        int              `json:"orders_paid"`
+	ConversionPercent float64          `json:"conversion_percent"` // 0..100
+	PerShow           []perShowBody    `json:"per_show"`
+}
+
+// analytics returns aggregated sales data for the last N days (defaults
+// to 30, capped at 365 to bound the daily-row count and the per-show
+// loop). Single endpoint feeding the whole /admin/analytics page so
+// the frontend stays one fetch.
+func (h *Handler) analytics(w http.ResponseWriter, r *http.Request) {
+	days := 30
+	if q := r.URL.Query().Get("days"); q != "" {
+		if n, err := strconv.Atoi(q); err == nil && n > 0 {
+			if n > 365 {
+				n = 365
+			}
+			days = n
+		}
+	}
+	now := time.Now()
+	// Pad the window to "end of today" so today's sales fall inside [from, to).
+	to := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).
+		Add(24 * time.Hour)
+	from := to.Add(-time.Duration(days) * 24 * time.Hour)
+
+	sales, err := h.st.DailySales(r.Context(), from, to)
+	if err != nil {
+		writeInternal(w, "daily sales", err)
+		return
+	}
+	// Fill missing days with zeros so the chart has a solid baseline.
+	bySrc := make(map[string]store.DailySales, len(sales))
+	for _, d := range sales {
+		bySrc[d.Date] = d
+	}
+	out := analyticsResponse{From: from, To: to, Days: days}
+	for i := 0; i < days; i++ {
+		day := from.Add(time.Duration(i) * 24 * time.Hour).Format("2006-01-02")
+		row := bySrc[day]
+		out.DailySales = append(out.DailySales, dailySalesBody{
+			Date: day, Tickets: row.Tickets, RevenueKopecks: row.RevenueKopecks,
+		})
+		out.TotalTickets += row.Tickets
+		out.TotalRevenue += row.RevenueKopecks
+	}
+
+	conv, err := h.st.Conversion(r.Context(), from, to)
+	if err != nil {
+		writeInternal(w, "conversion", err)
+		return
+	}
+	out.OrdersCreated = conv.TotalOrders
+	out.OrdersPaid = conv.PaidOrders
+	if conv.TotalOrders > 0 {
+		out.ConversionPercent = float64(conv.PaidOrders) * 100 / float64(conv.TotalOrders)
+	}
+
+	// Per-show: iterate non-archived shows and reuse the Stats query
+	// each show editor already runs. Bounded by show count, which in
+	// self-host stays in single/double digits.
+	shows, err := h.st.ListShows(r.Context())
+	if err != nil {
+		writeInternal(w, "list shows", err)
+		return
+	}
+	for _, sh := range shows {
+		if sh.ArchivedAt != nil {
+			continue
+		}
+		st, err := h.st.Stats(r.Context(), sh.ID)
+		if err != nil {
+			slog.Warn("analytics: stats failed", "showId", sh.ID, "err", err)
+			continue
+		}
+		out.PerShow = append(out.PerShow, perShowBody{
+			ID: sh.ID, Slug: sh.Slug, Title: sh.Title,
+			Total: st.Total, Sold: st.Sold, Held: st.Held, Free: st.Free,
+			RevenueKopecks: st.RevenueKopecks,
+		})
 	}
 	writeJSON(w, http.StatusOK, out)
 }

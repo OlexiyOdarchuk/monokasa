@@ -188,6 +188,36 @@ export interface BuyerTicket {
 	items: BuyerTicketItem[];
 }
 
+export interface DailySales {
+	date: string; // YYYY-MM-DD
+	tickets: number;
+	revenue_kopecks: number;
+}
+
+export interface PerShowStats {
+	id: number;
+	slug: string;
+	title: string;
+	total: number;
+	sold: number;
+	held: number;
+	free: number;
+	revenue_kopecks: number;
+}
+
+export interface Analytics {
+	from: string;
+	to: string;
+	days: number;
+	daily_sales: DailySales[];
+	total_tickets: number;
+	total_revenue_kopecks: number;
+	orders_created: number;
+	orders_paid: number;
+	conversion_percent: number;
+	per_show: PerShowStats[];
+}
+
 export interface Organizer {
 	name: string;
 	bio: string;

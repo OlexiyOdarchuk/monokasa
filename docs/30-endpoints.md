@@ -111,6 +111,7 @@ based підхід раніше ламав cookie в деяких браузер
 | GET | `/api/admin/shows/{id}/poster-qr.png` | PNG QR-код на /event/<slug> для друкованих афіш |
 | GET | `/api/admin/organizer` | single-row профіль (name/bio/socials) |
 | PUT | `/api/admin/organizer` | overwrite профіль (всі поля опційні; bio ≤2000 chars) |
+| GET | `/api/admin/analytics?days=N` | агрегати: daily_sales[], total_*, конверсія, per_show[]; days∈[1,365] |
 
 ## Auth
 

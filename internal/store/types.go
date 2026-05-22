@@ -222,6 +222,24 @@ type AuditEntry struct {
 	CreatedAt    time.Time
 }
 
+// DailySales is one row of the per-day rollup used by /admin/analytics.
+// Date is the local "YYYY-MM-DD" derived from orders.confirmed_at
+// (interpreted as UTC by SQLite). Tickets is the count of confirmed
+// reservations (i.e. PDF tickets generated); Revenue is the kopecks
+// that day brought in.
+type DailySales struct {
+	Date           string
+	Tickets        int
+	RevenueKopecks int64
+}
+
+// ConversionStats summarises how many orders created in a period
+// actually got paid. Useful as a single KPI on the analytics page.
+type ConversionStats struct {
+	TotalOrders int
+	PaidOrders  int
+}
+
 // Organizer is the single-row profile that the public /about page
 // renders: name, bio, socials, contact. Used as a soft footer on
 // event pages so buyers know who's behind the event. All fields are
