@@ -13,37 +13,27 @@
 	let submitting = $state(false);
 	let tokenErrorMsg = $state('');
 
-	// One-shot: if the magic-link landed us here with ?token=, GET the
-	// consume endpoint via the form-redirect dance. (publicApi.get expects
-	// JSON; consume issues a 303 to /my, so we go through a plain fetch.)
+	// Magic-link clicks hit /api/public/login/consume first; that
+	// server-side handler sets the cookie and 303s here. On error it
+	// 303s here with ?error=… so we can show a friendly message
+	// instead of raw JSON in the address bar.
 	onMount(async () => {
-		const token = page.url.searchParams.get('token');
-		if (token) {
-			// Strip the token from the URL bar so refreshing the page doesn't
-			// re-attempt a one-shot token (which would fail with 'expired').
+		const err = page.url.searchParams.get('error');
+		if (err) {
+			// Strip the error param so a refresh doesn't keep showing it.
 			const url = new URL(window.location.href);
-			url.searchParams.delete('token');
+			url.searchParams.delete('error');
 			window.history.replaceState({}, '', url.toString());
-
-			try {
-				const r = await fetch(`/api/public/login/consume?token=${encodeURIComponent(token)}`, {
-					credentials: 'same-origin',
-					redirect: 'manual'
-				});
-				// Consume sets the cookie via 303. With redirect:'manual' the
-				// browser doesn't actually follow it but the Set-Cookie has
-				// already landed. Just fall through to loadWhoami below.
-				if (r.status >= 400 && r.status !== 0) {
-					const err = (await r.json().catch(() => ({}))) as { detail?: string };
-					mode = 'tokenError';
-					tokenErrorMsg = err.detail || 'Посилання застаріле — запроси нове.';
-					return;
-				}
-			} catch {
-				// "redirect: manual" can throw in some browsers when the
-				// network responds with 303 with empty body. Ignore — the
-				// cookie's already set; we just re-check below.
-			}
+			mode = 'tokenError';
+			tokenErrorMsg =
+				err === 'expired_token'
+					? 'Посилання прострочене — запроси нове.'
+					: err === 'invalid_token'
+						? 'Посилання застаріле або вже використане — запроси нове.'
+						: err === 'missing_token'
+							? 'У посиланні немає токена.'
+							: 'Не вдалось залогінити, спробуй ще раз.';
+			return;
 		}
 		await refresh();
 	});

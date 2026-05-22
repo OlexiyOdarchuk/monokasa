@@ -57,6 +57,21 @@ polling'у. Кожне повідомлення — `data: {"type":"seat_status"
 Keep-alive comment `: ping\n\n` кожні 25 секунд. 503 `realtime_disabled`
 якщо hub не сконфігурований. Деталі → [[50-packages/realtime]].
 
+### Buyer "Мої квитки" (magic-link auth)
+
+| Метод | Шлях | Що робить |
+|---|---|---|
+| POST | `/api/public/login/request` | `{email}` → шле magic-link (або 200 `status:"logged"` якщо SMTP не сконфігурований — лінк у логах) |
+| GET | `/api/public/login/consume?token=` | Burn token + Set-Cookie + 303 на `/my` (або `/my?error=…` при невдачі) |
+| POST | `/api/public/login/logout` | Видалити cookie + сесію |
+| GET | `/api/public/my` | whoami → `{email}` або 401 |
+| GET | `/api/public/my/tickets` | Список замовлень з QR payloads (paid only) |
+
+Magic-link URL вказує **прямо на `/api/public/login/consume`** (не на
+`/my?token=…`) — щоб браузер нативно обробив 303 з Set-Cookie. Fetch-
+based підхід раніше ламав cookie в деяких браузерах. Деталі →
+[[40-flows/buyer-my-tickets]].
+
 ## Admin (за `RequireAuth`)
 
 | Метод | Шлях | Що робить |

@@ -800,7 +800,13 @@ func (h *Handler) loginRequest(w http.ResponseWriter, r *http.Request) {
 		writeInternal(w, "create login token", err)
 		return
 	}
-	link := fmt.Sprintf("%s/my?token=%s", h.publicOrigin(r), url.QueryEscape(token))
+	// Magic link points at the consume endpoint directly, not /my?token=.
+	// That way the browser's own navigation processes the 303 Set-Cookie
+	// + Location:/my naturally — `fetch(..., {redirect:'manual'})` drops
+	// the cookie on the floor in some browsers, which used to leave the
+	// buyer staring at the login form even after a "successful" click.
+	link := fmt.Sprintf("%s/api/public/login/consume?token=%s",
+		h.publicOrigin(r), url.QueryEscape(token))
 	if h.loginMailer == nil {
 		// No SMTP configured. Log the link so the developer can copy
 		// it from console, but advertise that this is not safe for
@@ -842,35 +848,42 @@ func (h *Handler) publicOrigin(r *http.Request) string {
 }
 
 // loginConsume validates the token from the magic link, mints a long-
-// lived cookie, and 303s the browser to /my. The 303 keeps the token
-// out of the address bar after the redirect.
+// lived cookie, and 303s the browser to /my. Errors also 303 back to
+// /my (with ?error=…) so the SPA renders a friendly message instead
+// of the buyer seeing raw JSON in the address bar.
+//
+// Hit directly by the magic link (not by the SPA via fetch). That way
+// the browser handles Set-Cookie + Location naturally — earlier fetch-
+// based plumbing dropped the cookie on some browsers and silently
+// left the buyer on the login form.
 func (h *Handler) loginConsume(w http.ResponseWriter, r *http.Request) {
 	token := r.URL.Query().Get("token")
 	if token == "" {
-		writeError(w, http.StatusBadRequest, "missing_token", "")
+		http.Redirect(w, r, "/my?error=missing_token", http.StatusSeeOther)
 		return
 	}
 	email, err := h.st.ConsumeBuyerLoginToken(r.Context(), token)
 	switch {
 	case errors.Is(err, store.ErrCodeNotFound):
-		writeError(w, http.StatusBadRequest, "invalid_token",
-			"посилання застаріле або вже використане — запроси нове")
+		http.Redirect(w, r, "/my?error=invalid_token", http.StatusSeeOther)
 		return
 	case errors.Is(err, store.ErrAlreadyClosed):
-		writeError(w, http.StatusBadRequest, "expired_token",
-			"посилання прострочене — запроси нове")
+		http.Redirect(w, r, "/my?error=expired_token", http.StatusSeeOther)
 		return
 	case err != nil:
-		writeInternal(w, "consume login token", err)
+		slog.Error("consume login token", "err", err)
+		http.Redirect(w, r, "/my?error=internal", http.StatusSeeOther)
 		return
 	}
 	sessionToken, err := randomToken()
 	if err != nil {
-		writeInternal(w, "mint session token", err)
+		slog.Error("mint session token", "err", err)
+		http.Redirect(w, r, "/my?error=internal", http.StatusSeeOther)
 		return
 	}
 	if err := h.st.CreateBuyerSession(r.Context(), sessionToken, email); err != nil {
-		writeInternal(w, "create buyer session", err)
+		slog.Error("create buyer session", "err", err)
+		http.Redirect(w, r, "/my?error=internal", http.StatusSeeOther)
 		return
 	}
 	http.SetCookie(w, &http.Cookie{

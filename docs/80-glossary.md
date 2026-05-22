@@ -38,6 +38,20 @@ BuyerName замовника.
 **Reconcile** — догрібати пропущені webhook'и через monobank
 statement. Запускається `/reconcile` від адмін-бота.
 
+**Magic-link** — одноразове посилання, що шлеться buyer'у email'ом
+для входу в "Мої квитки". Living TTL 15 хв; на клік сервер вмикає
+buyer_session cookie на 30 днів. Без пароля. Деталі →
+[[70-decisions/buyer-auth-magic-link]].
+
+**Buyer session** — окремий cookie (`monokasa_buyer`) для покупців,
+паралельний admin сесії (`monokasa_admin`). Один браузер може бути
+одночасно admin'ом і buyer'ом без колізій.
+
+**Refund mark** — `reservations.refunded_at` стамп, що admin вернув
+гроші руками в моно. Per-seat у multi-seat ordeг'і (один із п'яти
+гостей не прийшов — повернули його порцію). Не звільняє місце;
+використовуй cancel для цього.
+
 ## Технічні
 
 **RequireAuth** — middleware у `internal/auth`. Перевіряє cookie-сесію.

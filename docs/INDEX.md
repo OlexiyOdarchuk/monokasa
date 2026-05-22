@@ -21,6 +21,7 @@ README.md — для тих, хто хоче ЗАПУСТИТИ. Цей vault �
 ### 🌊 Сценарії
 - [[40-flows/buyer-web]] — покупець через сайт
 - [[40-flows/buyer-bot]] — покупець через бот
+- [[40-flows/buyer-my-tickets]] — "Мої квитки" magic-link flow
 - [[40-flows/admin]] — операції адміна
 - [[40-flows/webhook]] — monobank → confirm → доставка
 - [[40-flows/reconcile]] — рятувальна сітка для пропущених webhook'ів
@@ -49,6 +50,7 @@ README.md — для тих, хто хоче ЗАПУСТИТИ. Цей vault �
 - [[70-decisions/why-sqlite]] — чому SQLite, не Postgres
 - [[70-decisions/multi-seat-orders]] — чому orders + reservations, а не плоско
 - [[70-decisions/attendee-names]] — як обрали B (один + опційно)
+- [[70-decisions/buyer-auth-magic-link]] — чому magic-link, не password
 
 ### 📖 Терміни
 - [[80-glossary]] — order, reservation, hold, jar, attendee, тощо

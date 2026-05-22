@@ -84,6 +84,16 @@
 ### sessions
 - 256-bit opaque token, MaxAge 30 днів
 
+### buyer_login_tokens
+- Одноразовий 256-bit hex token emailed buyer'у для magic-link login
+- email (lowercase), expires_at (TTL 15 хв), used_at (один shot)
+
+### buyer_sessions
+- 256-bit opaque cookie token для довгоживучої buyer-сесії
+- email (lowercase), MaxAge 30 днів
+- Окремо від `sessions` (admin) — щоб один браузер міг бути одночасно
+  admin'ом і buyer'ом
+
 ## Стани сутностей
 
 ### Order
