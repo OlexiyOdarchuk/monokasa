@@ -69,6 +69,33 @@
 		}
 	}
 
+	// Refund mark — purely bookkeeping. Doesn't free seat, doesn't change
+	// status. After click, the row carries refunded_at so the badge
+	// replaces the button.
+	async function markRefunded(g: Guest) {
+		if (
+			!confirm(
+				`Позначити як повернуто гроші для ${g.reservation.buyer_name} · ${seatLabel(g.seat)}?\n\n` +
+					'Це лише відмітка — реальний refund треба зробити руками у monobank.'
+			)
+		)
+			return;
+		try {
+			await api.post(`/api/admin/reservations/${g.reservation.id}/refund`);
+			// Optimistic: stamp the row locally. The endpoint returns the
+			// order, not the guest row, so a full update would need a
+			// refetch; one bit of state is enough for the badge.
+			guests = guests.map((x) =>
+				x.reservation.id === g.reservation.id
+					? { ...x, reservation: { ...x.reservation, refunded_at: new Date().toISOString() } }
+					: x
+			);
+		} catch (e) {
+			if (e instanceof ApiError) error = e.detail || e.code;
+			else error = String(e);
+		}
+	}
+
 	function formatDateTime(iso: string | null | undefined): string {
 		if (!iso) return '—';
 		return new Date(iso).toLocaleString('uk-UA', {
@@ -187,18 +214,33 @@
 							<span class="inline-block rounded border px-2 py-0.5 text-xs {style.cls}">
 								{style.label}
 							</span>
+							{#if g.reservation.refunded_at}
+								<span class="ml-1 inline-block rounded border border-violet-900 bg-violet-950/50 px-2 py-0.5 text-xs text-violet-300">
+									повернуто
+								</span>
+							{/if}
 						</td>
 						<td class="px-3 py-2 text-xs text-neutral-500">{formatDateTime(g.reservation.created_at)}</td>
 						<td class="px-3 py-2 text-xs text-neutral-500">{formatDateTime(g.reservation.confirmed_at)}</td>
 						<td class="px-3 py-2 text-right">
-							{#if g.reservation.status !== 'cancelled'}
-								<button
-									onclick={() => cancel(g)}
-									class="text-xs text-red-400 hover:underline"
-								>
-									Скасувати
-								</button>
-							{/if}
+							<div class="flex justify-end gap-3">
+								{#if g.reservation.confirmed_at && !g.reservation.refunded_at}
+									<button
+										onclick={() => markRefunded(g)}
+										class="text-xs text-violet-400 hover:underline"
+									>
+										Повернути
+									</button>
+								{/if}
+								{#if g.reservation.status !== 'cancelled'}
+									<button
+										onclick={() => cancel(g)}
+										class="text-xs text-red-400 hover:underline"
+									>
+										Скасувати
+									</button>
+								{/if}
+							</div>
 						</td>
 					</tr>
 				{/each}

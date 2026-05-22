@@ -453,6 +453,64 @@ func mustGetSeats(t *testing.T, h *harness, showID int64) []store.Seat {
 	return seats
 }
 
+func TestMarkRefundedFlow(t *testing.T) {
+	h := setup(t)
+	ctx := context.Background()
+
+	// Build a confirmed order so refund-mark is allowed.
+	showID, _ := h.st.CreateShow(ctx, store.Show{Title: "T", StartsAt: time.Now()}, 1, 1, 100)
+	seats, _ := h.st.Seats(ctx, showID)
+	r, err := h.st.Reserve(ctx, seats[0], 0, 0, "Buyer", "b@x.com", "code1234", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	order, _, _ := h.st.FindOrderByCode(ctx, r.Code)
+	if _, err := h.st.ConfirmOrder(ctx, order.ID, map[int64]string{r.ID: "qr"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Refund mark — first call succeeds.
+	resp := h.do(http.MethodPost, fmt.Sprintf("/api/admin/reservations/%d/refund", r.ID), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("first refund: status %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// Second call returns already_refunded.
+	resp = h.do(http.MethodPost, fmt.Sprintf("/api/admin/reservations/%d/refund", r.ID), nil)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("second refund: status %d, want 409", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// Guest list now carries refunded_at on this row.
+	resp = h.do(http.MethodGet, fmt.Sprintf("/api/admin/shows/%d/guests", showID), nil)
+	var guests []struct {
+		Reservation struct {
+			ID         int64      `json:"id"`
+			RefundedAt *time.Time `json:"refunded_at"`
+		} `json:"reservation"`
+	}
+	h.decodeJSON(resp, &guests)
+	if len(guests) != 1 || guests[0].Reservation.RefundedAt == nil {
+		t.Fatalf("guest refunded_at not set: %+v", guests)
+	}
+}
+
+func TestMarkRefundedRequiresPaidOrder(t *testing.T) {
+	h := setup(t)
+	ctx := context.Background()
+	showID, _ := h.st.CreateShow(ctx, store.Show{Title: "T", StartsAt: time.Now()}, 1, 1, 100)
+	seats, _ := h.st.Seats(ctx, showID)
+	r, _ := h.st.Reserve(ctx, seats[0], 0, 0, "B", "b@x.com", "code5678", time.Minute)
+	// Order is held (not confirmed) → refund mark refuses.
+	resp := h.do(http.MethodPost, fmt.Sprintf("/api/admin/reservations/%d/refund", r.ID), nil)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status %d, want 409", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
 func TestAuditLogRecordsAdminActions(t *testing.T) {
 	h := setup(t)
 

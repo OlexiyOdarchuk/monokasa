@@ -93,6 +93,11 @@ type Order struct {
 	ConfirmedAt  *time.Time
 	CancelledAt  *time.Time
 	RemindedAt   *time.Time
+	// RefundedAt records that admin manually returned the money in
+	// monobank. Doesn't affect seat status (use AdminCancelReservation
+	// to actually free the seat); refund_at is purely bookkeeping so the
+	// organizer can answer "did I give this person their money back".
+	RefundedAt *time.Time
 }
 
 // SeatStatus is one of "free", "held", "sold".
@@ -105,9 +110,13 @@ const (
 )
 
 // MyItem couples a user's reservation with its seat for /my output.
+// OrderRefundedAt is populated for admin guest listings (so the UI can
+// show a "повернуто" badge per row). Bot /my and reminder paths leave
+// it nil — they don't query orders.refunded_at.
 type MyItem struct {
-	Reservation Reservation
-	Seat        Seat
+	Reservation     Reservation
+	Seat            Seat
+	OrderRefundedAt *time.Time
 }
 
 // Stats is an admin snapshot of a single show.

@@ -129,6 +129,9 @@ export interface Reservation {
 	expires_at: string;
 	confirmed_at?: string | null;
 	cancelled_at?: string | null;
+	// Set when admin manually marked the order as refunded in monobank.
+	// Independent of cancelled_at — refund-mark is pure bookkeeping.
+	refunded_at?: string | null;
 	status: 'paid' | 'held' | 'expired' | 'cancelled';
 }
 

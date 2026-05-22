@@ -40,7 +40,8 @@
 		'seat.batch_update': 'оновлено місця',
 		'reservation.cancel': 'скасовано бронь',
 		'order.create': 'бронювання',
-		'payment.confirm': 'оплата'
+		'payment.confirm': 'оплата',
+		'order.refund_marked': 'позначено повернутим'
 	};
 
 	// Tint each action so admin/buyer/system entries are easy to skim.
@@ -48,6 +49,7 @@
 		if (a === 'payment.confirm') return 'text-emerald-300';
 		if (a === 'order.create') return 'text-amber-300';
 		if (a === 'reservation.cancel') return 'text-red-300';
+		if (a === 'order.refund_marked') return 'text-violet-300';
 		return 'text-neutral-200';
 	}
 

@@ -74,6 +74,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/admin/shows/{id}/guests", h.listGuests)
 	mux.HandleFunc("GET /api/admin/shows/{id}/guests.csv", h.exportGuestsCSV)
 	mux.HandleFunc("POST /api/admin/reservations/{id}/cancel", h.cancelReservation)
+	mux.HandleFunc("POST /api/admin/reservations/{id}/refund", h.markRefunded)
 
 	mux.HandleFunc("GET /api/admin/audit", h.listAudit)
 }
@@ -498,6 +499,7 @@ type reservationBody struct {
 	ExpiresAt   time.Time  `json:"expires_at"`
 	ConfirmedAt *time.Time `json:"confirmed_at,omitempty"`
 	CancelledAt *time.Time `json:"cancelled_at,omitempty"`
+	RefundedAt  *time.Time `json:"refunded_at,omitempty"`
 	Status      string     `json:"status"` // paid | held | expired | cancelled
 }
 
@@ -530,7 +532,8 @@ func toGuestResponse(item store.MyItem, now time.Time) guestResponse {
 			BuyerName: item.Reservation.BuyerName, TGUserID: item.Reservation.TGUserID,
 			CreatedAt: item.Reservation.CreatedAt, ExpiresAt: item.Reservation.ExpiresAt,
 			ConfirmedAt: item.Reservation.ConfirmedAt, CancelledAt: item.Reservation.CancelledAt,
-			Status: reservationStatus(item.Reservation, now),
+			RefundedAt: item.OrderRefundedAt,
+			Status:     reservationStatus(item.Reservation, now),
 		},
 		Seat: seatBriefBody{
 			ID: item.Seat.ID, Row: item.Seat.Row, Col: item.Seat.Col,
@@ -632,6 +635,41 @@ func (h *Handler) cancelReservation(w http.ResponseWriter, r *http.Request) {
 		"freed_seats": len(freed),
 	})
 	writeJSON(w, http.StatusOK, toGuestResponse(store.MyItem{Reservation: res, Seat: seat}, time.Now()))
+}
+
+// markRefunded stamps orders.refunded_at — pure bookkeeping. Seat
+// status is untouched (use cancel to free a seat). Refusable when the
+// order isn't confirmed, or already marked.
+func (h *Handler) markRefunded(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseID(w, r)
+	if !ok {
+		return
+	}
+	order, err := h.st.MarkOrderRefunded(r.Context(), id)
+	switch {
+	case errors.Is(err, store.ErrCodeNotFound):
+		writeError(w, http.StatusNotFound, "reservation_not_found", "")
+		return
+	case errors.Is(err, store.ErrNotPaid):
+		writeError(w, http.StatusConflict, "not_paid",
+			"order is not confirmed — refund mark only applies after payment")
+		return
+	case errors.Is(err, store.ErrAlreadyClosed):
+		writeError(w, http.StatusConflict, "already_refunded", "")
+		return
+	case err != nil:
+		writeInternal(w, "mark refunded", err)
+		return
+	}
+	h.audit(r, "order.refund_marked", fmt.Sprintf("order:%d", order.ID), map[string]any{
+		"code": order.Code, "total_kopecks": order.TotalKopecks,
+		"buyer_name": order.BuyerName, "buyer_email": order.BuyerEmail,
+	})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"order_id":     order.ID,
+		"code":         order.Code,
+		"refunded_at":  order.RefundedAt,
+	})
 }
 
 // --- audit ---

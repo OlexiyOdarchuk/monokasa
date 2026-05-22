@@ -166,6 +166,10 @@ var migrations = []string{
 		created_at      INTEGER NOT NULL
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at DESC)`,
+	// Refund bookkeeping. Doesn't affect seat status — admin uses
+	// AdminCancelReservation to actually free a seat. This column just
+	// records "I returned the money in monobank manually".
+	`ALTER TABLE orders ADD COLUMN refunded_at INTEGER`,
 }
 
 // Errors.
@@ -877,10 +881,14 @@ func (s *Store) FindReservationByTicket(ctx context.Context, ticketID int64) (Re
 // ListReservations returns every reservation for a show — including
 // cancelled rows, which are needed for admin audit. Newest first.
 func (s *Store) ListReservations(ctx context.Context, showID int64) ([]MyItem, error) {
+	// Pulls refunded_at off the parent order so the admin UI can render
+	// a "повернуто" badge without a second round-trip per row. LEFT JOIN
+	// because legacy reservations may pre-date the orders table.
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT `+reservationJoinSeat+`
+		SELECT `+reservationJoinSeat+`, o.refunded_at
 		FROM reservations r
 		JOIN seats s ON s.id = r.seat_id
+		LEFT JOIN orders o ON o.id = r.order_id
 		WHERE s.show_id = ?
 		ORDER BY r.created_at DESC`, showID)
 	if err != nil {
@@ -891,12 +899,49 @@ func (s *Store) ListReservations(ctx context.Context, showID int64) ([]MyItem, e
 	for rows.Next() {
 		var r Reservation
 		var seat Seat
-		if err := scanReservationWithSeat(rows, &r, &seat); err != nil {
+		// scanReservationWithSeat handles up through the seat columns;
+		// the trailing refunded_at gets scanned via a small wrapper.
+		var refunded sql.NullInt64
+		if err := scanReservationWithSeatExtra(rows, &r, &seat, &refunded); err != nil {
 			return nil, err
 		}
-		out = append(out, MyItem{Reservation: r, Seat: seat})
+		item := MyItem{Reservation: r, Seat: seat}
+		if refunded.Valid {
+			t := time.Unix(refunded.Int64, 0)
+			item.OrderRefundedAt = &t
+		}
+		out = append(out, item)
 	}
 	return out, rows.Err()
+}
+
+// scanReservationWithSeatExtra wraps scanReservationWithSeat for queries
+// that append extra trailing columns after the seat block. SQLite Scan
+// is positional, so a single Scan() call sees all columns at once.
+func scanReservationWithSeatExtra(row interface{ Scan(...any) error }, r *Reservation, seat *Seat, extras ...any) error {
+	var conf, cancelled sql.NullInt64
+	var sellable int
+	args := []any{
+		&r.ID, &r.SeatID, &r.TGUserID, &r.TGChatID, &r.BuyerName, &r.BuyerEmail,
+		&r.AttendeeName, &r.Code,
+		scanTime(&r.CreatedAt), scanTime(&r.ExpiresAt), &conf, &cancelled,
+		&seat.ID, &seat.ShowID, &seat.Row, &seat.Col, &seat.X, &seat.Y,
+		&seat.Label, &seat.Category, &seat.PriceKopecks, &sellable,
+	}
+	args = append(args, extras...)
+	if err := row.Scan(args...); err != nil {
+		return err
+	}
+	if conf.Valid {
+		t := time.Unix(conf.Int64, 0)
+		r.ConfirmedAt = &t
+	}
+	if cancelled.Valid {
+		t := time.Unix(cancelled.Int64, 0)
+		r.CancelledAt = &t
+	}
+	seat.Sellable = sellable != 0
+	return nil
 }
 
 // AdminCancelReservation force-cancels the order this reservation
@@ -1639,6 +1684,100 @@ func (s *Store) SweepExpiredSessions(ctx context.Context) (int64, error) {
 	}
 	n, _ := res.RowsAffected()
 	return n, nil
+}
+
+// --- refunds ---
+
+// ErrNotPaid is returned by MarkOrderRefunded when the target order has
+// never reached confirmed_at. Refunds without a payment make no sense
+// and almost always indicate the admin is targeting the wrong row.
+var ErrNotPaid = errors.New("order not yet confirmed")
+
+// MarkOrderRefunded sets orders.refunded_at on a confirmed order. The
+// caller passes a reservation id (matching the admin UI's row model);
+// we resolve it to the parent order and stamp once. Doesn't touch seat
+// status — refund is bookkeeping, not cancellation.
+//
+// Returns the Order with RefundedAt populated. ErrCodeNotFound when the
+// reservation doesn't exist, ErrNotPaid when the order isn't confirmed,
+// ErrAlreadyClosed when the order already has refunded_at set.
+func (s *Store) MarkOrderRefunded(ctx context.Context, reservationID int64) (Order, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Order{}, err
+	}
+	defer tx.Rollback()
+
+	var orderID sql.NullInt64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT order_id FROM reservations WHERE id = ?`, reservationID).Scan(&orderID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Order{}, ErrCodeNotFound
+		}
+		return Order{}, err
+	}
+	if !orderID.Valid {
+		// Legacy reservation pre-dating the orders table — refund
+		// bookkeeping doesn't apply.
+		return Order{}, ErrCodeNotFound
+	}
+
+	var confirmed, refunded sql.NullInt64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT confirmed_at, refunded_at FROM orders WHERE id = ?`,
+		orderID.Int64).Scan(&confirmed, &refunded); err != nil {
+		return Order{}, err
+	}
+	if !confirmed.Valid {
+		return Order{}, ErrNotPaid
+	}
+	if refunded.Valid {
+		return Order{}, ErrAlreadyClosed
+	}
+
+	now := time.Now()
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE orders SET refunded_at = ? WHERE id = ?`, now.Unix(), orderID.Int64); err != nil {
+		return Order{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Order{}, err
+	}
+
+	// Re-load the full order for the response. Cheap — one row, indexed.
+	order, _, err := s.FindOrderByCode(ctx, "") // placeholder to silence linters; replaced below
+	_ = order
+	_ = err
+	o := Order{ID: orderID.Int64, RefundedAt: &now}
+	// Pull the other fields so callers don't get a hollow Order. One
+	// extra query is fine here — refund-mark is rare.
+	var conf, cancelled, reminded sql.NullInt64
+	var createdAt, expiresAt int64
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT code, buyer_name, buyer_email, tg_user_id, tg_chat_id,
+		       total_kopecks, created_at, expires_at,
+		       confirmed_at, cancelled_at, reminded_at
+		FROM orders WHERE id = ?`, orderID.Int64).Scan(
+		&o.Code, &o.BuyerName, &o.BuyerEmail, &o.TGUserID, &o.TGChatID,
+		&o.TotalKopecks, &createdAt, &expiresAt,
+		&conf, &cancelled, &reminded); err != nil {
+		return o, err
+	}
+	o.CreatedAt = time.Unix(createdAt, 0)
+	o.ExpiresAt = time.Unix(expiresAt, 0)
+	if conf.Valid {
+		t := time.Unix(conf.Int64, 0)
+		o.ConfirmedAt = &t
+	}
+	if cancelled.Valid {
+		t := time.Unix(cancelled.Int64, 0)
+		o.CancelledAt = &t
+	}
+	if reminded.Valid {
+		t := time.Unix(reminded.Int64, 0)
+		o.RemindedAt = &t
+	}
+	return o, nil
 }
 
 // --- audit log ---
