@@ -99,9 +99,15 @@ func (h *Handler) me(w http.ResponseWriter, r *http.Request) {
 // audit writes a row to audit_log without bothering the caller about
 // the outcome. Audit failures get logged and swallowed — losing a
 // trail line is less bad than failing the user-facing action.
+//
+// Failure paths are logged at Error (not Warn) so operators see them
+// in default-level logs; the missing-user branch was previously a
+// silent return which made "empty audit list" impossible to diagnose.
 func (h *Handler) audit(r *http.Request, action, target string, details map[string]any) {
 	u, ok := auth.UserFromContext(r.Context())
 	if !ok {
+		slog.Error("audit: no user in context — RequireAuth middleware misconfigured?",
+			"action", action, "target", target)
 		return
 	}
 	var raw string
@@ -117,8 +123,11 @@ func (h *Handler) audit(r *http.Request, action, target string, details map[stri
 		Target:      target,
 		Details:     raw,
 	}); err != nil {
-		slog.Warn("audit log write failed", "action", action, "target", target, "err", err)
+		slog.Error("audit log write failed",
+			"action", action, "target", target, "actor", u.Email, "err", err)
+		return
 	}
+	slog.Info("audit", "action", action, "target", target, "actor", u.Email)
 }
 
 // --- shows ---

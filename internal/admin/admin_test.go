@@ -452,3 +452,56 @@ func mustGetSeats(t *testing.T, h *harness, showID int64) []store.Seat {
 	}
 	return seats
 }
+
+func TestAuditLogRecordsAdminActions(t *testing.T) {
+	h := setup(t)
+
+	// Trigger one of each kind of mutation.
+	resp := h.do(http.MethodPost, "/api/admin/shows", map[string]any{
+		"title":         "Audit Show",
+		"venue":         "X",
+		"starts_at":     time.Date(2026, 6, 1, 19, 0, 0, 0, time.UTC),
+		"rows":          1,
+		"cols":          2,
+		"price_kopecks": 10000,
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create: %d", resp.StatusCode)
+	}
+	var created struct{ ID int64 }
+	h.decodeJSON(resp, &created)
+
+	resp = h.do(http.MethodPatch, fmt.Sprintf("/api/admin/shows/%d", created.ID),
+		map[string]any{"venue": "Y"})
+	resp.Body.Close()
+
+	resp = h.do(http.MethodPost, fmt.Sprintf("/api/admin/shows/%d/archive", created.ID), nil)
+	resp.Body.Close()
+
+	// Now read the audit feed back.
+	resp = h.do(http.MethodGet, "/api/admin/audit", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("audit list: %d", resp.StatusCode)
+	}
+	var entries []struct {
+		ActorEmail string `json:"actor_email"`
+		Action     string `json:"action"`
+		Target     string `json:"target"`
+	}
+	h.decodeJSON(resp, &entries)
+	want := []string{"show.archive", "show.update", "show.create"} // newest first
+	if len(entries) != 3 {
+		t.Fatalf("got %d entries, want 3: %+v", len(entries), entries)
+	}
+	for i, w := range want {
+		if entries[i].Action != w {
+			t.Errorf("entries[%d].Action = %q, want %q", i, entries[i].Action, w)
+		}
+		if entries[i].ActorEmail != "admin@x.com" {
+			t.Errorf("entries[%d].ActorEmail = %q", i, entries[i].ActorEmail)
+		}
+		if !strings.HasPrefix(entries[i].Target, "show:") {
+			t.Errorf("entries[%d].Target = %q, want show:*", i, entries[i].Target)
+		}
+	}
+}

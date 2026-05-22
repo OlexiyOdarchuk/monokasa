@@ -256,11 +256,14 @@
 				<details class="text-xs text-neutral-500">
 					<summary class="cursor-pointer hover:text-neutral-300">або вставити URL</summary>
 					<input
-						type="url"
+						type="text"
 						bind:value={editPosterURL}
-						placeholder="https://example.com/poster.jpg"
+						placeholder="https://example.com/poster.jpg або /posters/…"
 						class="mt-2 w-full rounded-md border border-neutral-800 bg-neutral-900 px-3 py-2 text-sm text-neutral-100 focus:border-neutral-600 focus:outline-none"
 					/>
+					<p class="mt-1 text-xs text-neutral-500">
+						Може бути зовнішнє https://… або шлях /posters/… від upload'у вище.
+					</p>
 				</details>
 				{#if editPosterURL}
 					<img src={editPosterURL} alt="Прев'ю постера" class="max-h-48 rounded-md border border-neutral-800" onerror={(e: Event) => ((e.target as HTMLImageElement).style.display = 'none')} />

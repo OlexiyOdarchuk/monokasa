@@ -4,8 +4,13 @@
 *.db-wal
 *.db-shm
 monokasa
-# Stray default-name Go binaries from `go build` without `-o`.
+# Stray default-name Go binaries from `go build` without `-o` —
+# Go falls back to the parent dir name (cmd/app → "app", repo "main").
 /main
+/app
+# Local poster uploads (POSTERS_DIR defaults to ./posters on non-Docker
+# runs; Docker mounts /data/posters from a named volume).
+/posters/
 
 # direnv / Nix
 .direnv/
