@@ -49,7 +49,8 @@ type Handler struct {
 	baseURL            string // public origin used when composing magic-link emails
 	loginMailer        LoginMailer
 	secureCookies      bool
-	freeOrderConfirmer FreeOrderConfirmer // optional; called for 0-kopeck orders so 100%-off promos auto-issue tickets
+	freeOrderConfirmer      FreeOrderConfirmer      // optional; called for 0-kopeck orders so 100%-off promos auto-issue tickets
+	acquiringInvoiceCreator AcquiringInvoiceCreator // optional; called for shows with payment_method='acquiring'
 
 	// Per-IP token buckets in front of the abuse-prone endpoints.
 	// Tuned conservatively: real users hit each of these maybe once
@@ -66,6 +67,13 @@ type Handler struct {
 // arrives. main.go wires this to pay.Processor.ConfirmFreeOrder.
 type FreeOrderConfirmer func(ctx context.Context, orderCode string) error
 
+// AcquiringInvoiceCreator wraps pay.Processor.CreateAcquiringInvoice
+// for the public layer. Called for orders whose show has
+// payment_method='acquiring'. Returns the page URL the buyer should
+// be redirected to and the invoice id stored on the order. main.go
+// supplies the show title and items it has on hand.
+type AcquiringInvoiceCreator func(ctx context.Context, orderCode string) (pageURL, invoiceID string, err error)
+
 type Config struct {
 	Store              *store.Store
 	Coder              *token.Coder
@@ -78,6 +86,11 @@ type Config struct {
 	LoginMailer        LoginMailer   // optional; magic-link login disabled when nil
 	SecureCookies      bool          // true forces Secure cookie attribute in production
 	FreeOrderConfirmer FreeOrderConfirmer
+	// AcquiringInvoiceCreator is the hook for shows with
+	// payment_method='acquiring'. Optional: when nil (or when the
+	// show's payment_method is 'jar'), createOrder falls back to the
+	// jar prefill URL.
+	AcquiringInvoiceCreator AcquiringInvoiceCreator
 }
 
 func NewHandler(c Config) *Handler {
@@ -92,7 +105,8 @@ func NewHandler(c Config) *Handler {
 		baseURL:            strings.TrimRight(c.BaseURL, "/"),
 		loginMailer:        c.LoginMailer,
 		secureCookies:      c.SecureCookies,
-		freeOrderConfirmer: c.FreeOrderConfirmer,
+		freeOrderConfirmer:      c.FreeOrderConfirmer,
+		acquiringInvoiceCreator: c.AcquiringInvoiceCreator,
 		// Magic-link send + waitlist signups both trigger outbound
 		// mail; cap at 1 per 6s sustained with burst 3 so a quick
 		// double-tap is fine but a script can't spam our SMTP relay.
@@ -1085,7 +1099,23 @@ func (h *Handler) createOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	payURL := jarPrefillURL(h.jarLink, order.TotalKopecks, order.Code)
+	// Pay URL: acquiring-enabled show gets a real merchant invoice
+	// page; otherwise we fall back to the jar prefill link. Both
+	// flows feed the same buyer-facing "Сплатити" button.
+	var payURL string
+	if show.PaymentMethod == "acquiring" && h.acquiringInvoiceCreator != nil {
+		pageURL, invoiceID, err := h.acquiringInvoiceCreator(r.Context(), order.Code)
+		if err != nil {
+			writeInternal(w, "create acquiring invoice", err)
+			return
+		}
+		if err := h.st.SetOrderInvoiceID(r.Context(), order.ID, invoiceID); err != nil {
+			slog.Error("set invoice id", "code", order.Code, "err", err)
+		}
+		payURL = pageURL
+	} else {
+		payURL = jarPrefillURL(h.jarLink, order.TotalKopecks, order.Code)
+	}
 	items := make([]orderItemResponse, 0, len(targets))
 	for _, s := range targets {
 		items = append(items, orderItemResponse{Seat: publicSeat{

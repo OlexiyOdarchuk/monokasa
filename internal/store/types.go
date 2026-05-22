@@ -31,6 +31,11 @@ type Show struct {
 	// group collapse into one landing card; their event pages link
 	// between siblings under "Інші дати".
 	SessionGroup string
+	// PaymentMethod is "jar" (default, monobank jar prefill URL) or
+	// "acquiring" (real merchant invoice via /api/merchant/invoice/*).
+	// Acquiring requires MONO_ACQUIRING_TOKEN env at runtime; falls
+	// back to jar with a warning when the token is missing.
+	PaymentMethod string
 }
 
 // IsGA returns true for general-admission shows (no seat map).
@@ -123,6 +128,10 @@ type Order struct {
 	// DiscountKopecks is the amount subtracted from sum(seat prices)
 	// to arrive at TotalKopecks. Zero when no discount applied.
 	DiscountKopecks int64
+	// InvoiceID is the monobank acquiring invoice id, populated only
+	// for orders whose show used payment_method='acquiring'. Empty
+	// for jar-based orders.
+	InvoiceID string
 }
 
 // SeatStatus is one of "free", "held", "sold".

@@ -163,10 +163,11 @@ type showResponse struct {
 	PosterURL    string     `json:"poster_url"`
 	CreatedAt    time.Time  `json:"created_at"`
 	ArchivedAt   *time.Time `json:"archived_at,omitempty"`
-	Kind         string     `json:"kind"`          // "seated" or "ga"
-	GACapacity   int        `json:"ga_capacity"`   // pool size for GA shows
-	SessionGroup string     `json:"session_group"` // empty = standalone
-	Stats        *statsBody `json:"stats,omitempty"`
+	Kind          string     `json:"kind"`          // "seated" or "ga"
+	GACapacity    int        `json:"ga_capacity"`   // pool size for GA shows
+	SessionGroup  string     `json:"session_group"` // empty = standalone
+	PaymentMethod string     `json:"payment_method"` // "jar" or "acquiring"
+	Stats         *statsBody `json:"stats,omitempty"`
 }
 
 type statsBody struct {
@@ -182,13 +183,18 @@ func toShowResponse(s store.Show, stats *statsBody) showResponse {
 	if kind == "" {
 		kind = "seated"
 	}
+	pm := s.PaymentMethod
+	if pm == "" {
+		pm = "jar"
+	}
 	return showResponse{
 		ID: s.ID, Slug: s.Slug, Title: s.Title, Venue: s.Venue,
 		StartsAt: s.StartsAt, Description: s.Description, PosterURL: s.PosterURL,
 		CreatedAt: s.CreatedAt, ArchivedAt: s.ArchivedAt,
 		Kind: kind, GACapacity: s.GACapacity,
-		SessionGroup: s.SessionGroup,
-		Stats:        stats,
+		SessionGroup:  s.SessionGroup,
+		PaymentMethod: pm,
+		Stats:         stats,
 	}
 }
 
@@ -219,6 +225,9 @@ type createShowRequest struct {
 	// SessionGroup optional: tag two+ shows with the same label to
 	// present them as one production on multiple dates.
 	SessionGroup string `json:"session_group,omitempty"`
+	// PaymentMethod: "jar" (default) or "acquiring". Acquiring requires
+	// MONO_ACQUIRING_TOKEN at runtime.
+	PaymentMethod string `json:"payment_method,omitempty"`
 }
 
 func (h *Handler) createShow(w http.ResponseWriter, r *http.Request) {
@@ -261,10 +270,20 @@ func (h *Handler) createShow(w http.ResponseWriter, r *http.Request) {
 			"kind must be 'seated' or 'ga'")
 		return
 	}
+	pm := req.PaymentMethod
+	if pm == "" {
+		pm = "jar"
+	}
+	if pm != "jar" && pm != "acquiring" {
+		writeError(w, http.StatusBadRequest, "invalid_input",
+			"payment_method must be 'jar' or 'acquiring'")
+		return
+	}
 	id, err := h.st.CreateShow(r.Context(), store.Show{
 		Title: req.Title, Venue: req.Venue, StartsAt: req.StartsAt,
 		Kind: kind, GACapacity: req.GACapacity,
-		SessionGroup: strings.TrimSpace(req.SessionGroup),
+		SessionGroup:  strings.TrimSpace(req.SessionGroup),
+		PaymentMethod: pm,
 	}, req.Rows, req.Cols, req.PriceKopecks)
 	if err != nil {
 		writeInternal(w, "create show", err)
@@ -315,12 +334,13 @@ func (h *Handler) getShow(w http.ResponseWriter, r *http.Request) {
 }
 
 type updateShowRequest struct {
-	Title        *string    `json:"title"`
-	Venue        *string    `json:"venue"`
-	StartsAt     *time.Time `json:"starts_at"`
-	Description  *string    `json:"description"`
-	PosterURL    *string    `json:"poster_url"`
-	SessionGroup *string    `json:"session_group"`
+	Title         *string    `json:"title"`
+	Venue         *string    `json:"venue"`
+	StartsAt      *time.Time `json:"starts_at"`
+	Description   *string    `json:"description"`
+	PosterURL     *string    `json:"poster_url"`
+	SessionGroup  *string    `json:"session_group"`
+	PaymentMethod *string    `json:"payment_method"`
 }
 
 func (h *Handler) updateShow(w http.ResponseWriter, r *http.Request) {
@@ -361,6 +381,15 @@ func (h *Handler) updateShow(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.SessionGroup != nil {
 		merged.SessionGroup = strings.TrimSpace(*req.SessionGroup)
+	}
+	if req.PaymentMethod != nil {
+		pm := strings.TrimSpace(*req.PaymentMethod)
+		if pm != "jar" && pm != "acquiring" {
+			writeError(w, http.StatusBadRequest, "invalid_input",
+				"payment_method must be 'jar' or 'acquiring'")
+			return
+		}
+		merged.PaymentMethod = pm
 	}
 	if err := h.st.UpdateShow(r.Context(), merged); err != nil {
 		writeInternal(w, "update show", err)

@@ -17,7 +17,12 @@ import (
 	"strings"
 	"time"
 
+	"crypto/ecdsa"
+	"sync"
+
+	"github.com/OlexiyOdarchuk/go-monobank-sdk/acquiring"
 	"github.com/OlexiyOdarchuk/go-monobank-sdk/bank"
+	"github.com/OlexiyOdarchuk/go-monobank-sdk/currency"
 	"github.com/OlexiyOdarchuk/go-monobank-sdk/money"
 	"github.com/OlexiyOdarchuk/go-monobank-sdk/webhook"
 
@@ -79,6 +84,11 @@ var (
 // Store is the persistence behavior the processor needs.
 type Store interface {
 	FindOrderByCode(ctx context.Context, code string) (Order, []OrderItem, error)
+	// FindOrderByInvoiceID is the acquiring dual of FindOrderByCode —
+	// the webhook arrives with monobank's invoice id, not our code,
+	// so the matcher needs this lookup. Returns ErrCodeNotFound when
+	// nothing matches (unsolicited webhook for a stale invoice).
+	FindOrderByInvoiceID(ctx context.Context, invoiceID string) (Order, []OrderItem, error)
 	ConfirmOrder(ctx context.Context, orderID int64, qrPayloads map[int64]string) error
 	// LogAudit appends one row to the audit_log table. Pay processor
 	// logs payment.confirm here so the journal shows monobank webhook
@@ -130,6 +140,22 @@ type Processor struct {
 	// realtime.SeatSold event so live SSE subscribers update without
 	// reloading. Nil-safe (Publish on a nil hub is a no-op).
 	Hub *realtime.Hub
+	// AcquiringClient is the monobank Merchant API client. Optional —
+	// when nil, shows with payment_method='acquiring' fall back to jar
+	// at handler level (see public.createOrder). When set, the
+	// processor knows how to create invoices and verify webhooks.
+	AcquiringClient *acquiring.Client
+	// BaseURL is the public origin of this deploy ("https://kasa.x.com").
+	// Used to compose redirectUrl + webHookUrl on invoice create so
+	// monobank can call us back. Mandatory when AcquiringClient is set.
+	BaseURL string
+
+	// Acquiring webhook signing key, fetched lazily from monobank
+	// (/api/merchant/pubkey) on first use and cached. Rotates rarely
+	// enough that one round-trip per process lifetime is fine.
+	acqKeyOnce sync.Once
+	acqKey     *ecdsa.PublicKey
+	acqKeyErr  error
 }
 
 // Handle is the OnEvent callback wired into webhook.NewHandler.
@@ -329,4 +355,135 @@ func extractCode(fields ...string) string {
 		}
 	}
 	return ""
+}
+
+// --- acquiring (monobank Merchant API) ---
+
+// AcquiringEnabled reports whether the processor was configured with a
+// merchant API client. Public handlers branch on this when deciding
+// whether to honour show.payment_method='acquiring' or fall back to jar.
+func (p *Processor) AcquiringEnabled() bool { return p.AcquiringClient != nil }
+
+// CreateAcquiringInvoice asks monobank to mint a real invoice for the
+// order, returning the URL the buyer should be redirected to. The
+// invoice ID is stored on the order so the webhook handler can match
+// the eventual "success" notification back to it.
+//
+// redirectURL is the buyer-facing page to land on after payment (the
+// event page); webhookURL is what monobank POSTs to with the status
+// update. Both should be absolute https URLs.
+func (p *Processor) CreateAcquiringInvoice(ctx context.Context, order Order, items []OrderItem, showTitle string) (pageURL string, invoiceID string, err error) {
+	if p.AcquiringClient == nil {
+		return "", "", fmt.Errorf("acquiring not configured")
+	}
+	if p.BaseURL == "" {
+		return "", "", fmt.Errorf("acquiring requires BaseURL on processor")
+	}
+	// Build line-items: monobank likes a description and per-item
+	// breakdown. We send one line per reservation seat — keeps the
+	// receipt readable.
+	basket := make([]acquiring.BasketItem, 0, len(items))
+	for _, it := range items {
+		name := fmt.Sprintf("%s · ряд %d місце %d", showTitle, it.Seat.Row, it.Seat.Col)
+		if it.Seat.Category == "GA" {
+			name = fmt.Sprintf("%s · GA #%d", showTitle, it.Seat.Col)
+		}
+		basket = append(basket, acquiring.BasketItem{
+			Name: name,
+			Qty:  1,
+			Sum:  it.Seat.Price.Minor,
+			Unit: "шт.",
+			Code: fmt.Sprintf("res-%d", it.ReservationID),
+		})
+	}
+	resp, err := p.AcquiringClient.CreateInvoice(ctx, &acquiring.CreateInvoiceRequest{
+		Amount:   order.TotalKopecks,
+		Currency: currency.UAH,
+		MerchantPaymInfo: &acquiring.MerchantPaymInfo{
+			Reference:   order.Code,
+			Destination: fmt.Sprintf("Квитки на %q · код %s", showTitle, order.Code),
+			BasketOrder: basket,
+		},
+		RedirectURL: p.BaseURL + "/event/by-code/" + order.Code,
+		WebHookURL:  p.BaseURL + "/webhook/acquiring",
+		// Validity matches HOLD duration so monobank invalidates the
+		// invoice when our reservation would expire anyway.
+		Validity: int64((15 * time.Minute).Seconds()),
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("create invoice: %w", err)
+	}
+	return resp.PageURL, resp.InvoiceID, nil
+}
+
+// HandleAcquiringWebhook verifies the signed POST monobank sent us,
+// parses the payload, and confirms+delivers the matching order when
+// status reaches "success". Returns nil for status updates we don't
+// act on (created/processing/hold) so the caller can return 200 — the
+// bank retries non-2xx responses.
+func (p *Processor) HandleAcquiringWebhook(ctx context.Context, body []byte, xSign string) error {
+	pub, err := p.acquiringPubKey(ctx)
+	if err != nil {
+		return fmt.Errorf("pubkey: %w", err)
+	}
+	if err := acquiring.VerifyWebhook(pub, body, xSign); err != nil {
+		return fmt.Errorf("verify: %w", err)
+	}
+	hook, err := acquiring.ParseWebhook(body)
+	if err != nil {
+		return fmt.Errorf("parse: %w", err)
+	}
+	switch hook.Status {
+	case acquiring.InvoiceSuccess:
+		// Fall through to confirmation.
+	case acquiring.InvoiceFailure, acquiring.InvoiceExpired, acquiring.InvoiceReversed:
+		slog.Info("acquiring webhook: non-success status",
+			"invoiceId", hook.InvoiceID, "status", hook.Status,
+			"reason", hook.FailureReason)
+		return nil
+	default:
+		// created / processing / hold — nothing to do yet.
+		return nil
+	}
+	order, items, err := p.Store.FindOrderByInvoiceID(ctx, hook.InvoiceID)
+	if err != nil {
+		return fmt.Errorf("find order by invoice %q: %w", hook.InvoiceID, err)
+	}
+	if order.ConfirmedAt != nil {
+		// Idempotent — monobank retries until they get a 200.
+		return nil
+	}
+	return p.deliverConfirmedOrder(ctx, order, items, deliverContext{
+		AuditAction: "payment.acquiring",
+		AuditExtra: map[string]any{
+			"invoice_id":     hook.InvoiceID,
+			"final_kopecks":  hook.FinalAmount.Minor,
+			"merchant_paid":  hook.Amount.Minor,
+		},
+	})
+}
+
+// acquiringPubKey lazily fetches the merchant signing key from monobank
+// on first use and caches it for the rest of the process lifetime.
+// Concurrent callers join via sync.Once; failure is sticky (the
+// process needs a restart or fresh PubKey call to recover).
+func (p *Processor) acquiringPubKey(ctx context.Context) (*ecdsa.PublicKey, error) {
+	p.acqKeyOnce.Do(func() {
+		if p.AcquiringClient == nil {
+			p.acqKeyErr = fmt.Errorf("acquiring client not configured")
+			return
+		}
+		sk, err := p.AcquiringClient.PubKey(ctx)
+		if err != nil {
+			p.acqKeyErr = fmt.Errorf("fetch pubkey: %w", err)
+			return
+		}
+		pub, err := acquiring.ParsePubKey([]byte(sk.Key))
+		if err != nil {
+			p.acqKeyErr = fmt.Errorf("parse pubkey: %w", err)
+			return
+		}
+		p.acqKey = pub
+	})
+	return p.acqKey, p.acqKeyErr
 }

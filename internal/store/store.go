@@ -290,6 +290,14 @@ var migrations = []string{
 	// give away a 5-seat order. For percent codes scope=ticket means
 	// cheapest_seat * percent/100; for fixed it's min(value, cheapest).
 	`ALTER TABLE discount_codes ADD COLUMN scope TEXT NOT NULL DEFAULT 'order'`,
+	// Acquiring (monobank Merchant API) as an alternative to the jar
+	// link. payment_method='jar' (default, back-compat) routes the
+	// buyer to a jar prefill URL; 'acquiring' creates a real invoice
+	// via /api/merchant/invoice/create and stores the returned id on
+	// the order so the webhook handler can match it later.
+	`ALTER TABLE shows ADD COLUMN payment_method TEXT NOT NULL DEFAULT 'jar'`,
+	`ALTER TABLE orders ADD COLUMN invoice_id TEXT NOT NULL DEFAULT ''`,
+	`CREATE INDEX IF NOT EXISTS idx_orders_invoice ON orders(invoice_id) WHERE invoice_id != ''`,
 }
 
 // Errors.
@@ -368,15 +376,18 @@ func (s *Store) Ping(ctx context.Context) error {
 
 // --- shows ---
 
-const showCols = `id, slug, title, venue, starts_at, description, poster_url, created_at, archived_at, kind, ga_capacity, session_group`
+const showCols = `id, slug, title, venue, starts_at, description, poster_url, created_at, archived_at, kind, ga_capacity, session_group, payment_method`
 
 func scanShow(row interface{ Scan(...any) error }, sh *Show) error {
 	var startsAt, createdAt int64
 	var archivedAt sql.NullInt64
 	if err := row.Scan(&sh.ID, &sh.Slug, &sh.Title, &sh.Venue, &startsAt,
 		&sh.Description, &sh.PosterURL, &createdAt, &archivedAt,
-		&sh.Kind, &sh.GACapacity, &sh.SessionGroup); err != nil {
+		&sh.Kind, &sh.GACapacity, &sh.SessionGroup, &sh.PaymentMethod); err != nil {
 		return err
+	}
+	if sh.PaymentMethod == "" {
+		sh.PaymentMethod = "jar"
 	}
 	sh.StartsAt = time.Unix(startsAt, 0)
 	if createdAt > 0 {
@@ -422,12 +433,15 @@ func (s *Store) CreateShow(ctx context.Context, show Show, rows, cols int, price
 		}
 		show.Slug = slug
 	}
+	if show.PaymentMethod == "" {
+		show.PaymentMethod = "jar"
+	}
 	res, err := tx.ExecContext(ctx,
-		`INSERT INTO shows(slug, title, venue, starts_at, description, poster_url, created_at, kind, ga_capacity, session_group)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO shows(slug, title, venue, starts_at, description, poster_url, created_at, kind, ga_capacity, session_group, payment_method)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		show.Slug, show.Title, show.Venue, show.StartsAt.Unix(),
 		show.Description, show.PosterURL, show.CreatedAt.Unix(),
-		show.Kind, show.GACapacity, show.SessionGroup)
+		show.Kind, show.GACapacity, show.SessionGroup, show.PaymentMethod)
 	if err != nil {
 		if isUniqueErr(err) {
 			return 0, fmt.Errorf("slug %q already exists", show.Slug)
@@ -646,9 +660,13 @@ func (s *Store) ActiveShow(ctx context.Context) (Show, error) {
 // created_at and archived_at are not touched — slug is set once at create
 // and changing it would break shared links.
 func (s *Store) UpdateShow(ctx context.Context, sh Show) error {
+	pm := sh.PaymentMethod
+	if pm == "" {
+		pm = "jar"
+	}
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE shows SET title=?, venue=?, starts_at=?, description=?, poster_url=?, session_group=? WHERE id=?`,
-		sh.Title, sh.Venue, sh.StartsAt.Unix(), sh.Description, sh.PosterURL, sh.SessionGroup, sh.ID)
+		`UPDATE shows SET title=?, venue=?, starts_at=?, description=?, poster_url=?, session_group=?, payment_method=? WHERE id=?`,
+		sh.Title, sh.Venue, sh.StartsAt.Unix(), sh.Description, sh.PosterURL, sh.SessionGroup, pm, sh.ID)
 	if err != nil {
 		return err
 	}
@@ -1673,11 +1691,11 @@ func (s *Store) FindOrderByCode(ctx context.Context, code string) (Order, []Orde
 	var createdAt, expiresAt int64
 	err := s.db.QueryRowContext(ctx, `
 		SELECT id, code, buyer_name, buyer_email, tg_user_id, tg_chat_id,
-		       total_kopecks, discount_code, discount_kopecks,
+		       total_kopecks, discount_code, discount_kopecks, invoice_id,
 		       created_at, expires_at, confirmed_at, cancelled_at, reminded_at
 		FROM orders WHERE code = ?`, code).Scan(
 		&o.ID, &o.Code, &o.BuyerName, &o.BuyerEmail, &o.TGUserID, &o.TGChatID,
-		&o.TotalKopecks, &o.DiscountCode, &o.DiscountKopecks,
+		&o.TotalKopecks, &o.DiscountCode, &o.DiscountKopecks, &o.InvoiceID,
 		&createdAt, &expiresAt, &conf, &cancelled, &reminded)
 	if errors.Is(err, sql.ErrNoRows) {
 		return o, nil, ErrCodeNotFound
@@ -2665,6 +2683,105 @@ func (s *Store) UpdateDiscountCode(ctx context.Context, d DiscountCode) error {
 func (s *Store) DeleteDiscountCode(ctx context.Context, id int64) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM discount_codes WHERE id = ?`, id)
 	return err
+}
+
+// SetOrderInvoiceID stores the monobank acquiring invoice id on an
+// order so the webhook handler can match incoming notifications back
+// to the right order. Called once, right after CreateInvoice returns.
+func (s *Store) SetOrderInvoiceID(ctx context.Context, orderID int64, invoiceID string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE orders SET invoice_id = ? WHERE id = ?`, invoiceID, orderID)
+	return err
+}
+
+// FindOrderByInvoiceID is the acquiring-side dual of FindOrderByCode —
+// the webhook arrives with the monobank invoice id, not our code, so
+// the matcher needs this lookup. Returns ErrCodeNotFound if no order
+// has that invoice attached.
+func (s *Store) FindOrderByInvoiceID(ctx context.Context, invoiceID string) (Order, []OrderItem, error) {
+	var o Order
+	var conf, cancelled, reminded sql.NullInt64
+	var createdAt, expiresAt int64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, code, buyer_name, buyer_email, tg_user_id, tg_chat_id,
+		       total_kopecks, discount_code, discount_kopecks, invoice_id,
+		       created_at, expires_at, confirmed_at, cancelled_at, reminded_at
+		FROM orders WHERE invoice_id = ? AND invoice_id != ''`, invoiceID).Scan(
+		&o.ID, &o.Code, &o.BuyerName, &o.BuyerEmail, &o.TGUserID, &o.TGChatID,
+		&o.TotalKopecks, &o.DiscountCode, &o.DiscountKopecks, &o.InvoiceID,
+		&createdAt, &expiresAt, &conf, &cancelled, &reminded)
+	if errors.Is(err, sql.ErrNoRows) {
+		return o, nil, ErrCodeNotFound
+	}
+	if err != nil {
+		return o, nil, err
+	}
+	o.CreatedAt = time.Unix(createdAt, 0)
+	o.ExpiresAt = time.Unix(expiresAt, 0)
+	if conf.Valid {
+		t := time.Unix(conf.Int64, 0)
+		o.ConfirmedAt = &t
+	}
+	if cancelled.Valid {
+		t := time.Unix(cancelled.Int64, 0)
+		o.CancelledAt = &t
+	}
+	if reminded.Valid {
+		t := time.Unix(reminded.Int64, 0)
+		o.RemindedAt = &t
+	}
+	items, err := s.orderItems(ctx, o.ID)
+	if err != nil {
+		return o, nil, err
+	}
+	return o, items, nil
+}
+
+// orderItems is the seat+reservation rollup used by FindOrderBy*.
+// Kept as a small helper so both lookup paths share the same query.
+func (s *Store) orderItems(ctx context.Context, orderID int64) ([]OrderItem, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+resCols+`, r.cancelled_at,
+		       s.id, s.show_id, s.row, s.col, s.x, s.y, s.label, s.category, s.price_kopecks, s.sellable
+		FROM reservations r JOIN seats s ON s.id = r.seat_id
+		WHERE r.order_id = ? AND r.cancelled_at IS NULL
+		ORDER BY r.id`, orderID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []OrderItem
+	for rows.Next() {
+		var r Reservation
+		var seat Seat
+		var conf, refunded, cancelled sql.NullInt64
+		var sellable int
+		if err := rows.Scan(
+			&r.ID, &r.SeatID, &r.TGUserID, &r.TGChatID,
+			&r.BuyerName, &r.BuyerEmail, &r.AttendeeName, &r.Code,
+			scanTime(&r.CreatedAt), scanTime(&r.ExpiresAt),
+			&conf, &refunded, &cancelled,
+			&seat.ID, &seat.ShowID, &seat.Row, &seat.Col,
+			&seat.X, &seat.Y, &seat.Label, &seat.Category, &seat.PriceKopecks, &sellable,
+		); err != nil {
+			return nil, err
+		}
+		seat.Sellable = sellable != 0
+		if conf.Valid {
+			t := time.Unix(conf.Int64, 0)
+			r.ConfirmedAt = &t
+		}
+		if refunded.Valid {
+			t := time.Unix(refunded.Int64, 0)
+			r.RefundedAt = &t
+		}
+		if cancelled.Valid {
+			t := time.Unix(cancelled.Int64, 0)
+			r.CancelledAt = &t
+		}
+		out = append(out, OrderItem{Reservation: r, Seat: seat})
+	}
+	return out, rows.Err()
 }
 
 // --- waiting list ---

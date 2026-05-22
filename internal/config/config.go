@@ -27,6 +27,11 @@ type Config struct {
 	RemindBefore time.Duration
 	MonoToken    string
 	WebhookURL   string
+	// MonoAcquiringToken is the merchant API key for shows with
+	// payment_method='acquiring'. Optional — unset = jar-only mode.
+	// Issued by monobank business support, distinct from MonoToken
+	// (which is the Personal API jar-statement key).
+	MonoAcquiringToken string
 
 	// AdminEmail/AdminPassword bootstrap the first admin user on a fresh
 	// install. Once any user exists in the DB these are ignored, so they
@@ -84,6 +89,7 @@ func Load() (Config, error) {
 	c.JarLink = os.Getenv("MONO_JAR_LINK")
 	c.ScannerToken = os.Getenv("SCANNER_TOKEN")
 	c.MonoToken = os.Getenv("MONO_TOKEN")
+	c.MonoAcquiringToken = os.Getenv("MONO_ACQUIRING_TOKEN")
 	c.WebhookURL = os.Getenv("WEBHOOK_URL")
 	c.AdminTGID, _ = strconv.ParseInt(os.Getenv("ADMIN_TG_ID"), 10, 64)
 	c.AdminEmail = os.Getenv("ADMIN_EMAIL")

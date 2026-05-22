@@ -16,6 +16,7 @@
 	let gaCapacity = $state(100);
 	let priceUAH = $state(params.get('price') ?? '250');
 	let sessionGroup = $state(params.get('group') ?? '');
+	let paymentMethod = $state<'jar' | 'acquiring'>('jar');
 
 	let submitting = $state(false);
 	let error = $state('');
@@ -43,7 +44,8 @@
 			price_kopecks: priceKopecks,
 			kind,
 			ga_capacity: kind === 'ga' ? gaCapacity : 0,
-			session_group: sessionGroup.trim()
+			session_group: sessionGroup.trim(),
+			payment_method: paymentMethod
 		};
 
 		submitting = true;
@@ -190,6 +192,34 @@
 		<p class="mt-1 text-xs text-neutral-500">
 			Однакова ціна для всіх місць; категорії з різною ціною — у редакторі залу (наступний PR).
 		</p>
+	</div>
+
+	<div>
+		<span class="block text-sm text-neutral-400">Метод оплати</span>
+		<div class="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
+			<label
+				class="flex cursor-pointer items-start gap-3 rounded-md border border-neutral-800 bg-neutral-900 p-3 hover:border-neutral-600 {paymentMethod === 'jar' ? 'ring-2 ring-[var(--color-brand)]' : ''}"
+			>
+				<input type="radio" bind:group={paymentMethod} value="jar" class="mt-1 accent-[var(--color-brand)]" />
+				<span class="flex-1 text-sm">
+					<span class="font-medium text-neutral-100">🍯 Банка моно</span>
+					<span class="mt-0.5 block text-xs text-neutral-500">
+						Простіше, без бізнес-кабінету. Ліміт банки моно.
+					</span>
+				</span>
+			</label>
+			<label
+				class="flex cursor-pointer items-start gap-3 rounded-md border border-neutral-800 bg-neutral-900 p-3 hover:border-neutral-600 {paymentMethod === 'acquiring' ? 'ring-2 ring-[var(--color-brand)]' : ''}"
+			>
+				<input type="radio" bind:group={paymentMethod} value="acquiring" class="mt-1 accent-[var(--color-brand)]" />
+				<span class="flex-1 text-sm">
+					<span class="font-medium text-neutral-100">💳 Еквайринг</span>
+					<span class="mt-0.5 block text-xs text-neutral-500">
+						Справжній invoice + чек. Потрібен MONO_ACQUIRING_TOKEN.
+					</span>
+				</span>
+			</label>
+		</div>
 	</div>
 
 	<div>

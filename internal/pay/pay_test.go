@@ -75,6 +75,12 @@ func (f *fakeStore) FindOrderByCode(_ context.Context, code string) (Order, []Or
 	return f.order, f.items, nil
 }
 
+func (f *fakeStore) FindOrderByInvoiceID(_ context.Context, _ string) (Order, []OrderItem, error) {
+	// pay_test doesn't exercise the acquiring path; just satisfy the
+	// interface with a not-found response.
+	return Order{}, nil, ErrCodeNotFound
+}
+
 func (f *fakeStore) ConfirmOrder(_ context.Context, orderID int64, qrPayloads map[int64]string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

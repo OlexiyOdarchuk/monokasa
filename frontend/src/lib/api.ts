@@ -111,6 +111,7 @@ export interface Show {
 	kind: ShowKind;
 	ga_capacity: number;
 	session_group: string;
+	payment_method: 'jar' | 'acquiring';
 	stats?: Stats | null;
 }
 
@@ -281,6 +282,7 @@ export interface CreateShowInput {
 	kind?: ShowKind;
 	ga_capacity?: number;
 	session_group?: string;
+	payment_method?: 'jar' | 'acquiring';
 }
 
 export interface UpdateShowInput {
@@ -290,6 +292,7 @@ export interface UpdateShowInput {
 	description?: string;
 	poster_url?: string;
 	session_group?: string;
+	payment_method?: 'jar' | 'acquiring';
 }
 
 // ---- public-side (anonymous buyer) shapes ----

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"expvar"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -19,6 +20,7 @@ import (
 	"github.com/joho/godotenv"
 
 	monobank "github.com/OlexiyOdarchuk/go-monobank-sdk"
+	"github.com/OlexiyOdarchuk/go-monobank-sdk/acquiring"
 	"github.com/OlexiyOdarchuk/go-monobank-sdk/bank"
 	"github.com/OlexiyOdarchuk/go-monobank-sdk/currency"
 	"github.com/OlexiyOdarchuk/go-monobank-sdk/jar"
@@ -176,6 +178,17 @@ func main() {
 		Email:    emailDelivery,
 		Hub:      hub,
 	}
+	// Acquiring (monobank Merchant API) — optional. When MONO_ACQUIRING_TOKEN
+	// is set, shows tagged payment_method='acquiring' get a real invoice
+	// (page URL + signed webhook) instead of the jar-prefill link.
+	if cfg.MonoAcquiringToken != "" {
+		processor.AcquiringClient = acquiring.New(cfg.MonoAcquiringToken)
+		processor.BaseURL = cfg.BaseURL
+		if cfg.BaseURL == "" {
+			slog.Warn("acquiring enabled but BASE_URL empty — invoice redirect/webhook URLs will be missing")
+		}
+		slog.Info("acquiring enabled")
+	}
 	hook, err := webhook.NewHandler(ctx, webhook.Options{
 		Keys:    monoClient,
 		Dedup:   webhook.NewMemoryDeduper(2048),
@@ -310,10 +323,31 @@ func main() {
 			_, err := processor.ConfirmFreeOrder(ctx, code)
 			return err
 		},
+		// Acquiring path: look up the just-created order, ask the
+		// processor to mint a monobank invoice, return the page URL +
+		// invoice id for the caller to attach to the order row.
+		AcquiringInvoiceCreator: func(ctx context.Context, code string) (string, string, error) {
+			if !processor.AcquiringEnabled() {
+				return "", "", fmt.Errorf("acquiring not configured")
+			}
+			order, items, err := processor.Store.FindOrderByCode(ctx, code)
+			if err != nil {
+				return "", "", err
+			}
+			show, err := payShowFn(ctx)
+			if err != nil {
+				return "", "", err
+			}
+			return processor.CreateAcquiringInvoice(ctx, order, items, show.Title)
+		},
 	})
 
 	mux := http.NewServeMux()
 	mux.Handle("/webhook", hook)
+	// Acquiring webhook is mounted unconditionally so monobank can post
+	// to a known URL; when acquiring isn't configured the handler 404s,
+	// keeping the surface predictable for ops debugging.
+	mux.HandleFunc("POST /webhook/acquiring", acquiringWebhookHandler(processor))
 	mux.Handle("/debug/vars", expvar.Handler())
 	mux.Handle("/api/admin/", authHandler.RequireAuth(adminMux))
 	mux.HandleFunc("/posters/", postersSvc.HandleServe)
@@ -943,8 +977,10 @@ func (w webStore) FindReservationByTicket(ctx context.Context, ticketID int64) (
 
 type payStore struct{ s *store.Store }
 
-func (p payStore) FindOrderByCode(ctx context.Context, code string) (pay.Order, []pay.OrderItem, error) {
-	o, items, err := p.s.FindOrderByCode(ctx, code)
+// toPayOrderAndItems is the shared store.Order/[]Reservation → pay.*
+// translation used by both lookup adapters. Kept private so the two
+// FindOrderBy* funcs don't drift on field mapping.
+func toPayOrderAndItems(o store.Order, items []store.OrderItem, err error) (pay.Order, []pay.OrderItem, error) {
 	payOrder := pay.Order{
 		ID: o.ID, Code: o.Code,
 		BuyerName:       o.BuyerName,
@@ -977,6 +1013,16 @@ func (p payStore) FindOrderByCode(ctx context.Context, code string) (pay.Order, 
 		}
 	}
 	return payOrder, payItems, nil
+}
+
+func (p payStore) FindOrderByInvoiceID(ctx context.Context, invoiceID string) (pay.Order, []pay.OrderItem, error) {
+	o, items, err := p.s.FindOrderByInvoiceID(ctx, invoiceID)
+	return toPayOrderAndItems(o, items, err)
+}
+
+func (p payStore) FindOrderByCode(ctx context.Context, code string) (pay.Order, []pay.OrderItem, error) {
+	o, items, err := p.s.FindOrderByCode(ctx, code)
+	return toPayOrderAndItems(o, items, err)
 }
 
 func (p payStore) ConfirmOrder(ctx context.Context, orderID int64, qrPayloads map[int64]string) error {
@@ -1162,6 +1208,35 @@ func payRenderer(show pay.Show, seat pay.Seat, buyerName, qrPayload string) ([]b
 		ticket.Seat{Row: seat.Row, Col: seat.Col, Category: seat.Category},
 		buyerName, qrPayload,
 	)
+}
+
+// acquiringWebhookHandler wraps pay.Processor.HandleAcquiringWebhook in
+// an http.HandlerFunc with the right signing-header lookup and body
+// size cap. Returns 404 when acquiring isn't configured so the
+// endpoint is discoverable but inert.
+func acquiringWebhookHandler(processor *pay.Processor) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !processor.AcquiringEnabled() {
+			http.NotFound(w, r)
+			return
+		}
+		// Cap body before reading so a malformed huge POST can't OOM.
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			slog.Error("acquiring webhook: read body", "err", err)
+			http.Error(w, "bad body", http.StatusBadRequest)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+		if err := processor.HandleAcquiringWebhook(ctx, body, r.Header.Get("X-Sign")); err != nil {
+			slog.Error("acquiring webhook handle", "err", err)
+			http.Error(w, "error", http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}
 }
 
 // eventOGHandler serves the SPA shell with route-specific Open Graph

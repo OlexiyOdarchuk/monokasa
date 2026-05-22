@@ -60,6 +60,13 @@ func (p payAdapter) FindOrderByCode(ctx context.Context, code string) (pay.Order
 	return payOrder, payItems, nil
 }
 
+func (p payAdapter) FindOrderByInvoiceID(_ context.Context, _ string) (pay.Order, []pay.OrderItem, error) {
+	// e2e test doesn't exercise the acquiring path — return a stub
+	// that satisfies the interface and matches "not found" semantics
+	// the tests would never hit anyway.
+	return pay.Order{}, nil, pay.ErrCodeNotFound
+}
+
 func (p payAdapter) ConfirmOrder(ctx context.Context, orderID int64, qrPayloads map[int64]string) error {
 	_, err := p.s.ConfirmOrder(ctx, orderID, qrPayloads)
 	return err
