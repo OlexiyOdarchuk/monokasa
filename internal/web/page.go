@@ -76,6 +76,11 @@ const pageHTML = `<!doctype html>
   </div>
 </div>
 <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
+<!-- Telegram WebApp SDK: harmless no-op outside Telegram context.
+     Used so window.Telegram.WebApp.initData can authenticate the
+     scanner without the shared password when admin opens it via the
+     bot's "🔍 Сканер" inline button. -->
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script>
 (async () => {
   const video = document.getElementById('cam');
@@ -128,11 +133,25 @@ const pageHTML = `<!doctype html>
   let lastPayload = '';
   let cooldownUntil = 0;
 
+  // Telegram WebApp integration: when this page is opened as a Mini
+  // App from the bot, window.Telegram.WebApp.initData carries the
+  // signed payload our server verifies as a second auth path. The
+  // SDK script is added by Telegram automatically when launched as a
+  // WebApp; outside that context window.Telegram is undefined and
+  // we just fall through to the cookie/password flow.
+  const tgInitData = (window.Telegram && window.Telegram.WebApp && window.Telegram.WebApp.initData) || '';
+  if (window.Telegram && window.Telegram.WebApp && window.Telegram.WebApp.ready) {
+    window.Telegram.WebApp.ready();
+    window.Telegram.WebApp.expand && window.Telegram.WebApp.expand();
+  }
+
   async function check(payload) {
     try {
+      const headers = { 'Content-Type': 'application/json' };
+      if (tgInitData) headers['X-Telegram-Init-Data'] = tgInitData;
       const res = await fetch('/scan/check', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({ payload }),
         credentials: 'same-origin',
       });

@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"net/url"
 	"sort"
-	"strconv"
 	"strings"
 )
 
@@ -81,6 +80,3 @@ func VerifyTelegramInitData(initData, botToken string) (userID int64, err error)
 	return user.ID, nil
 }
 
-// _ keeps strconv imported so future int field extraction (auth_date etc)
-// doesn't require touching the import block. Cheap and explicit.
-var _ = strconv.Itoa

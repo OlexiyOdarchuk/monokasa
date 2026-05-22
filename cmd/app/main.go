@@ -234,6 +234,13 @@ func main() {
 	authHandler := auth.NewHandler(st, cfg.SecureCookies)
 
 	scanner := web.NewScanner(webStore{st}, coder, cfg.ScannerToken)
+	// Telegram WebApp auth: bot opens /scan?tg=1 as a Mini App for
+	// admin TG users. Scanner verifies the signed initData against
+	// the bot token and the admin allow-list. Falls back to the
+	// shared-password flow when TG context isn't present.
+	if cfg.TGToken != "" && cfg.AdminTGID != 0 {
+		scanner.EnableTelegramWebApp(cfg.TGToken, []int64{cfg.AdminTGID})
+	}
 
 	// Seat gauges resolve the active show at scrape time and stat against
 	// its id — so admins flipping between shows in the web UI don't need

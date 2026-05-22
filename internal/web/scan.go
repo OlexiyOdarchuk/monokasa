@@ -54,10 +54,12 @@ type Coder interface {
 // Scanner is the QR-scanner web app: GET /scan serves the HTML, POST
 // /scan/check validates a payload and marks the ticket as used.
 type Scanner struct {
-	store   Store
-	coder   Coder
-	token   string // shared auth token; empty disables auth
-	limiter *Limiter
+	store    Store
+	coder    Coder
+	token    string // shared auth token; empty disables auth
+	botToken string // Telegram bot token; enables WebApp initData auth
+	adminTG  map[int64]bool
+	limiter  *Limiter
 }
 
 func NewScanner(s Store, c Coder, authToken string) *Scanner {
@@ -65,6 +67,20 @@ func NewScanner(s Store, c Coder, authToken string) *Scanner {
 	// QR per second; anything faster is either an automated probe or a
 	// stuck client. Per-IP, so multiple staff devices don't fight.
 	return &Scanner{store: s, coder: c, token: authToken, limiter: NewLimiter(10, 20)}
+}
+
+// EnableTelegramWebApp turns on the second auth path: scanners opened
+// as Telegram Mini Apps can authenticate via initData instead of the
+// shared password cookie. adminTGIDs is the allow-list — only those
+// Telegram users get through, even if initData verifies.
+func (s *Scanner) EnableTelegramWebApp(botToken string, adminTGIDs []int64) {
+	s.botToken = botToken
+	s.adminTG = make(map[int64]bool, len(adminTGIDs))
+	for _, id := range adminTGIDs {
+		if id != 0 {
+			s.adminTG[id] = true
+		}
+	}
 }
 
 func (s *Scanner) Register(mux *http.ServeMux) {
@@ -106,7 +122,22 @@ func (s *Scanner) authOK(r *http.Request) bool {
 		}
 	}
 	if hdr := r.Header.Get("X-Scanner-Token"); hdr != "" {
-		return subtle.ConstantTimeCompare([]byte(hdr), []byte(s.token)) == 1
+		if subtle.ConstantTimeCompare([]byte(hdr), []byte(s.token)) == 1 {
+			return true
+		}
+	}
+	// Telegram WebApp auth: header X-Telegram-Init-Data is the
+	// signed initData blob the Mini App SDK exposes. We verify the
+	// signature against the bot token and check the user against the
+	// admin allow-list. Bot token isn't a secret known to attackers
+	// (lives in the server's env), so this is a real second factor.
+	if s.botToken != "" {
+		if raw := r.Header.Get("X-Telegram-Init-Data"); raw != "" {
+			userID, err := VerifyTelegramInitData(raw, s.botToken)
+			if err == nil && s.adminTG[userID] {
+				return true
+			}
+		}
 	}
 	return false
 }
@@ -128,6 +159,13 @@ func (s *Scanner) handlePage(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
+		// Mini App entry: ?tg=1 query opts into the Telegram WebApp
+		// flow. The page itself exposes no data; real auth happens on
+		// /scan/check, which validates the initData header set by JS.
+		if s.botToken != "" && r.URL.Query().Get("tg") == "1" {
+			writeScannerPage(w)
+			return
+		}
 		if s.authOK(r) {
 			writeScannerPage(w)
 			return

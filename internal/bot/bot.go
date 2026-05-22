@@ -418,7 +418,19 @@ func (b *Bot) sendEventList(c tele.Context, header string) error {
 	}
 
 	markup := &tele.ReplyMarkup{}
-	rows := make([][]tele.InlineButton, 0, len(shows))
+	rows := make([][]tele.InlineButton, 0, len(shows)+1)
+	// Scanner WebApp button for admins. Opens /scan?tg=1 in a Telegram
+	// Mini App; the page authenticates via initData against the bot
+	// token (server validates user.id is in the admin allow-list).
+	// Requires https BASE_URL — Telegram rejects WebApp buttons that
+	// don't use https.
+	if b.adminTGID != 0 && c.Sender() != nil && c.Sender().ID == b.adminTGID &&
+		strings.HasPrefix(b.baseURL, "https://") {
+		rows = append(rows, []tele.InlineButton{{
+			Text:   "🔍 Сканер квитків (адмін)",
+			WebApp: &tele.WebApp{URL: b.baseURL + "/scan?tg=1"},
+		}})
+	}
 	for _, sh := range shows {
 		rows = append(rows, []tele.InlineButton{{
 			Unique: "show",
