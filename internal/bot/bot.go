@@ -462,7 +462,12 @@ func (b *Bot) callbackShow(c tele.Context, cb *tele.Callback) error {
 	rows := [][]tele.InlineButton{
 		{{Unique: "pick", Text: "📋 Обрати місце", Data: sh.Slug}},
 	}
-	if b.baseURL != "" {
+	// Telegram WebApp URLs MUST be https://. http://localhost is fine
+	// for dev with the SPA in a browser, but TG would reject the
+	// inline-keyboard button with a 400. Skip the button rather than
+	// crashing the whole message; the in-chat "📋 Обрати місце" path
+	// still works.
+	if strings.HasPrefix(b.baseURL, "https://") {
 		rows = append(rows, []tele.InlineButton{{
 			Text:   "🗺 Відкрити мапу залу",
 			WebApp: &tele.WebApp{URL: fmt.Sprintf("%s/event/%s", b.baseURL, sh.Slug)},

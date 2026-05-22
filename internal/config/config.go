@@ -97,6 +97,15 @@ func Load() (Config, error) {
 	c.SMTPImplicitTLS = envBool("SMTP_IMPLICIT_TLS", false)
 	c.BotUsername = strings.TrimPrefix(os.Getenv("BOT_USERNAME"), "@")
 	c.BaseURL = strings.TrimRight(os.Getenv("BASE_URL"), "/")
+	// Telegram WebApp buttons require https://, and so does any sane
+	// public deploy. If the admin set BASE_URL=mono.example.com without
+	// a scheme, prepend https:// rather than letting telebot reject the
+	// inline-keyboard button at send time with an opaque 400.
+	if c.BaseURL != "" &&
+		!strings.HasPrefix(c.BaseURL, "https://") &&
+		!strings.HasPrefix(c.BaseURL, "http://") {
+		c.BaseURL = "https://" + c.BaseURL
+	}
 	// Default is relative ("./posters") so local `go run` / `make` works
 	// out of the box without root. Docker compose explicitly sets
 	// POSTERS_DIR=/data/posters where the named volume lives.
