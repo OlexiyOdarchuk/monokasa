@@ -277,6 +277,13 @@ var migrations = []string{
 	)`,
 	`ALTER TABLE orders ADD COLUMN discount_code TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE orders ADD COLUMN discount_kopecks INTEGER NOT NULL DEFAULT 0`,
+	// Multi-session: shows sharing the same non-empty session_group label
+	// represent the same production on different dates (Fri/Sat/Sun
+	// performance of one play). Landing collapses them into one card;
+	// event page links between siblings. Empty (default) = standalone
+	// show, behaves exactly as before.
+	`ALTER TABLE shows ADD COLUMN session_group TEXT NOT NULL DEFAULT ''`,
+	`CREATE INDEX IF NOT EXISTS idx_shows_session_group ON shows(session_group) WHERE session_group != ''`,
 }
 
 // Errors.
@@ -328,14 +335,14 @@ func (s *Store) Ping(ctx context.Context) error {
 
 // --- shows ---
 
-const showCols = `id, slug, title, venue, starts_at, description, poster_url, created_at, archived_at, kind, ga_capacity`
+const showCols = `id, slug, title, venue, starts_at, description, poster_url, created_at, archived_at, kind, ga_capacity, session_group`
 
 func scanShow(row interface{ Scan(...any) error }, sh *Show) error {
 	var startsAt, createdAt int64
 	var archivedAt sql.NullInt64
 	if err := row.Scan(&sh.ID, &sh.Slug, &sh.Title, &sh.Venue, &startsAt,
 		&sh.Description, &sh.PosterURL, &createdAt, &archivedAt,
-		&sh.Kind, &sh.GACapacity); err != nil {
+		&sh.Kind, &sh.GACapacity, &sh.SessionGroup); err != nil {
 		return err
 	}
 	sh.StartsAt = time.Unix(startsAt, 0)
@@ -383,11 +390,11 @@ func (s *Store) CreateShow(ctx context.Context, show Show, rows, cols int, price
 		show.Slug = slug
 	}
 	res, err := tx.ExecContext(ctx,
-		`INSERT INTO shows(slug, title, venue, starts_at, description, poster_url, created_at, kind, ga_capacity)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO shows(slug, title, venue, starts_at, description, poster_url, created_at, kind, ga_capacity, session_group)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		show.Slug, show.Title, show.Venue, show.StartsAt.Unix(),
 		show.Description, show.PosterURL, show.CreatedAt.Unix(),
-		show.Kind, show.GACapacity)
+		show.Kind, show.GACapacity, show.SessionGroup)
 	if err != nil {
 		if isUniqueErr(err) {
 			return 0, fmt.Errorf("slug %q already exists", show.Slug)
@@ -528,6 +535,35 @@ func Slugify(s string) string {
 	return string(out)
 }
 
+// ListSessionsInGroup returns all non-archived shows in the same
+// session_group, soonest first. Used by the buyer event page to render
+// "Інші дати" siblings, and by the landing-page collapser to lay out
+// one card per series. Empty group returns nil (don't treat
+// unlabelled shows as a group).
+func (s *Store) ListSessionsInGroup(ctx context.Context, group string) ([]Show, error) {
+	if group == "" {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+showCols+`
+		FROM shows
+		WHERE session_group = ? AND archived_at IS NULL
+		ORDER BY starts_at ASC`, group)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Show
+	for rows.Next() {
+		var sh Show
+		if err := scanShow(rows, &sh); err != nil {
+			return nil, err
+		}
+		out = append(out, sh)
+	}
+	return out, rows.Err()
+}
+
 // ListShows returns all shows, archived or not, newest start first.
 func (s *Store) ListShows(ctx context.Context) ([]Show, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT `+showCols+` FROM shows ORDER BY starts_at DESC`)
@@ -578,8 +614,8 @@ func (s *Store) ActiveShow(ctx context.Context) (Show, error) {
 // and changing it would break shared links.
 func (s *Store) UpdateShow(ctx context.Context, sh Show) error {
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE shows SET title=?, venue=?, starts_at=?, description=?, poster_url=? WHERE id=?`,
-		sh.Title, sh.Venue, sh.StartsAt.Unix(), sh.Description, sh.PosterURL, sh.ID)
+		`UPDATE shows SET title=?, venue=?, starts_at=?, description=?, poster_url=?, session_group=? WHERE id=?`,
+		sh.Title, sh.Venue, sh.StartsAt.Unix(), sh.Description, sh.PosterURL, sh.SessionGroup, sh.ID)
 	if err != nil {
 		return err
 	}

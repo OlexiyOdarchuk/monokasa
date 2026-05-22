@@ -26,6 +26,7 @@
 	let editStartsAt = $state(''); // RFC3339 UTC, two-way bound to DateTimePicker
 	let editDescription = $state('');
 	let editPosterURL = $state('');
+	let editSessionGroup = $state('');
 	let uploading = $state(false);
 	let uploadError = $state('');
 
@@ -86,6 +87,7 @@
 			editStartsAt = show.starts_at;
 			editDescription = show.description;
 			editPosterURL = show.poster_url;
+			editSessionGroup = show.session_group ?? '';
 			categories = await api.get<SeatCategory[]>(`/api/admin/shows/${id}/categories`);
 		} catch (e) {
 			if (e instanceof ApiError) error = e.detail || e.code;
@@ -168,6 +170,7 @@
 		if (editStartsAt !== show.starts_at) patch.starts_at = editStartsAt;
 		if (editDescription !== show.description) patch.description = editDescription;
 		if (editPosterURL !== show.poster_url) patch.poster_url = editPosterURL.trim();
+		if (editSessionGroup !== (show.session_group ?? '')) patch.session_group = editSessionGroup.trim();
 
 		if (Object.keys(patch).length === 0) {
 			saving = false;
@@ -265,6 +268,13 @@
 			class="rounded-md border border-neutral-700 px-2 py-1 text-xs text-neutral-300 hover:bg-neutral-800"
 		>
 			🔳 QR для афіші
+		</a>
+		<a
+			href="/admin/shows/new?title={encodeURIComponent(show.title)}&venue={encodeURIComponent(show.venue)}&group={encodeURIComponent(show.session_group || show.slug)}"
+			class="rounded-md border border-neutral-700 px-2 py-1 text-xs text-neutral-300 hover:bg-neutral-800"
+			title="Створити ще одну дату цієї події"
+		>
+			🎭 Створити повтор
 		</a>
 	</div>
 
@@ -397,6 +407,20 @@
 				placeholder="Розкажи гостям, що це за подія. Можна без форматування."
 				class="mt-1 w-full rounded-md border border-neutral-800 bg-neutral-900 px-3 py-2 focus:border-neutral-600 focus:outline-none"
 			></textarea>
+		</div>
+		<div>
+			<label for="grp" class="block text-sm text-neutral-400">Серія сесій</label>
+			<input
+				id="grp"
+				type="text"
+				bind:value={editSessionGroup}
+				maxlength="60"
+				placeholder="порожньо = разова подія"
+				class="mt-1 w-full rounded-md border border-neutral-800 bg-neutral-900 px-3 py-2 focus:border-neutral-600 focus:outline-none"
+			/>
+			<p class="mt-1 text-xs text-neutral-500">
+				Та сама мітка на 2+ подіях групує їх в один blok на лендингу з вибором дати.
+			</p>
 		</div>
 
 		{#if error}

@@ -1,16 +1,21 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
+	import { page } from '$app/state';
 	import { api, type Show, type CreateShowInput, type ShowKind, ApiError } from '$lib/api';
 	import DateTimePicker from '$lib/DateTimePicker.svelte';
 
-	let title = $state('');
-	let venue = $state('');
+	// "🎭 Створити повтор" on show editor links here with prefill params
+	// so the admin doesn't retype title/venue/group for another date.
+	const params = page.url.searchParams;
+	let title = $state(params.get('title') ?? '');
+	let venue = $state(params.get('venue') ?? '');
 	let startsAtISO = $state(''); // RFC3339 UTC, populated by DateTimePicker
 	let kind = $state<ShowKind>('seated');
 	let rows = $state(5);
 	let cols = $state(6);
 	let gaCapacity = $state(100);
-	let priceUAH = $state('250');
+	let priceUAH = $state(params.get('price') ?? '250');
+	let sessionGroup = $state(params.get('group') ?? '');
 
 	let submitting = $state(false);
 	let error = $state('');
@@ -37,7 +42,8 @@
 			cols: kind === 'seated' ? cols : 0,
 			price_kopecks: priceKopecks,
 			kind,
-			ga_capacity: kind === 'ga' ? gaCapacity : 0
+			ga_capacity: kind === 'ga' ? gaCapacity : 0,
+			session_group: sessionGroup.trim()
 		};
 
 		submitting = true;
@@ -183,6 +189,22 @@
 		/>
 		<p class="mt-1 text-xs text-neutral-500">
 			Однакова ціна для всіх місць; категорії з різною ціною — у редакторі залу (наступний PR).
+		</p>
+	</div>
+
+	<div>
+		<label for="grp" class="block text-sm text-neutral-400">Серія сесій (опційно)</label>
+		<input
+			id="grp"
+			type="text"
+			bind:value={sessionGroup}
+			maxlength="60"
+			placeholder="hamlet-2026"
+			class="mt-1 w-full rounded-md border border-neutral-800 bg-neutral-900 px-3 py-2 text-neutral-100 focus:border-neutral-600 focus:outline-none"
+		/>
+		<p class="mt-1 text-xs text-neutral-500">
+			Однакова мітка на двох або більше подіях → лендинг покаже один blok із вибором дати.
+			Залиш порожнім, якщо подія разова.
 		</p>
 	</div>
 

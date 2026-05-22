@@ -544,6 +544,28 @@
 					{/if}
 				</div>
 			{/if}
+			{#if show.siblings && show.siblings.length > 0}
+				<div class="mt-4 rounded-md border border-neutral-800 bg-neutral-900/50 p-3">
+					<div class="text-xs uppercase tracking-wider text-neutral-500">Інші дати цієї події</div>
+					<ul class="mt-2 flex flex-wrap gap-2">
+						{#each show.siblings as sib (sib.slug)}
+							<li>
+								<a
+									href="/event/{sib.slug}"
+									class="inline-flex items-center gap-2 rounded-md border border-neutral-700 bg-neutral-950 px-3 py-1.5 text-sm hover:bg-neutral-800"
+								>
+									<span>{startsAtText(sib.starts_at)}</span>
+									{#if sib.seats_free === 0}
+										<span class="rounded bg-neutral-800 px-1.5 text-xs text-neutral-500">зайнято</span>
+									{:else if sib.seats_free <= 5}
+										<span class="text-xs text-amber-400">{sib.seats_free} вільно</span>
+									{/if}
+								</a>
+							</li>
+						{/each}
+					</ul>
+				</div>
+			{/if}
 		</header>
 
 		{#if seatsRemaining === 0}

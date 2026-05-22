@@ -106,7 +106,16 @@
 								{/if}
 							</div>
 							<p class="mt-1 text-sm text-[var(--color-brand)]">
-								{formatDateTime(show.starts_at)}
+								{#if show.sessions && show.sessions.length > 1}
+									{show.sessions.length} {show.sessions.length === 1
+										? 'дата'
+										: show.sessions.length < 5
+											? 'дати'
+											: 'дат'}
+									· найближча {formatDateTime(show.starts_at)}
+								{:else}
+									{formatDateTime(show.starts_at)}
+								{/if}
 							</p>
 							{#if show.venue}
 								<p class="mt-1 text-sm text-neutral-400">📍 {show.venue}</p>

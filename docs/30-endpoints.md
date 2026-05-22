@@ -19,10 +19,12 @@
 ## Public (без авторизації)
 
 ### `GET /api/public/shows`
-Список не-archived подій. Відповідь: масив `{slug, title, venue, starts_at, description, poster_url, seats_free, seats_total, kind}`. `kind` — `"seated"` або `"ga"`; фронтенд лендингу читає його щоб підписати "місць" vs "квитків". Використовується лендінгом і Bot.Store.Shows.
+Список не-archived подій. Відповідь: масив `{slug, title, venue, starts_at, description, poster_url, seats_free, seats_total, kind, sessions?}`. `kind` — `"seated"` або `"ga"`. Якщо кілька подій мають однаковий `session_group`, вони колапсуються в один елемент із масивом `sessions: [{slug, starts_at, seats_free}]` і canonical-ом стає найближча. Використовується лендінгом і Bot.Store.Shows.
 
 ### `GET /api/public/shows/{slug}`
 Деталі однієї події з seat map. Відповідь: `{slug, title, venue, ..., kind, seats: [{id, row, col, x, y, label, category, price_kopecks, sellable, taken}], categories: [...]}`. `taken=true` = `held` або `sold`.
+
+Якщо подія належить до multi-session серії — додається `siblings: [{slug, starts_at, seats_free}]` зі списком ІНШИХ дат тієї ж серії.
 
 Для GA (kind="ga") `seats[]` повертається **порожнім** — концептуально місць немає, є лише пул. Замість того додаються:
 - `ga_capacity` — оригінальний розмір пулу

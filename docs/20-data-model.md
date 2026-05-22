@@ -43,6 +43,7 @@
 | archived_at | INTEGER | nullable; non-null = ховаємо з landing і бота |
 | kind | TEXT | `"seated"` (default) або `"ga"`. GA шоу = virtual-seat pool, без мапи залу |
 | ga_capacity | INTEGER | для GA — оригінальний розмір пулу (для display). Для seated — 0 |
+| session_group | TEXT | мітка для multi-session (та сама вистава на кілька дат). Порожньо = разова подія |
 
 ### seats
 | col | type | заміт |

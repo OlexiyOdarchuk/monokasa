@@ -110,6 +110,7 @@ export interface Show {
 	archived_at?: string | null;
 	kind: ShowKind;
 	ga_capacity: number;
+	session_group: string;
 	stats?: Stats | null;
 }
 
@@ -274,6 +275,7 @@ export interface CreateShowInput {
 	price_kopecks: number;
 	kind?: ShowKind;
 	ga_capacity?: number;
+	session_group?: string;
 }
 
 export interface UpdateShowInput {
@@ -282,9 +284,16 @@ export interface UpdateShowInput {
 	starts_at?: string;
 	description?: string;
 	poster_url?: string;
+	session_group?: string;
 }
 
 // ---- public-side (anonymous buyer) shapes ----
+
+export interface SessionLink {
+	slug: string;
+	starts_at: string;
+	seats_free: number;
+}
 
 export interface PublicShowSummary {
 	slug: string;
@@ -296,6 +305,9 @@ export interface PublicShowSummary {
 	seats_free: number;
 	seats_total: number;
 	kind: ShowKind;
+	// Present when this card stands in for a multi-session production.
+	// Empty/undefined for standalone shows. UI shows a date picker.
+	sessions?: SessionLink[];
 }
 
 
@@ -332,6 +344,9 @@ export interface PublicShow {
 	ga_capacity?: number;
 	ga_price_kopecks?: number;
 	ga_free?: number;
+	// Other shows in the same session_group (multi-session productions).
+	// Empty/undefined for standalone shows.
+	siblings?: SessionLink[];
 }
 
 export interface SeatCategory {

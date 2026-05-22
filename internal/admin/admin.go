@@ -163,9 +163,10 @@ type showResponse struct {
 	PosterURL   string     `json:"poster_url"`
 	CreatedAt   time.Time  `json:"created_at"`
 	ArchivedAt  *time.Time `json:"archived_at,omitempty"`
-	Kind        string     `json:"kind"`         // "seated" or "ga"
-	GACapacity  int        `json:"ga_capacity"`  // pool size for GA shows
-	Stats       *statsBody `json:"stats,omitempty"`
+	Kind         string     `json:"kind"`          // "seated" or "ga"
+	GACapacity   int        `json:"ga_capacity"`   // pool size for GA shows
+	SessionGroup string     `json:"session_group"` // empty = standalone
+	Stats        *statsBody `json:"stats,omitempty"`
 }
 
 type statsBody struct {
@@ -186,7 +187,8 @@ func toShowResponse(s store.Show, stats *statsBody) showResponse {
 		StartsAt: s.StartsAt, Description: s.Description, PosterURL: s.PosterURL,
 		CreatedAt: s.CreatedAt, ArchivedAt: s.ArchivedAt,
 		Kind: kind, GACapacity: s.GACapacity,
-		Stats: stats,
+		SessionGroup: s.SessionGroup,
+		Stats:        stats,
 	}
 }
 
@@ -214,6 +216,9 @@ type createShowRequest struct {
 	// GACapacity is used instead. Omitted/blank defaults to "seated".
 	Kind       string `json:"kind,omitempty"`
 	GACapacity int    `json:"ga_capacity,omitempty"`
+	// SessionGroup optional: tag two+ shows with the same label to
+	// present them as one production on multiple dates.
+	SessionGroup string `json:"session_group,omitempty"`
 }
 
 func (h *Handler) createShow(w http.ResponseWriter, r *http.Request) {
@@ -259,6 +264,7 @@ func (h *Handler) createShow(w http.ResponseWriter, r *http.Request) {
 	id, err := h.st.CreateShow(r.Context(), store.Show{
 		Title: req.Title, Venue: req.Venue, StartsAt: req.StartsAt,
 		Kind: kind, GACapacity: req.GACapacity,
+		SessionGroup: strings.TrimSpace(req.SessionGroup),
 	}, req.Rows, req.Cols, req.PriceKopecks)
 	if err != nil {
 		writeInternal(w, "create show", err)
@@ -309,11 +315,12 @@ func (h *Handler) getShow(w http.ResponseWriter, r *http.Request) {
 }
 
 type updateShowRequest struct {
-	Title       *string    `json:"title"`
-	Venue       *string    `json:"venue"`
-	StartsAt    *time.Time `json:"starts_at"`
-	Description *string    `json:"description"`
-	PosterURL   *string    `json:"poster_url"`
+	Title        *string    `json:"title"`
+	Venue        *string    `json:"venue"`
+	StartsAt     *time.Time `json:"starts_at"`
+	Description  *string    `json:"description"`
+	PosterURL    *string    `json:"poster_url"`
+	SessionGroup *string    `json:"session_group"`
 }
 
 func (h *Handler) updateShow(w http.ResponseWriter, r *http.Request) {
@@ -352,6 +359,9 @@ func (h *Handler) updateShow(w http.ResponseWriter, r *http.Request) {
 	if req.PosterURL != nil {
 		merged.PosterURL = *req.PosterURL
 	}
+	if req.SessionGroup != nil {
+		merged.SessionGroup = strings.TrimSpace(*req.SessionGroup)
+	}
 	if err := h.st.UpdateShow(r.Context(), merged); err != nil {
 		writeInternal(w, "update show", err)
 		return
@@ -373,6 +383,9 @@ func (h *Handler) updateShow(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.PosterURL != nil {
 		changed["poster_url"] = merged.PosterURL
+	}
+	if req.SessionGroup != nil {
+		changed["session_group"] = merged.SessionGroup
 	}
 	h.audit(r, "show.update", fmt.Sprintf("show:%d", id), changed)
 	writeJSON(w, http.StatusOK, toShowResponse(merged, nil))

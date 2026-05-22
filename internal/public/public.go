@@ -342,6 +342,18 @@ type publicShowSummary struct {
 	// Kind tells the lander whether this card links to a seat-map page
 	// or a quantity picker. "seated" or "ga".
 	Kind string `json:"kind"`
+	// Sessions is populated when this card stands in for multiple shows
+	// in the same session_group. Each entry is one performance the
+	// lander can deep-link to. Empty for standalone shows.
+	Sessions []sessionLink `json:"sessions,omitempty"`
+}
+
+// sessionLink is one date inside a multi-session series — what the
+// landing card uses for the date picker. Slug is the addressable show.
+type sessionLink struct {
+	Slug      string    `json:"slug"`
+	StartsAt  time.Time `json:"starts_at"`
+	SeatsFree int       `json:"seats_free"`
 }
 
 func (h *Handler) listShows(w http.ResponseWriter, r *http.Request) {
@@ -350,7 +362,12 @@ func (h *Handler) listShows(w http.ResponseWriter, r *http.Request) {
 		writeInternal(w, "list shows", err)
 		return
 	}
-	out := make([]publicShowSummary, 0, len(shows))
+	// First pass: build a summary row per active show, collecting stats.
+	type bucket struct {
+		summary publicShowSummary
+		group   string // session_group; empty = standalone
+	}
+	rows := make([]bucket, 0, len(shows))
 	for _, sh := range shows {
 		// Hide archived shows — admin controls visibility via the
 		// Archive button in the show editor. We intentionally do NOT
@@ -370,17 +387,60 @@ func (h *Handler) listShows(w http.ResponseWriter, r *http.Request) {
 		if kind == "" {
 			kind = "seated"
 		}
-		out = append(out, publicShowSummary{
-			Slug: sh.Slug, Title: sh.Title, Venue: sh.Venue,
-			StartsAt:    sh.StartsAt,
-			Description: sh.Description,
-			PosterURL:   sh.PosterURL,
-			SeatsFree:   st.Free,
-			SeatsTotal:  st.Total,
-			Kind:        kind,
+		rows = append(rows, bucket{
+			summary: publicShowSummary{
+				Slug: sh.Slug, Title: sh.Title, Venue: sh.Venue,
+				StartsAt:    sh.StartsAt,
+				Description: sh.Description,
+				PosterURL:   sh.PosterURL,
+				SeatsFree:   st.Free,
+				SeatsTotal:  st.Total,
+				Kind:        kind,
+			},
+			group: sh.SessionGroup,
 		})
 	}
-	// Sort by start, soonest first.
+	// Second pass: collapse rows with the same session_group into one
+	// card whose date picker (Sessions) lists every performance.
+	groupIndex := make(map[string]int, len(rows))
+	out := make([]publicShowSummary, 0, len(rows))
+	for _, b := range rows {
+		if b.group == "" {
+			out = append(out, b.summary)
+			continue
+		}
+		if idx, ok := groupIndex[b.group]; ok {
+			// Append session to existing card; sum free seats so the
+			// "seats_free" badge reflects the whole series.
+			out[idx].Sessions = append(out[idx].Sessions, sessionLink{
+				Slug: b.summary.Slug, StartsAt: b.summary.StartsAt, SeatsFree: b.summary.SeatsFree,
+			})
+			out[idx].SeatsFree += b.summary.SeatsFree
+			out[idx].SeatsTotal += b.summary.SeatsTotal
+			// Earliest date wins as the canonical "next show" for the card.
+			if b.summary.StartsAt.Before(out[idx].StartsAt) {
+				out[idx].StartsAt = b.summary.StartsAt
+				out[idx].Slug = b.summary.Slug
+			}
+			continue
+		}
+		card := b.summary
+		card.Sessions = []sessionLink{{
+			Slug: b.summary.Slug, StartsAt: b.summary.StartsAt, SeatsFree: b.summary.SeatsFree,
+		}}
+		groupIndex[b.group] = len(out)
+		out = append(out, card)
+	}
+	// Within each grouped card, sort sessions by date so the date picker
+	// renders chronologically regardless of insertion order.
+	for i := range out {
+		if len(out[i].Sessions) > 1 {
+			sort.Slice(out[i].Sessions, func(a, b int) bool {
+				return out[i].Sessions[a].StartsAt.Before(out[i].Sessions[b].StartsAt)
+			})
+		}
+	}
+	// Sort cards by start, soonest first.
 	sort.Slice(out, func(i, j int) bool { return out[i].StartsAt.Before(out[j].StartsAt) })
 	writeJSON(w, http.StatusOK, out)
 }
@@ -410,6 +470,10 @@ type publicShow struct {
 	// makes the quantity picker simpler and survives if Seats is omitted
 	// in future for bandwidth.
 	GAFree int `json:"ga_free,omitempty"`
+	// Siblings lists OTHER active shows in the same session_group, so
+	// the event page can render "Інші дати: …" links. Excludes the
+	// current show. Empty for standalone shows.
+	Siblings []sessionLink `json:"siblings,omitempty"`
 }
 
 type publicCategory struct {
@@ -510,6 +574,32 @@ func (h *Handler) getShow(w http.ResponseWriter, r *http.Request) {
 	}
 	if kind == "ga" {
 		out.GAFree = gaFree
+	}
+	// Multi-session: surface other dates of the same production so the
+	// event page can show "Інші дати". Excludes the current show; misses
+	// here don't break the page so we log and continue.
+	if show.SessionGroup != "" {
+		siblings, err := h.st.ListSessionsInGroup(r.Context(), show.SessionGroup)
+		if err != nil {
+			slog.Warn("list siblings failed", "showId", show.ID, "err", err)
+		} else {
+			for _, sib := range siblings {
+				if sib.ID == show.ID {
+					continue
+				}
+				// Free seat count per sibling. Skipping on error rather
+				// than aborting — buyer page still works without the
+				// availability badge on a sibling link.
+				st, err := h.st.Stats(r.Context(), sib.ID)
+				free := 0
+				if err == nil {
+					free = st.Free
+				}
+				out.Siblings = append(out.Siblings, sessionLink{
+					Slug: sib.Slug, StartsAt: sib.StartsAt, SeatsFree: free,
+				})
+			}
+		}
 	}
 	writeJSON(w, http.StatusOK, out)
 }

@@ -26,6 +26,11 @@ type Show struct {
 	// GACapacity is the original GA pool size at creation time. Used for
 	// display only; the live "free" count comes from seat statuses.
 	GACapacity int
+	// SessionGroup ties multiple show rows to the same production (a
+	// play running Fri/Sat/Sun). Empty = standalone. Shows in the same
+	// group collapse into one landing card; their event pages link
+	// between siblings under "Інші дати".
+	SessionGroup string
 }
 
 // IsGA returns true for general-admission shows (no seat map).
