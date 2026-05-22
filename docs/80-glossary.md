@@ -52,6 +52,30 @@ buyer_session cookie на 30 днів. Без пароля. Деталі →
 гостей не прийшов — повернули його порцію). Не звільняє місце;
 використовуй cancel для цього.
 
+**GA** — General Admission. `shows.kind='ga'` → нема мапи залу,
+тільки `ga_capacity` віртуальних seats у одному ряду. Buyer обирає
+quantity, server allocates з пулу. Деталі → [[70-decisions/ga-mode]].
+
+**Session group** — `shows.session_group` мітка для multi-session
+вистав (один Hamlet, кілька дат). Лендинг колапсує карточку.
+
+**Payment method** — `shows.payment_method` ∈ {`jar`, `acquiring`}.
+Per-show toggle для monobank Personal API (jar) vs Merchant API
+(invoice + fiscal receipt). Деталі → [[70-decisions/acquiring]].
+
+**Invoice** — monobank merchant invoice ID, зберігається в
+`orders.invoice_id` для acquiring-шоу. Webhook lookup за ним замість
+коду в коментарі.
+
+**Discount scope** — `'order'` (відняти від кошика) vs `'ticket'`
+(обмежити ціною одного дешевого квитка). Запобігає випадковому 100%
+зніманню всієї суми коли admin хотів дати один comp.
+
+**Waitlist** — `waiting_list` таблиця; buyer лишає email на sold-out
+події і отримує лист коли seat звільниться. Atomic
+`NextUnnotifiedWaitlist` → SMTP send → `MarkWaitlistNotified` (send-
+before-mark щоб SMTP fail не залишав «notified» без листа).
+
 ## Технічні
 
 **RequireAuth** — middleware у `internal/auth`. Перевіряє cookie-сесію.
@@ -84,6 +108,16 @@ Cascade на весь order (всі rows + order row).
 **Sweep** — періодичний background-таск:
 - `SweepExpiredHolds` — cancel-ить order'и з минулим `expires_at`
 - `SweepSessions` — видаляє минулі admin sessions
+
+**TG init data** — підписаний blob, що Telegram WebApp SDK кладе у
+`window.Telegram.WebApp.initData`. Server вериф'ить HMAC-SHA256 (key
+= `HMAC("WebAppData", botToken)`) і читає `user.id` для allow-list.
+Деталі → [[70-decisions/scanner-tg-webapp]].
+
+**Free order** — 0-kopeck order (наприклад 100% discount). monobank не
+випускає invoice на 0₴, тому `public.createOrder` синхронно викликає
+`pay.Processor.ConfirmFreeOrder` — confirm + render + deliver той самий
+шлях, тільки без webhook.
 
 **Reminder loop** — таск, що шле "сьогодні о 19:00" повідомлення за
 годину до старту події. Маркує `reminded_at` щоб не дублювати.

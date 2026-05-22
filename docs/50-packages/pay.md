@@ -66,14 +66,49 @@ pdf, _ := Renderer(show, it.Seat, name, qrs[it.ReservationID])
 Multi-seat web може заповнити per-ticket attendee; всі інші шляхи (bot,
 single-seat web) лишають порожнім → buyer name на PDF.
 
+## Acquiring (Merchant API)
+
+Альтернативний шлях для шоу з `payment_method='acquiring'`. Включається
+коли в `Processor` задано `AcquiringClient` (`acquiring.New(token)`) +
+`BaseURL`. Без них шоу падає назад на jar при `CreateOrder` (handler-side
+fallback у public layer).
+
+Методи:
+- `AcquiringEnabled()` — публічний probe для гілки в public handler
+- `CreateAcquiringInvoice(ctx, order, items, showTitle)` — викликається
+  одразу після `CreateOrderWithDiscount` для acquiring-шоу. Повертає
+  `(pageURL, invoiceID)`. `pageURL` стає `pay_url` для buyer'а; `invoiceID`
+  пишеться в `orders.invoice_id` для подальшого webhook lookup.
+- `HandleAcquiringWebhook(ctx, body, xSign)` — підпис верифікується
+  ECDSA-публічним ключем (lazy fetch через `Client.PubKey`, sync.Once
+  cache); ParseWebhook + status check; на `InvoiceSuccess` —
+  `FindOrderByInvoiceID` + `deliverConfirmedOrder` з audit action
+  `payment.acquiring`.
+
+Спільний код: jar webhook (`processTx`) і `HandleAcquiringWebhook`
+обидва закінчуються `deliverConfirmedOrder` — той самий confirm +
+ticket render + SSE broadcast + audit + delivery. Різниця тільки в
+audit action і details (`tx_id` vs `invoice_id`).
+
+Деталі архітектури → [[70-decisions/acquiring]].
+
+## ConfirmFreeOrder
+
+Окрема гілка для 0-kopeck ордерів (100% discount). monobank не випускає
+invoice на 0₴, тож і webhook ніколи не прийде. `public.createOrder`
+синхронно викликає `ConfirmFreeOrder(code)`, яка валідує `total == 0`,
+і виконує той самий `deliverConfirmedOrder` (audit action `payment.free`).
+Buyer одразу бачить «оплачено» без редиректу на банк.
+
 ## Файли
 
-- `pay.go` — Processor + processTx
+- `pay.go` — Processor + processTx + acquiring methods + deliverConfirmedOrder
 - `pay_test.go` — unit-тести з fake Store, Coder, Renderer, Notifier, Email
 
 ## Дотичне
 
-- [[40-flows/webhook]] — повний flow
+- [[40-flows/webhook]] — повний flow для jar
 - [[40-flows/reconcile]] — інший entry point до тієї ж логіки
+- [[70-decisions/acquiring]] — чому per-show toggle
 - [[50-packages/email]] — як шле батч-листа
 - [[50-packages/ticket]] — як рендериться PDF

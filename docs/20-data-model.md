@@ -25,7 +25,7 @@
         └──────────┘
 ```
 
-Окремо: `users` (адмін-логіни) + `sessions` (auth-токени) + `organizer` (single-row профіль для /about) + `discount_codes` (промокоди) + `waiting_list` (буфер email'ів для sold-out подій).
+Окремо: `users` (адмін-логіни) + `sessions` (auth-токени) + `organizer` (single-row профіль для /about) + `discount_codes` (промокоди) + `waiting_list` (буфер email'ів для sold-out подій) + `seat_categories` (pricing tiers).
 
 ## Кожна таблиця
 
@@ -42,8 +42,9 @@
 | created_at | INTEGER | |
 | archived_at | INTEGER | nullable; non-null = ховаємо з landing і бота |
 | kind | TEXT | `"seated"` (default) або `"ga"`. GA шоу = virtual-seat pool, без мапи залу |
-| ga_capacity | INTEGER | для GA — оригінальний розмір пулу (для display). Для seated — 0 |
+| ga_capacity | INTEGER | для GA — розмір пулу. Мутабельний через `PATCH /shows/{id}/ga-capacity` (grow → append seats, shrink → refuse якщо хвостові продані) |
 | session_group | TEXT | мітка для multi-session (та сама вистава на кілька дат). Порожньо = разова подія |
+| payment_method | TEXT | `"jar"` (default) → moonbank jar prefill URL; `"acquiring"` → реальний merchant invoice. Per-show toggle |
 
 ### seats
 | col | type | заміт |
@@ -64,9 +65,13 @@
 | id, code | INT, TEXT UNIQUE | code = 8-char base32 (a-z + 2-7) |
 | buyer_name, buyer_email | | |
 | tg_user_id, tg_chat_id | | 0 для web-only |
-| total_kopecks | | сума по всіх місцях |
+| total_kopecks | | post-discount сума до оплати |
+| discount_code | TEXT default '' | snapshot назви промокоду (зберігається після `DELETE FROM discount_codes`) |
+| discount_kopecks | INT default 0 | скільки відняли від суми місць |
+| invoice_id | TEXT default '' | monobank acquiring invoice id (тільки для `payment_method='acquiring'`); порожньо для jar-flow |
 | created_at, expires_at | | |
 | confirmed_at, cancelled_at, reminded_at | nullable | |
+| refunded_at | nullable | bookkeeping, не впливає на seat статус |
 
 ### reservations
 | col | type | заміт |
@@ -99,6 +104,38 @@
 - email (lowercase), MaxAge 30 днів
 - Окремо від `sessions` (admin) — щоб один браузер міг бути одночасно
   admin'ом і buyer'ом
+
+### seat_categories
+- pricing tier per show: `(show_id, name UNIQUE)` + `color`, `price_kopecks`, `sort_order`
+- `seats.category` (string) join'иться до `name`; upsert tier-у каскадно
+  оновлює `seats.price_kopecks` всіх місць з цією назвою
+
+### discount_codes
+- `code TEXT UNIQUE COLLATE NOCASE` (EARLY/early однакові)
+- `kind` ∈ {`percent`, `fixed`} + `value` (1..100 / kopecks)
+- `scope` ∈ {`order`, `ticket`} — `ticket` обмежує знижку ціною одного
+  (найдешевшого) квитка щоб «100% comp» не злив весь кошик
+- `max_uses` (0 = ∞), `used_count` атомарно інкрементиться у тій самій
+  tx що CreateOrder — два конкурентних buyer'и не можуть оба видоїти
+  ост анню знижку
+- `expires_at` (nullable), `active` toggle для emergency disable
+
+### waiting_list
+- `(show_id, email UNIQUE)` + `created_at` + `notified_at` nullable
+- email lower-cased на write
+- При signup'і re-subscribe скидає `notified_at=NULL`, тож той хто не
+  встиг забронити після першого notify може записатись знову
+- Email шлеться **після** успішного send (`NextUnnotifiedWaitlist` +
+  `MarkWaitlistNotified`), а не до — SMTP fail не залишає рядок
+  "notified" без листа
+
+### organizer
+- Single-row CHECK(id=1); name/bio/contact/socials для `/about`
+
+### audit_log
+- `actor_user_id` (0 для bot/web), `actor_email`, `action`, `target`,
+  `details JSON`, `created_at`. Index DESC by created_at для тіктокs
+  у `/admin/audit`
 
 ## Стани сутностей
 

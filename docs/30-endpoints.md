@@ -8,9 +8,10 @@
 | `/api/public/*` | будь-хто (web-buyer) | [[50-packages/public]] |
 | `/api/admin/*` | RequireAuth (cookie session) | [[50-packages/admin]] |
 | `/admin/*` | сторінки логіну | [[50-packages/auth]] |
-| `/scan*` | shared-token | [[50-packages/web]] |
+| `/scan*` | shared-token cookie АБО Telegram WebApp init data | [[50-packages/web]] |
 | `/posters/*` | будь-хто (read-only) | [[50-packages/posters]] |
-| `/webhook` | monobank Personal API | `cmd/app` |
+| `/webhook` | monobank Personal API (jar) | `cmd/app` |
+| `/webhook/acquiring` | monobank Merchant API (signed) | `cmd/app` + [[50-packages/pay]] |
 | `/health` | LB | `cmd/app` |
 | `/debug/vars` | expvar (Prometheus) | `internal/metrics` |
 | `/event/<slug>` | OG-wrap → embed SPA | `cmd/app` + [[50-packages/og]] |
@@ -119,12 +120,13 @@ based підхід раніше ламав cookie в деяких браузер
 | POST | `/api/admin/shows/{id}/categories` | upsert tier (creates or updates by name); cascade-syncs seat prices |
 | DELETE | `/api/admin/categories/{id}` | видалити tier (не торкає seats.category labels) |
 | GET | `/api/admin/shows/{id}/poster-qr.png` | PNG QR-код на /event/<slug> для друкованих афіш |
+| PATCH | `/api/admin/shows/{id}/ga-capacity` | `{ga_capacity}` — grow/shrink GA пул. Shrink → 409 `seats_booked` коли хвостові квитки вже продані |
 | GET | `/api/admin/organizer` | single-row профіль (name/bio/socials) |
 | PUT | `/api/admin/organizer` | overwrite профіль (всі поля опційні; bio ≤2000 chars) |
 | GET | `/api/admin/analytics?days=N` | агрегати: daily_sales[], total_*, конверсія, per_show[]; days∈[1,365] |
 | GET | `/api/admin/discounts` | список промокодів (newest first) |
-| POST | `/api/admin/discounts` | створити; `{code, kind:'percent'\|'fixed', value, max_uses, expires_at?, active}` |
-| PATCH | `/api/admin/discounts/{id}` | оновити kind/value/max_uses/expires_at/active (code immutable) |
+| POST | `/api/admin/discounts` | створити; `{code, kind:'percent'\|'fixed', value, scope:'order'\|'ticket', max_uses, expires_at?, active}` |
+| PATCH | `/api/admin/discounts/{id}` | оновити kind/value/scope/max_uses/expires_at/active (code immutable) |
 | DELETE | `/api/admin/discounts/{id}` | видалити (історичні orders зберігають назву) |
 
 ## Auth
@@ -139,12 +141,14 @@ based підхід раніше ламав cookie в деяких браузер
 
 | Метод | Шлях | Що робить |
 |---|---|---|
-| GET | `/scan` | HTML scanner UI (камера, jsQR) |
-| POST | `/scan/check` | перевірка QR payload, погашення; rate-limit per IP |
+| GET | `/scan` | HTML scanner UI (камера, jsQR). Password gate якщо `SCANNER_TOKEN` set |
+| GET | `/scan?tg=1` | Те саме, але одразу серветь сторінку без password gate — для Telegram WebApp кнопки бота. Auth все одно перевіряється на `/scan/check` |
+| POST | `/scan/check` | Перевірка QR payload + погашення; rate-limit per IP. Auth: cookie з SCANNER_TOKEN, `X-Scanner-Token` header, **або** `X-Telegram-Init-Data` (server verify через bot token + admin allow-list) |
 
 ## Webhook
 
-`POST /webhook` — monobank Personal API формат. Auth — за `x-effective-amount` + `x-sign` (заголовки моно). Деталі → [[40-flows/webhook]].
+- `POST /webhook` — monobank **Personal API** (jar transactions). Auth за `x-effective-amount` + `x-sign` (заголовки моно). Деталі → [[40-flows/webhook]].
+- `POST /webhook/acquiring` — monobank **Merchant API** (acquiring invoices). Auth за ECDSA `X-Sign` header проти merchant pubkey (`/api/merchant/pubkey`, lazy-cached). 404 коли `MONO_ACQUIRING_TOKEN` не set. Деталі → [[70-decisions/acquiring]].
 
 ## Health / metrics
 

@@ -55,11 +55,33 @@ func (s *Scanner) Register(mux *http.ServeMux)
 скани = `used`. Бан-логіка на IP — захист від брутфорсу через підбір
 QR.
 
+## Auth paths
+
+`Scanner.authOK` приймає 3 шляхи (any одного достатньо):
+
+1. **Cookie `monokasa_scan`** з shared `SCANNER_TOKEN` — set після успіху
+   на password form `GET /scan`. Persistent (configured TTL).
+2. **Header `X-Scanner-Token`** — те саме shared token, для CLI-fetch
+   або custom integrations. Constant-time compare.
+3. **Header `X-Telegram-Init-Data`** — підписаний blob з Telegram Mini
+   App. `VerifyTelegramInitData(initData, botToken)` відтворює HMAC-
+   SHA256 ланцюжок (`secret = HMAC("WebAppData", botToken)`,
+   `hash = HMAC(secret, sortedFields)`), читає `user.id`, перевіряє у
+   admin allow-list (`EnableTelegramWebApp(botToken, []adminTGID)`).
+
+Bot button у `/start` для `ADMIN_TG_ID` лінкує на `/scan?tg=1` як
+WebApp. `?tg=1` query вмикає shortcut serving scanner page без password
+gate; auth все одно перевіряється на `/scan/check`. Деталі →
+[[70-decisions/scanner-tg-webapp]].
+
 ## Файли
 
 - `scan.go` — Scanner, обидва handler'и
-- `scan.html` — embed HTML
+- `page.go` — embed HTML (підвантажує telegram-web-app.js)
+- `tgwebapp.go` — `VerifyTelegramInitData` + unit tests
+- `ratelimit.go` — Limiter, ClientIP, GC (експортовано для public/auth)
 - `scan_test.go` — flow happy/used/invalid + rate-limit
+- `tgwebapp_test.go` — signature ok/mismatch/missing-hash/missing-user
 
 ## Чому HTML, не SPA
 

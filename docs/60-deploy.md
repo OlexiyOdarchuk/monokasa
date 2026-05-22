@@ -115,6 +115,25 @@ curl -X POST https://api.monobank.ua/personal/webhook \
      -d '{"webHookUrl":"https://your.host/webhook"}'
 ```
 
+## Acquiring (опційно)
+
+Для шоу з `payment_method='acquiring'` — реальний merchant invoice
+замість jar prefill. Дві річі треба:
+
+1. **`MONO_ACQUIRING_TOKEN`** в env — окремий від `MONO_TOKEN`, видається
+   monobank business support (https://api.monobank.ua/docs/acquiring.html).
+2. **`BASE_URL`** — обов'язково https; інакше `redirectUrl` / `webHookUrl`
+   будуть невалідні і monobank відмовиться створювати invoice.
+
+Webhook реєструється на monobank-side не нашим запитом — banking
+sysadmin вписує `https://your.host/webhook/acquiring` у налаштуваннях
+мерчанта. Підпис верифіковано через `/api/merchant/pubkey` (lazy-fetch +
+in-memory cache; ротація ключа = restart процесу).
+
+Перемикати методи можна per-show через admin UI (`PATCH /api/admin/shows/{id}`
+з `payment_method`). Старі шоу залишаються на jar; нові можна одразу
+ставити на acquiring без міграції.
+
 ## Backup
 
 Один файл — `tix.db`:

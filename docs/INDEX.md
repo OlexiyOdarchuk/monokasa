@@ -54,6 +54,8 @@ README.md — для тих, хто хоче ЗАПУСТИТИ. Цей vault �
 - [[70-decisions/buyer-auth-magic-link]] — чому magic-link, не password
 - [[70-decisions/seat-categories]] — pricing tiers як окрема таблиця
 - [[70-decisions/ga-mode]] — GA (general admission) як virtual-seat pool
+- [[70-decisions/acquiring]] — monobank Merchant API як per-show toggle поруч з банкою
+- [[70-decisions/scanner-tg-webapp]] — scanner як TG WebApp для admin'ів
 
 ### 📖 Терміни
 - [[80-glossary]] — order, reservation, hold, jar, attendee, тощо
