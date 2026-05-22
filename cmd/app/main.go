@@ -703,6 +703,18 @@ func (b botStore) CancelReservation(ctx context.Context, code string, tgUserID i
 	return toBotReservation(r), toBotSeat(s), translateStoreErr(err)
 }
 
+func (b botStore) CancelHeldOrderByUser(ctx context.Context, orderCode string, tgUserID int64) ([]bot.Seat, error) {
+	seats, err := b.s.CancelHeldOrderByUser(ctx, orderCode, tgUserID)
+	if err != nil {
+		return nil, translateStoreErr(err)
+	}
+	out := make([]bot.Seat, len(seats))
+	for i, s := range seats {
+		out[i] = toBotSeat(s)
+	}
+	return out, nil
+}
+
 func (b botStore) LinkOrderToTGChat(ctx context.Context, code string, tgUserID, tgChatID int64) (bot.Order, []bot.OrderItem, error) {
 	o, items, err := b.s.LinkOrderToTGChat(ctx, code, tgUserID, tgChatID)
 	if err != nil {

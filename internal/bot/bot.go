@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -148,6 +149,10 @@ type Store interface {
 	// race; the entire order rolls back on failure.
 	CreateOrder(ctx context.Context, seats []Seat, tgUserID, tgChatID int64, buyerName, code string, hold time.Duration) (Order, []OrderItem, error)
 	CancelReservation(ctx context.Context, code string, tgUserID int64) (Reservation, Seat, error)
+	// CancelHeldOrderByUser cascade-cancels a HELD multi-seat order on
+	// behalf of its owner. Confirmed orders return ErrAlreadyPaid — bot
+	// buyers never get a self-refund path; admin handles those.
+	CancelHeldOrderByUser(ctx context.Context, orderCode string, tgUserID int64) ([]Seat, error)
 	MyReservations(ctx context.Context, tgUserID int64) ([]MyItem, error)
 	Stats(ctx context.Context, showID int64) (Stats, error)
 	// LinkOrderToTGChat attaches a Telegram chat to a web-buyer order
@@ -429,6 +434,8 @@ func (b *Bot) handleCallback(c tele.Context) error {
 		return b.callbackClear(c, cb)
 	case strings.HasPrefix(cb.Data, "\fcancel|"):
 		return b.callbackCancel(c, cb)
+	case strings.HasPrefix(cb.Data, "\fcanord|"):
+		return b.callbackCancelOrder(c, cb)
 	case strings.HasPrefix(cb.Data, "\fevents|"):
 		_ = c.Respond(&tele.CallbackResponse{})
 		return b.sendEventList(c, "📅 Афіша:")
@@ -1050,6 +1057,24 @@ func (b *Bot) linkReservation(c tele.Context, code string) error {
 
 // --- /my ---
 
+// orderCodeOf strips the ".N" multi-seat suffix from a reservation code,
+// returning the parent order code. Single-seat codes round-trip unchanged.
+func orderCodeOf(reservationCode string) string {
+	if i := strings.IndexByte(reservationCode, '.'); i > 0 {
+		return reservationCode[:i]
+	}
+	return reservationCode
+}
+
+// myGroup is a ready-to-render bucket of one order's reservations.
+type myGroup struct {
+	OrderCode string
+	Items     []MyItem // sorted by row/col for stable rendering
+	Confirmed bool     // any reservation confirmed → whole order is paid
+	Expired   bool     // none confirmed AND all expired
+	ExpiresAt time.Time
+}
+
 func (b *Bot) handleMy(c tele.Context) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -1063,21 +1088,146 @@ func (b *Bot) handleMy(c tele.Context) error {
 		return c.Send("У тебе ще немає бронювань. /events — афіша.")
 	}
 
-	var out strings.Builder
-	out.WriteString("Твої бронювання:\n\n")
+	// Group reservations by order code so multi-seat orders render as a
+	// single block with one cancel button rather than N rows.
+	byOrder := make(map[string]*myGroup)
 	for _, it := range items {
+		code := orderCodeOf(it.Reservation.Code)
+		g, ok := byOrder[code]
+		if !ok {
+			g = &myGroup{OrderCode: code, ExpiresAt: it.Reservation.ExpiresAt}
+			byOrder[code] = g
+		}
+		g.Items = append(g.Items, it)
+	}
+	now := time.Now()
+	for _, g := range byOrder {
+		anyConfirmed := false
+		anyLive := false
+		for _, it := range g.Items {
+			if it.Reservation.ConfirmedAt != nil {
+				anyConfirmed = true
+			}
+			if it.Reservation.ConfirmedAt == nil && it.Reservation.ExpiresAt.After(now) {
+				anyLive = true
+			}
+		}
+		g.Confirmed = anyConfirmed
+		g.Expired = !anyConfirmed && !anyLive
+	}
+	// Stable order: live (held) first, then confirmed, then expired.
+	// Within each bucket: by earliest expiry.
+	codes := make([]string, 0, len(byOrder))
+	for k := range byOrder {
+		codes = append(codes, k)
+	}
+	sort.SliceStable(codes, func(i, j int) bool {
+		a, b := byOrder[codes[i]], byOrder[codes[j]]
+		rank := func(g *myGroup) int {
+			switch {
+			case !g.Confirmed && !g.Expired:
+				return 0
+			case g.Confirmed:
+				return 1
+			default:
+				return 2
+			}
+		}
+		ra, rb := rank(a), rank(b)
+		if ra != rb {
+			return ra < rb
+		}
+		return a.ExpiresAt.Before(b.ExpiresAt)
+	})
+
+	// One message per order keeps the cancel button anchored to the right
+	// rows — Telegram inline keyboards live on a single message at a time.
+	intro := "Твої бронювання:"
+	if err := c.Send(intro); err != nil {
+		return err
+	}
+	for _, code := range codes {
+		g := byOrder[code]
+		var sb strings.Builder
+		for _, it := range g.Items {
+			fmt.Fprintf(&sb, "· ряд %d місце %d\n", it.Seat.Row, it.Seat.Col)
+		}
+		seatsBlock := sb.String()
+
 		switch {
-		case it.Reservation.ConfirmedAt != nil:
-			fmt.Fprintf(&out, "✅ Ряд %d місце %d — оплачено (%s)\n",
-				it.Seat.Row, it.Seat.Col, formatDateTime(*it.Reservation.ConfirmedAt))
-		case it.Reservation.ExpiresAt.After(time.Now()):
-			fmt.Fprintf(&out, "⏳ Ряд %d місце %d — чекає оплати до %s\n   код: `%s`\n",
-				it.Seat.Row, it.Seat.Col, formatClock(it.Reservation.ExpiresAt), it.Reservation.Code)
+		case g.Confirmed:
+			msg := fmt.Sprintf("✅ Оплачено · код `%s`\n%s",
+				escapeMarkdown(code), seatsBlock)
+			if err := c.Send(msg, tele.ModeMarkdown); err != nil {
+				return err
+			}
+		case g.Expired:
+			msg := fmt.Sprintf("✖ Протермінувалось · код `%s`\n%s",
+				escapeMarkdown(code), seatsBlock)
+			if err := c.Send(msg, tele.ModeMarkdown); err != nil {
+				return err
+			}
 		default:
-			fmt.Fprintf(&out, "✖ Ряд %d місце %d — бронь протермінувалась\n", it.Seat.Row, it.Seat.Col)
+			// Held. Single ✖ Скасувати button regardless of seat count —
+			// for multi-seat it cascades; for single-seat it's the same
+			// reservation code so callbackCancelOrder hits one row anyway.
+			msg := fmt.Sprintf("⏳ Чекає оплати до %s · код `%s`\n%s",
+				formatClock(g.ExpiresAt), escapeMarkdown(code), seatsBlock)
+			cancelLabel := "✖ Скасувати бронь"
+			if len(g.Items) > 1 {
+				cancelLabel = fmt.Sprintf("✖ Скасувати замовлення (%d місця)", len(g.Items))
+			}
+			markup := &tele.ReplyMarkup{
+				InlineKeyboard: [][]tele.InlineButton{
+					{{Unique: "canord", Text: cancelLabel, Data: code}},
+				},
+			}
+			if err := c.Send(msg, tele.ModeMarkdown, markup); err != nil {
+				return err
+			}
 		}
 	}
-	return c.Send(out.String(), tele.ModeMarkdown)
+	return nil
+}
+
+// callbackCancelOrder handles "✖ Скасувати …" from /my for held orders.
+// Cascades the whole order — multi-seat partial-cancel is forbidden mid-
+// payment because the buyer already locked the total in monobank.
+func (b *Bot) callbackCancelOrder(c tele.Context, cb *tele.Callback) error {
+	code := strings.TrimPrefix(cb.Data, "\fcanord|")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	freed, err := b.store.CancelHeldOrderByUser(ctx, code, cb.Sender.ID)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrCodeNotFound), errors.Is(err, ErrAlreadyClosed):
+			return c.Respond(&tele.CallbackResponse{Text: "Цю бронь вже закрито"})
+		case errors.Is(err, ErrAlreadyPaid):
+			return c.Respond(&tele.CallbackResponse{Text: "Вже оплачено — повернення тільки руками"})
+		case errors.Is(err, ErrNotYourBooking):
+			return c.Respond(&tele.CallbackResponse{Text: "Це не твоя бронь"})
+		default:
+			slog.Error("cancel order", "code", code, "err", err)
+			return c.Respond(&tele.CallbackResponse{Text: "Помилка"})
+		}
+	}
+	_ = c.Respond(&tele.CallbackResponse{Text: "Скасовано"})
+	// Broadcast every freed seat to live SSE subscribers so anyone
+	// staring at the seat map sees them turn green immediately.
+	for _, s := range freed {
+		b.hub.Publish(s.ShowID, realtime.Event{
+			Type: "seat_status", SeatID: s.ID, Status: realtime.SeatFree,
+		})
+	}
+	// Edit the original message: drop the keyboard, add a strikethrough-
+	// style confirmation. tele.EditReplyMarkup is the lightweight path.
+	_, _ = b.tb.Edit(cb.Message,
+		fmt.Sprintf("✖ Скасовано · код `%s`\n(%d %s повернулись у пул)",
+			escapeMarkdown(code), len(freed), seatWord(len(freed))),
+		tele.ModeMarkdown,
+		&tele.ReplyMarkup{InlineKeyboard: nil})
+	return nil
 }
 
 // --- /stats (admin) ---

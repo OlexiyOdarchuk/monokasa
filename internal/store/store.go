@@ -987,6 +987,81 @@ func (s *Store) FindReservationByCode(ctx context.Context, code string) (Reserva
 	return r, seat, nil
 }
 
+// CancelHeldOrderByUser cascade-cancels every reservation in a HELD
+// order on behalf of the Telegram user who created it. orderCode is
+// the parent order code ("abc12345" without ".N" suffix). Returns the
+// list of seats that were freed so the caller can fan out SSE events.
+//
+// Rules mirror the public flow: held orders cascade because the buyer
+// can't change the total mid-payment. Confirmed orders return
+// ErrAlreadyPaid — admin handles partial refunds, not the buyer.
+func (s *Store) CancelHeldOrderByUser(ctx context.Context, orderCode string, tgUserID int64) ([]Seat, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	var order Order
+	var createdAt, expiresAt int64
+	var confirmedAt, cancelledAt sql.NullInt64
+	err = tx.QueryRowContext(ctx, `
+		SELECT id, code, tg_user_id, created_at, expires_at, confirmed_at, cancelled_at
+		FROM orders WHERE code = ?`, orderCode).Scan(
+		&order.ID, &order.Code, &order.TGUserID,
+		&createdAt, &expiresAt, &confirmedAt, &cancelledAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrCodeNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if order.TGUserID != tgUserID {
+		return nil, ErrNotYourBooking
+	}
+	if confirmedAt.Valid {
+		return nil, ErrAlreadyPaid
+	}
+	if cancelledAt.Valid {
+		return nil, ErrAlreadyClosed
+	}
+
+	// Load the seats first so we can return them after the cascade
+	// update — needed for SSE broadcast in the bot caller.
+	rows, err := tx.QueryContext(ctx, `
+		SELECT `+seatCols+`
+		FROM seats
+		WHERE id IN (
+			SELECT seat_id FROM reservations
+			WHERE order_id = ? AND cancelled_at IS NULL
+		)`, order.ID)
+	if err != nil {
+		return nil, err
+	}
+	var freed []Seat
+	for rows.Next() {
+		var seat Seat
+		if err := scanSeat(rows, &seat); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		freed = append(freed, seat)
+	}
+	rows.Close()
+
+	now := time.Now().Unix()
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE reservations SET cancelled_at=? WHERE order_id=? AND cancelled_at IS NULL`,
+		now, order.ID); err != nil {
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE orders SET cancelled_at=? WHERE id=?`, now, order.ID); err != nil {
+		return nil, err
+	}
+	return freed, tx.Commit()
+}
+
 // CancelReservation soft-deletes a reservation if it belongs to the user
 // and is not yet confirmed.
 func (s *Store) CancelReservation(ctx context.Context, code string, tgUserID int64) (Reservation, Seat, error) {
