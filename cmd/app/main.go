@@ -103,7 +103,11 @@ func main() {
 		if err != nil {
 			return bot.Show{}, err
 		}
-		return bot.Show{ID: sh.ID, Title: sh.Title, Venue: sh.Venue, StartsAt: sh.StartsAt}, nil
+		return bot.Show{
+			ID: sh.ID, Title: sh.Title, Venue: sh.Venue, StartsAt: sh.StartsAt,
+			Description: sh.Description,
+			Kind:        sh.Kind, GACapacity: sh.GACapacity,
+		}, nil
 	}
 	payShowFn := func(ctx context.Context) (pay.Show, error) {
 		sh, err := st.ActiveShow(ctx)
@@ -674,6 +678,7 @@ func toBotShow(s store.Show) bot.Show {
 	return bot.Show{
 		ID: s.ID, Slug: s.Slug, Title: s.Title, Venue: s.Venue,
 		StartsAt: s.StartsAt, Description: s.Description,
+		Kind: s.Kind, GACapacity: s.GACapacity,
 	}
 }
 

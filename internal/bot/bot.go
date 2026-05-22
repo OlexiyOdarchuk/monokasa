@@ -44,7 +44,14 @@ type Show struct {
 	Venue       string
 	StartsAt    time.Time
 	Description string
+	// Kind is "seated" (default) or "ga". GA shows show a quantity
+	// picker instead of a seat grid — no concept of row/col.
+	Kind       string
+	GACapacity int
 }
+
+// IsGA returns true for general-admission shows.
+func (s Show) IsGA() bool { return s.Kind == "ga" }
 
 // Seat is the subset of seat info the bot needs (reservation cards,
 // reminders, ticket captions, and the inline-keyboard picker).
@@ -445,6 +452,10 @@ func (b *Bot) handleCallback(c tele.Context) error {
 		return b.callbackCancel(c, cb)
 	case strings.HasPrefix(cb.Data, "\fcanord|"):
 		return b.callbackCancelOrder(c, cb)
+	case strings.HasPrefix(cb.Data, "\fgaadd|"):
+		return b.callbackGAAdd(c, cb)
+	case strings.HasPrefix(cb.Data, "\fgasub|"):
+		return b.callbackGASub(c, cb)
 	case strings.HasPrefix(cb.Data, "\fevents|"):
 		_ = c.Respond(&tele.CallbackResponse{})
 		return b.sendEventList(c, "📅 Афіша:")
@@ -474,9 +485,15 @@ func (b *Bot) callbackShow(c tele.Context, cb *tele.Callback) error {
 	// Two ways to pick: inline keyboard (default, never leaves chat)
 	// and — if BASE_URL is set — WebApp button that opens the SVG map
 	// as a Mini App for users who prefer the visual experience.
+	// GA shows have no seat map, so the entry label is "кількість"
+	// instead of "обрати місце".
+	pickLabel := "📋 Обрати місце"
+	if sh.Kind == "ga" {
+		pickLabel = "🎤 Обрати кількість"
+	}
 	markup := &tele.ReplyMarkup{}
 	rows := [][]tele.InlineButton{
-		{{Unique: "pick", Text: "📋 Обрати місце", Data: sh.Slug}},
+		{{Unique: "pick", Text: pickLabel, Data: sh.Slug}},
 	}
 	// Telegram WebApp URLs MUST be https://. http://localhost is fine
 	// for dev with the SPA in a browser, but TG would reject the
@@ -547,8 +564,78 @@ func (b *Bot) callbackPick(c tele.Context, cb *tele.Callback) error {
 		Until:  time.Now().Add(pendingTTL),
 	})
 
+	// GA shows skip the seat grid entirely — there's nothing meaningful
+	// in row/col, just a pool. Show a -/+ quantity counter on top of
+	// the same pendingPick.Seats slice (each "tap +" adds one auto-
+	// allocated free seat to the basket).
+	if sh.IsGA() {
+		text, markup := renderGAPickBoard(sh, seats, status, nil)
+		return c.Send(text, markup)
+	}
+
 	text, markup := renderPickBoard(sh.Slug, seats, status, nil)
 	return c.Send(text, markup)
+}
+
+// renderGAPickBoard is the GA equivalent of renderPickBoard: shows the
+// current quantity in the basket and -/+1/+5 buttons. Reuses the same
+// pendingPick.Seats slice so the rest of the flow (Завершити, Очистити,
+// CreateOrder) stays unchanged.
+func renderGAPickBoard(sh Show, allSeats []Seat, status map[int64]SeatStatus, picked []pickedSeat) (string, *tele.ReplyMarkup) {
+	free := 0
+	for _, s := range allSeats {
+		if !s.Sellable {
+			continue
+		}
+		if status[s.ID] == SeatFree {
+			free++
+		}
+	}
+	gotten := len(picked)
+	free -= gotten // already-in-basket reservations are still "free in DB" but unavailable
+	if free < 0 {
+		free = 0
+	}
+
+	canAdd := func(n int) bool { return gotten+n <= maxPickSeats && n <= free }
+	addBtn := func(n int) tele.InlineButton {
+		label := "+" + strconv.Itoa(n)
+		if !canAdd(n) {
+			label = "·" + strconv.Itoa(n) + "·" // greyed-out hint
+		}
+		return tele.InlineButton{Unique: "gaadd", Text: label, Data: sh.Slug + ":" + strconv.Itoa(n)}
+	}
+
+	doneLabel := "✅ Завершити вибір"
+	if gotten > 0 {
+		doneLabel = fmt.Sprintf("✅ Завершити (%d · %s)", gotten, sumPrice(picked).String())
+	}
+
+	kb := [][]tele.InlineButton{
+		{addBtn(1), addBtn(2), addBtn(5)},
+	}
+	if gotten > 0 {
+		kb = append(kb, []tele.InlineButton{
+			{Unique: "gasub", Text: "−1", Data: sh.Slug},
+			{Unique: "clear", Text: "🧹 Очистити", Data: sh.Slug},
+		})
+	}
+	kb = append(kb, []tele.InlineButton{
+		{Unique: "done", Text: doneLabel, Data: sh.Slug},
+	})
+	kb = append(kb, []tele.InlineButton{
+		{Unique: "show", Text: "↩ Назад", Data: sh.Slug},
+	})
+
+	text := fmt.Sprintf(
+		"🎤 *%s*\n"+
+			"Загальний вхід — кількість, не місця.\n\n"+
+			"В кошику: *%d*\nВільно: *%d* з %d",
+		escapeMarkdown(sh.Title), gotten, free, sh.GACapacity)
+	if gotten > 0 {
+		text += fmt.Sprintf("\nСума: *%s*", sumPrice(picked).String())
+	}
+	return text, &tele.ReplyMarkup{InlineKeyboard: kb}
 }
 
 // maxPickSeats caps how many seats one chat user can stack in the
@@ -932,6 +1019,7 @@ func (b *Bot) loadPending(userID int64, sh Show) (pendingPick, bool) {
 // editPickBoard re-renders the picker keyboard in-place for the message
 // the callback fired from. Falls back to sending a fresh message if the
 // edit fails (e.g. message too old to edit per Telegram API limits).
+// Picks the GA or seated variant based on show.Kind.
 func (b *Bot) editPickBoard(c tele.Context, sh Show, picked []pickedSeat) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -945,13 +1033,113 @@ func (b *Bot) editPickBoard(c tele.Context, sh Show, picked []pickedSeat) error 
 		slog.Error("editPickBoard: seat statuses", "showId", sh.ID, "err", err)
 		return c.Send("Внутрішня помилка, спробуй ще раз пізніше.")
 	}
-	text, markup := renderPickBoard(sh.Slug, seats, status, picked)
-	if editErr := c.Edit(text, markup); editErr != nil {
+	var text string
+	var markup *tele.ReplyMarkup
+	if sh.IsGA() {
+		text, markup = renderGAPickBoard(sh, seats, status, picked)
+	} else {
+		text, markup = renderPickBoard(sh.Slug, seats, status, picked)
+	}
+	if editErr := c.Edit(text, markup, tele.ModeMarkdown); editErr != nil {
 		// Message too old / unchanged content — send a new one as
 		// fallback so the user always sees their updated basket.
-		return c.Send(text, markup)
+		return c.Send(text, markup, tele.ModeMarkdown)
 	}
 	return nil
+}
+
+// callbackGAAdd handles a tap on the +1/+2/+5 quantity buttons in the
+// GA picker. Auto-allocates the next N free seats from the pool and
+// adds them to the user's basket — buyer never sees seat numbers in
+// the bot UI, those are an implementation detail of the pool.
+func (b *Bot) callbackGAAdd(c tele.Context, cb *tele.Callback) error {
+	data := strings.TrimPrefix(cb.Data, "\fgaadd|")
+	slug, nStr, ok := strings.Cut(data, ":")
+	if !ok {
+		return c.Respond(&tele.CallbackResponse{Text: "bad add"})
+	}
+	n, err := strconv.Atoi(nStr)
+	if err != nil || n <= 0 {
+		return c.Respond(&tele.CallbackResponse{Text: "bad add"})
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	sh, err := b.store.FindShowBySlug(ctx, slug)
+	if err != nil {
+		return c.Respond(&tele.CallbackResponse{Text: "Подію не знайдено"})
+	}
+	pick, ok := b.loadPending(cb.Sender.ID, sh)
+	if !ok {
+		return c.Respond(&tele.CallbackResponse{Text: "Натисни 📋 ще раз"})
+	}
+	if len(pick.Seats)+n > maxPickSeats {
+		return c.Respond(&tele.CallbackResponse{
+			Text: fmt.Sprintf("Максимум %d за одну покупку", maxPickSeats),
+		})
+	}
+	// Walk the seat list and grab N free seats that aren't already in
+	// the basket. Status comes from the same per-call snapshot as the
+	// renderer so the UI stays consistent within one tap.
+	seats, err := b.store.Seats(ctx, sh.ID)
+	if err != nil {
+		return c.Respond(&tele.CallbackResponse{Text: "Помилка"})
+	}
+	status, err := b.store.SeatStatuses(ctx, sh.ID)
+	if err != nil {
+		return c.Respond(&tele.CallbackResponse{Text: "Помилка"})
+	}
+	inBasket := make(map[int64]struct{}, len(pick.Seats))
+	for _, p := range pick.Seats {
+		inBasket[p.SeatID] = struct{}{}
+	}
+	added := 0
+	for _, s := range seats {
+		if added >= n {
+			break
+		}
+		if !s.Sellable || status[s.ID] != SeatFree {
+			continue
+		}
+		if _, dup := inBasket[s.ID]; dup {
+			continue
+		}
+		pick.Seats = append(pick.Seats, pickedSeat{
+			SeatID: s.ID, Row: s.Row, Col: s.Col, Price: s.Price,
+		})
+		added++
+	}
+	if added == 0 {
+		return c.Respond(&tele.CallbackResponse{Text: "Вільних квитків немає"})
+	}
+	pick.Until = time.Now().Add(pendingTTL)
+	b.pending.Store(cb.Sender.ID, pick)
+	_ = c.Respond(&tele.CallbackResponse{})
+	return b.editPickBoard(c, sh, pick.Seats)
+}
+
+// callbackGASub drops the most recently-added GA ticket from the basket.
+// Simple last-in-first-out — buyer doesn't care which specific virtual
+// seat goes since the tickets are interchangeable.
+func (b *Bot) callbackGASub(c tele.Context, cb *tele.Callback) error {
+	slug := strings.TrimPrefix(cb.Data, "\fgasub|")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	sh, err := b.store.FindShowBySlug(ctx, slug)
+	if err != nil {
+		return c.Respond(&tele.CallbackResponse{Text: "Подію не знайдено"})
+	}
+	pick, ok := b.loadPending(cb.Sender.ID, sh)
+	if !ok {
+		return c.Respond(&tele.CallbackResponse{Text: "Натисни 📋 ще раз"})
+	}
+	if len(pick.Seats) == 0 {
+		return c.Respond(&tele.CallbackResponse{Text: "Кошик порожній"})
+	}
+	pick.Seats = pick.Seats[:len(pick.Seats)-1]
+	pick.Until = time.Now().Add(pendingTTL)
+	b.pending.Store(cb.Sender.ID, pick)
+	_ = c.Respond(&tele.CallbackResponse{})
+	return b.editPickBoard(c, sh, pick.Seats)
 }
 
 func indexOfPick(picks []pickedSeat, row, col int) int {
