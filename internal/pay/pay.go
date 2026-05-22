@@ -9,6 +9,7 @@ package pay
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -73,6 +74,11 @@ var (
 type Store interface {
 	FindOrderByCode(ctx context.Context, code string) (Order, []OrderItem, error)
 	ConfirmOrder(ctx context.Context, orderID int64, qrPayloads map[int64]string) error
+	// LogAudit appends one row to the audit_log table. Pay processor
+	// logs payment.confirm here so the journal shows monobank webhook
+	// activity alongside admin actions. Failures get swallowed at the
+	// call site — losing an audit row never blocks ticket delivery.
+	LogAudit(ctx context.Context, action, target, actorLabel, detailsJSON string) error
 }
 
 // Coder mints the signed QR payload embedded in each issued ticket.
@@ -197,6 +203,23 @@ func (p *Processor) processTx(ctx context.Context, t bank.Transaction) (bool, er
 		p.Hub.Publish(it.Seat.ShowID, realtime.Event{
 			Type: "seat_status", SeatID: it.Seat.ID, Status: realtime.SeatSold,
 		})
+	}
+
+	// Audit trail: one row per confirmed order. Buyer email goes in the
+	// actor slot so the journal shows "who paid". Details carry the
+	// monobank tx id and amount for quick reconciliation by hand.
+	auditDetails, _ := json.Marshal(map[string]any{
+		"code": order.Code, "seats": len(items),
+		"total_kopecks": order.TotalKopecks,
+		"paid_kopecks":  t.Amount.Minor,
+		"tx_id":         t.ID,
+	})
+	if err := p.Store.LogAudit(ctx, "payment.confirm",
+		fmt.Sprintf("order:%d", order.ID), order.BuyerEmail, string(auditDetails)); err != nil {
+		slog.Error("audit write failed", "code", order.Code, "err", err)
+	} else {
+		slog.Info("audit", "action", "payment.confirm",
+			"target", fmt.Sprintf("order:%d", order.ID), "actor", order.BuyerEmail)
 	}
 
 	// Render each PDF; if any render fails we still log_warn and

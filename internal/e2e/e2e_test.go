@@ -65,6 +65,12 @@ func (p payAdapter) ConfirmOrder(ctx context.Context, orderID int64, qrPayloads 
 	return err
 }
 
+func (p payAdapter) LogAudit(ctx context.Context, action, target, actorLabel, detailsJSON string) error {
+	return p.s.LogAudit(ctx, store.AuditEntry{
+		ActorEmail: actorLabel, Action: action, Target: target, Details: detailsJSON,
+	})
+}
+
 type webAdapter struct{ s *store.Store }
 
 func (w webAdapter) UseTicket(ctx context.Context, qrPayload string) (web.Ticket, error) {

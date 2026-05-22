@@ -728,6 +728,16 @@ func (b botStore) Stats(ctx context.Context, showID int64) (bot.Stats, error) {
 	}, err
 }
 
+func (b botStore) LogAudit(ctx context.Context, action, target, actorLabel, detailsJSON string) error {
+	return b.s.LogAudit(ctx, store.AuditEntry{
+		ActorUserID: 0,
+		ActorEmail:  actorLabel,
+		Action:      action,
+		Target:      target,
+		Details:     detailsJSON,
+	})
+}
+
 func translateStoreErr(err error) error {
 	switch err {
 	case nil:
@@ -817,6 +827,19 @@ func (p payStore) FindOrderByCode(ctx context.Context, code string) (pay.Order, 
 func (p payStore) ConfirmOrder(ctx context.Context, orderID int64, qrPayloads map[int64]string) error {
 	_, err := p.s.ConfirmOrder(ctx, orderID, qrPayloads)
 	return err
+}
+
+// LogAudit lets pay.Processor write to the same audit_log table the
+// admin/public flows use. ActorUserID stays 0 — payment.confirm is a
+// system event triggered by monobank webhook, not by an admin.
+func (p payStore) LogAudit(ctx context.Context, action, target, actorLabel, detailsJSON string) error {
+	return p.s.LogAudit(ctx, store.AuditEntry{
+		ActorUserID: 0,
+		ActorEmail:  actorLabel,
+		Action:      action,
+		Target:      target,
+		Details:     detailsJSON,
+	})
 }
 
 type payNotifier struct{ b *bot.Bot }

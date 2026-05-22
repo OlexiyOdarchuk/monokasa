@@ -16,6 +16,7 @@ package bot
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -154,6 +155,11 @@ type Store interface {
 	// Returns ErrCodeNotFound for unknown codes, ErrAlreadyClosed for
 	// cancelled orders.
 	LinkOrderToTGChat(ctx context.Context, code string, tgUserID, tgChatID int64) (Order, []OrderItem, error)
+	// LogAudit writes one row to the shared audit_log so journal entries
+	// from the bot (order.create from a Telegram buyer, reservation.cancel
+	// from the user-cancel button) sit alongside admin / web actions.
+	// Empty implementation is OK — caller swallows the error.
+	LogAudit(ctx context.Context, action, target, actorLabel, detailsJSON string) error
 }
 
 // ReconcileResult is the outcome of a /reconcile sweep.
@@ -809,6 +815,22 @@ func (b *Bot) handleText(c tele.Context) error {
 		b.hub.Publish(it.Seat.ShowID, realtime.Event{
 			Type: "seat_status", SeatID: it.Seat.ID, Status: realtime.SeatHeld,
 		})
+	}
+	// Audit: one row per bot-side order. Buyer label is the Telegram
+	// username when present, else falls back to the buyer name typed
+	// at the ForceReply prompt.
+	actor := name
+	if sender.Username != "" {
+		actor = "@" + sender.Username
+	}
+	auditDetails, _ := json.Marshal(map[string]any{
+		"code": order.Code, "seats": len(items),
+		"buyer_name": name, "tg_user_id": sender.ID,
+		"source": "bot",
+	})
+	if err := b.store.LogAudit(ctx, "order.create",
+		fmt.Sprintf("order:%d", order.ID), actor, string(auditDetails)); err != nil {
+		slog.Error("bot audit write failed", "code", order.Code, "err", err)
 	}
 
 	total := sumOrderPrice(items)

@@ -59,6 +59,33 @@ func NewHandler(c Config) *Handler {
 	}
 }
 
+// logAudit records a public-side action (buyer reserve / order create)
+// in the same audit_log table the admin uses. ActorUserID stays 0 to
+// mark this as not-an-admin; actorLabel carries whatever identifies the
+// caller (typically buyer email). Audit failures are slog.Error'd and
+// swallowed — losing one trail entry is less bad than failing the
+// user-facing purchase.
+func (h *Handler) logAudit(r *http.Request, action, target, actorLabel string, details map[string]any) {
+	var raw string
+	if len(details) > 0 {
+		if b, err := json.Marshal(details); err == nil {
+			raw = string(b)
+		}
+	}
+	if err := h.st.LogAudit(r.Context(), store.AuditEntry{
+		ActorUserID: 0,
+		ActorEmail:  actorLabel,
+		Action:      action,
+		Target:      target,
+		Details:     raw,
+	}); err != nil {
+		slog.Error("public audit write failed",
+			"action", action, "target", target, "err", err)
+		return
+	}
+	slog.Info("audit", "action", action, "target", target, "actor", actorLabel)
+}
+
 func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/public/shows", h.listShows)
 	mux.HandleFunc("GET /api/public/shows/{slug}", h.getShow)
@@ -429,6 +456,11 @@ func (h *Handler) createReservation(w http.ResponseWriter, r *http.Request) {
 	h.hub.Publish(show.ID, realtime.Event{
 		Type: "seat_status", SeatID: target.ID, Status: realtime.SeatHeld,
 	})
+	h.logAudit(r, "order.create", fmt.Sprintf("order:%d", order.ID), email, map[string]any{
+		"code": order.Code, "slug": show.Slug, "seats": 1,
+		"buyer_name": name, "total_kopecks": target.PriceKopecks,
+		"source": "web",
+	})
 	slog.Info("public reservation created",
 		"code", order.Code, "slug", show.Slug, "seatId", target.ID,
 		"buyer", name, "email", email)
@@ -615,6 +647,11 @@ func (h *Handler) createOrder(w http.ResponseWriter, r *http.Request) {
 	if h.botUsername != "" {
 		tgLink = fmt.Sprintf("https://t.me/%s?start=res_%s", h.botUsername, order.Code)
 	}
+	h.logAudit(r, "order.create", fmt.Sprintf("order:%d", order.ID), email, map[string]any{
+		"code": order.Code, "slug": show.Slug, "seats": len(targets),
+		"buyer_name": name, "total_kopecks": order.TotalKopecks,
+		"source": "web",
+	})
 	slog.Info("public order created",
 		"code", order.Code, "slug", show.Slug, "seats", len(targets),
 		"total", order.TotalKopecks, "buyer", name, "email", email)

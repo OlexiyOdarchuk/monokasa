@@ -38,8 +38,26 @@
 		'seat.add': 'додано місце',
 		'seat.remove': 'видалено місце',
 		'seat.batch_update': 'оновлено місця',
-		'reservation.cancel': 'скасовано бронь'
+		'reservation.cancel': 'скасовано бронь',
+		'order.create': 'бронювання',
+		'payment.confirm': 'оплата'
 	};
+
+	// Tint each action so admin/buyer/system entries are easy to skim.
+	function actionTint(a: string): string {
+		if (a === 'payment.confirm') return 'text-emerald-300';
+		if (a === 'order.create') return 'text-amber-300';
+		if (a === 'reservation.cancel') return 'text-red-300';
+		return 'text-neutral-200';
+	}
+
+	// Actor label varies by source: admin email, buyer email, @tg-username,
+	// or empty (for system events with no natural identity).
+	function actorLabel(e: AuditEntry): string {
+		if (e.actor_user_id > 0) return e.actor_email; // admin
+		if (e.actor_email) return e.actor_email; // buyer / bot
+		return 'система';
+	}
 
 	// Format the details JSON compactly — single-line key=value pairs.
 	function formatDetails(d: unknown): string {
@@ -62,10 +80,10 @@
 	<a href="/admin" class="text-sm text-neutral-400 hover:text-neutral-200">← До подій</a>
 </div>
 
-<h1 class="mt-2 text-2xl font-semibold tracking-tight">Журнал дій адмінів</h1>
+<h1 class="mt-2 text-2xl font-semibold tracking-tight">Журнал</h1>
 <p class="mt-1 text-sm text-neutral-400">
-	Останні дії по подіях, місцях і бронюваннях. Корисно, коли треба
-	відновити "хто і коли".
+	Усе що відбувається: бронювання, оплати, скасування, edits від адмінів.
+	Зелене — оплата, жовте — нова бронь, червоне — скасування.
 </p>
 
 {#if error}
@@ -96,8 +114,8 @@
 						<td class="px-3 py-2 text-xs text-neutral-500 whitespace-nowrap">
 							{formatDateTime(e.created_at)}
 						</td>
-						<td class="px-3 py-2 text-neutral-300">{e.actor_email}</td>
-						<td class="px-3 py-2">{actionLabels[e.action] ?? e.action}</td>
+						<td class="px-3 py-2 text-neutral-300">{actorLabel(e)}</td>
+						<td class="px-3 py-2 {actionTint(e.action)}">{actionLabels[e.action] ?? e.action}</td>
 						<td class="px-3 py-2 font-mono text-xs text-neutral-400">{e.target}</td>
 						<td class="px-3 py-2 text-xs text-neutral-500">
 							{formatDetails(e.details)}

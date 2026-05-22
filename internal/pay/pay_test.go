@@ -87,6 +87,12 @@ func (f *fakeStore) ConfirmOrder(_ context.Context, orderID int64, qrPayloads ma
 	return nil
 }
 
+func (f *fakeStore) LogAudit(_ context.Context, action, target, actorLabel, detailsJSON string) error {
+	// Stub: tests don't inspect audit calls, just satisfy the interface
+	// so pay.Processor can write its payment.confirm entries.
+	return nil
+}
+
 type fakeCoder struct{}
 
 func (fakeCoder) QRPayload(reservationID, seatID int64) string {
