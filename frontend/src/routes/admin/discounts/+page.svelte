@@ -9,6 +9,7 @@
 	let newCode = $state('');
 	let newKind = $state<'percent' | 'fixed'>('percent');
 	let newValue = $state(10);
+	let newScope = $state<'order' | 'ticket'>('order');
 	let newMaxUses = $state(0);
 	let newExpires = $state(''); // YYYY-MM-DD or empty
 	let creating = $state(false);
@@ -45,6 +46,7 @@
 				code: newCode.trim().toUpperCase(),
 				kind: newKind,
 				value,
+				scope: newScope,
 				max_uses: newMaxUses,
 				expires_at: expiresAt,
 				active: true
@@ -69,6 +71,7 @@
 				code: c.code,
 				kind: c.kind,
 				value: c.value,
+				scope: c.scope,
 				max_uses: c.max_uses,
 				expires_at: c.expires_at ?? null,
 				active: !c.active
@@ -90,8 +93,8 @@
 	}
 
 	function formatValue(c: DiscountCode): string {
-		if (c.kind === 'percent') return `−${c.value}%`;
-		return `−${(c.value / 100).toLocaleString('uk-UA')} ₴`;
+		const base = c.kind === 'percent' ? `−${c.value}%` : `−${(c.value / 100).toLocaleString('uk-UA')} ₴`;
+		return c.scope === 'ticket' ? `${base} / квиток` : base;
 	}
 
 	function formatExpires(iso?: string | null): string {
@@ -113,7 +116,7 @@
 </p>
 
 <!-- Create form -->
-<form onsubmit={create} class="mt-6 grid grid-cols-1 gap-3 rounded-lg border border-neutral-800 bg-neutral-900 p-4 sm:grid-cols-[1fr_auto_auto_auto_auto_auto]">
+<form onsubmit={create} class="mt-6 grid grid-cols-1 gap-3 rounded-lg border border-neutral-800 bg-neutral-900 p-4 sm:grid-cols-[1fr_auto_auto_auto_auto_auto_auto]">
 	<div>
 		<label for="dcode" class="block text-xs text-neutral-400">Код</label>
 		<input
@@ -152,6 +155,20 @@
 			required
 			class="mt-1 w-24 rounded-md border border-neutral-800 bg-neutral-950 px-2 py-1.5 text-right text-sm"
 		/>
+	</div>
+	<div>
+		<label for="dscope" class="block text-xs text-neutral-400">На що</label>
+		<select
+			id="dscope"
+			bind:value={newScope}
+			title={newScope === 'order'
+				? 'Знижка застосовується до суми всього замовлення'
+				: 'Знижка обмежена ціною одного квитка — для одиничних компів'}
+			class="mt-1 rounded-md border border-neutral-800 bg-neutral-950 px-2 py-1.5 text-sm"
+		>
+			<option value="order">кошик</option>
+			<option value="ticket">квиток</option>
+		</select>
 	</div>
 	<div>
 		<label for="dmax" class="block text-xs text-neutral-400">Макс. використань</label>
@@ -204,6 +221,7 @@
 				<tr>
 					<th class="px-4 py-2 text-left">Код</th>
 					<th class="px-4 py-2 text-right">Знижка</th>
+					<th class="px-4 py-2 text-center">На що</th>
 					<th class="px-4 py-2 text-right">Використано</th>
 					<th class="px-4 py-2 text-right">Діє до</th>
 					<th class="px-4 py-2 text-center">Активний</th>
@@ -216,6 +234,9 @@
 						<td class="px-4 py-2 font-mono font-medium">{c.code}</td>
 						<td class="px-4 py-2 text-right font-semibold tabular-nums text-emerald-400">
 							{formatValue(c)}
+						</td>
+						<td class="px-4 py-2 text-center text-xs text-neutral-400">
+							{c.scope === 'ticket' ? 'квиток' : 'кошик'}
 						</td>
 						<td class="px-4 py-2 text-right tabular-nums">
 							{c.used_count}{c.max_uses > 0 ? ` / ${c.max_uses}` : ''}

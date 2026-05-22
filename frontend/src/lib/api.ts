@@ -189,11 +189,15 @@ export interface BuyerTicket {
 	items: BuyerTicketItem[];
 }
 
+export type DiscountKind = 'percent' | 'fixed';
+export type DiscountScope = 'order' | 'ticket';
+
 export interface DiscountCode {
 	id: number;
 	code: string;
-	kind: 'percent' | 'fixed';
+	kind: DiscountKind;
 	value: number; // percent 1..100, OR kopecks for fixed
+	scope: DiscountScope;
 	max_uses: number; // 0 = unlimited
 	used_count: number;
 	expires_at?: string | null;
@@ -203,8 +207,9 @@ export interface DiscountCode {
 
 export interface DiscountInput {
 	code: string;
-	kind: 'percent' | 'fixed';
+	kind: DiscountKind;
 	value: number;
+	scope: DiscountScope;
 	max_uses: number;
 	expires_at?: string | null;
 	active: boolean;

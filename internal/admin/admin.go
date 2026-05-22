@@ -1029,8 +1029,9 @@ func (h *Handler) analytics(w http.ResponseWriter, r *http.Request) {
 type discountResponse struct {
 	ID         int64      `json:"id"`
 	Code       string     `json:"code"`
-	Kind       string     `json:"kind"` // "percent" or "fixed"
+	Kind       string     `json:"kind"`  // "percent" or "fixed"
 	Value      int64      `json:"value"`
+	Scope      string     `json:"scope"` // "order" or "ticket"
 	MaxUses    int        `json:"max_uses"`
 	UsedCount  int        `json:"used_count"`
 	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
@@ -1039,8 +1040,12 @@ type discountResponse struct {
 }
 
 func toDiscountResponse(d store.DiscountCode) discountResponse {
+	scope := d.Scope
+	if scope == "" {
+		scope = "order"
+	}
 	return discountResponse{
-		ID: d.ID, Code: d.Code, Kind: d.Kind, Value: d.Value,
+		ID: d.ID, Code: d.Code, Kind: d.Kind, Value: d.Value, Scope: scope,
 		MaxUses: d.MaxUses, UsedCount: d.UsedCount, ExpiresAt: d.ExpiresAt,
 		Active: d.Active, CreatedAt: d.CreatedAt,
 	}
@@ -1063,6 +1068,7 @@ type discountInput struct {
 	Code      string     `json:"code"`
 	Kind      string     `json:"kind"`
 	Value     int64      `json:"value"`
+	Scope     string     `json:"scope"`
 	MaxUses   int        `json:"max_uses"`
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 	Active    bool       `json:"active"`
@@ -1078,12 +1084,12 @@ func (h *Handler) createDiscount(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_input", "code required")
 		return
 	}
-	if err := validateDiscount(req.Kind, req.Value); err != nil {
+	if err := validateDiscount(req.Kind, req.Value, req.Scope); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_input", err.Error())
 		return
 	}
 	saved, err := h.st.CreateDiscountCode(r.Context(), store.DiscountCode{
-		Code: code, Kind: req.Kind, Value: req.Value,
+		Code: code, Kind: req.Kind, Value: req.Value, Scope: req.Scope,
 		MaxUses: req.MaxUses, ExpiresAt: req.ExpiresAt, Active: req.Active,
 	})
 	if err != nil {
@@ -1110,12 +1116,12 @@ func (h *Handler) updateDiscount(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if err := validateDiscount(req.Kind, req.Value); err != nil {
+	if err := validateDiscount(req.Kind, req.Value, req.Scope); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_input", err.Error())
 		return
 	}
 	if err := h.st.UpdateDiscountCode(r.Context(), store.DiscountCode{
-		ID: id, Kind: req.Kind, Value: req.Value,
+		ID: id, Kind: req.Kind, Value: req.Value, Scope: req.Scope,
 		MaxUses: req.MaxUses, ExpiresAt: req.ExpiresAt, Active: req.Active,
 	}); err != nil {
 		writeInternal(w, "update discount", err)
@@ -1140,7 +1146,7 @@ func (h *Handler) deleteDiscount(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func validateDiscount(kind string, value int64) error {
+func validateDiscount(kind string, value int64, scope string) error {
 	switch kind {
 	case "percent":
 		if value < 1 || value > 100 {
@@ -1152,6 +1158,12 @@ func validateDiscount(kind string, value int64) error {
 		}
 	default:
 		return errors.New("kind must be 'percent' or 'fixed'")
+	}
+	switch scope {
+	case "", "order", "ticket":
+		// "" maps to "order" at the store layer
+	default:
+		return errors.New("scope must be 'order' or 'ticket'")
 	}
 	return nil
 }

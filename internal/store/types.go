@@ -244,6 +244,10 @@ type DiscountCode struct {
 	Code       string
 	Kind       string // "percent" or "fixed"
 	Value      int64  // percent points 1..100, OR kopecks
+	// Scope is "order" (default — discount applies to cart total) or
+	// "ticket" (discount caps at one seat's price, so a 100% comp code
+	// can't accidentally give the whole cart away).
+	Scope      string
 	MaxUses    int
 	UsedCount  int
 	ExpiresAt  *time.Time

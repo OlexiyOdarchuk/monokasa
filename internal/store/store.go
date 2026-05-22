@@ -284,6 +284,12 @@ var migrations = []string{
 	// show, behaves exactly as before.
 	`ALTER TABLE shows ADD COLUMN session_group TEXT NOT NULL DEFAULT ''`,
 	`CREATE INDEX IF NOT EXISTS idx_shows_session_group ON shows(session_group) WHERE session_group != ''`,
+	// Discount scope: 'order' = applies to the whole cart (existing
+	// behaviour, kept as default for back-compat); 'ticket' = applies
+	// to ONE ticket only, so a "100% comp" code can't accidentally
+	// give away a 5-seat order. For percent codes scope=ticket means
+	// cheapest_seat * percent/100; for fixed it's min(value, cheapest).
+	`ALTER TABLE discount_codes ADD COLUMN scope TEXT NOT NULL DEFAULT 'order'`,
 }
 
 // Errors.
@@ -1523,14 +1529,15 @@ func (s *Store) CreateOrderWithDiscount(
 			canonicalCode      string
 			kind               string
 			value              int64
+			scope              string
 			maxUses, usedCount int
 			expiresAt          sql.NullInt64
 			activeInt          int
 		)
 		err := tx.QueryRowContext(ctx, `
-			SELECT id, code, kind, value, max_uses, used_count, expires_at, active
+			SELECT id, code, kind, value, scope, max_uses, used_count, expires_at, active
 			FROM discount_codes WHERE code = ? COLLATE NOCASE`,
-			discountCode).Scan(&discountID, &canonicalCode, &kind, &value,
+			discountCode).Scan(&discountID, &canonicalCode, &kind, &value, &scope,
 			&maxUses, &usedCount, &expiresAt, &activeInt)
 		if errors.Is(err, sql.ErrNoRows) {
 			return Order{}, nil, ErrDiscountNotFound
@@ -1547,11 +1554,35 @@ func (s *Store) CreateOrderWithDiscount(
 		if maxUses > 0 && usedCount >= maxUses {
 			return Order{}, nil, ErrDiscountUsedUp
 		}
+		if scope == "" {
+			scope = "order"
+		}
+		// scope=ticket caps the discount at one seat's price so a
+		// 100% comp code on a 5-seat cart doesn't accidentally give
+		// the whole order away. The "one seat" we use is the cheapest
+		// in the cart — fair to the organizer (buyer can't game by
+		// putting a VIP and a balcony together to discount the VIP).
+		var oneTicketPrice int64
+		if scope == "ticket" {
+			oneTicketPrice = seats[0].PriceKopecks
+			for _, s := range seats[1:] {
+				if s.PriceKopecks < oneTicketPrice {
+					oneTicketPrice = s.PriceKopecks
+				}
+			}
+		}
 		switch kind {
 		case "percent":
-			discountKopecks = total * value / 100
+			if scope == "ticket" {
+				discountKopecks = oneTicketPrice * value / 100
+			} else {
+				discountKopecks = total * value / 100
+			}
 		case "fixed":
 			discountKopecks = value
+			if scope == "ticket" && discountKopecks > oneTicketPrice {
+				discountKopecks = oneTicketPrice
+			}
 		default:
 			return Order{}, nil, fmt.Errorf("unknown discount kind %q", kind)
 		}
@@ -2537,15 +2568,18 @@ func isUniqueErr(err error) bool {
 
 // --- discount codes ---
 
-const discountCols = `id, code, kind, value, max_uses, used_count, expires_at, active, created_at`
+const discountCols = `id, code, kind, value, scope, max_uses, used_count, expires_at, active, created_at`
 
 func scanDiscount(row interface{ Scan(...any) error }, d *DiscountCode) error {
 	var expiresAt sql.NullInt64
 	var createdAt int64
 	var activeInt int
-	if err := row.Scan(&d.ID, &d.Code, &d.Kind, &d.Value, &d.MaxUses,
+	if err := row.Scan(&d.ID, &d.Code, &d.Kind, &d.Value, &d.Scope, &d.MaxUses,
 		&d.UsedCount, &expiresAt, &activeInt, &createdAt); err != nil {
 		return err
+	}
+	if d.Scope == "" {
+		d.Scope = "order"
 	}
 	d.Active = activeInt != 0
 	d.CreatedAt = time.Unix(createdAt, 0)
@@ -2585,10 +2619,14 @@ func (s *Store) CreateDiscountCode(ctx context.Context, d DiscountCode) (Discoun
 	if d.ExpiresAt != nil {
 		expiresAt = d.ExpiresAt.Unix()
 	}
+	scope := d.Scope
+	if scope == "" {
+		scope = "order"
+	}
 	res, err := s.db.ExecContext(ctx, `
-		INSERT INTO discount_codes (code, kind, value, max_uses, expires_at, active, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		d.Code, d.Kind, d.Value, d.MaxUses, expiresAt, boolToInt(d.Active), now)
+		INSERT INTO discount_codes (code, kind, value, scope, max_uses, expires_at, active, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		d.Code, d.Kind, d.Value, scope, d.MaxUses, expiresAt, boolToInt(d.Active), now)
 	if err != nil {
 		if isUniqueErr(err) {
 			return DiscountCode{}, fmt.Errorf("discount code %q already exists", d.Code)
@@ -2609,11 +2647,15 @@ func (s *Store) UpdateDiscountCode(ctx context.Context, d DiscountCode) error {
 	if d.ExpiresAt != nil {
 		expiresAt = d.ExpiresAt.Unix()
 	}
+	scope := d.Scope
+	if scope == "" {
+		scope = "order"
+	}
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE discount_codes
-		SET kind=?, value=?, max_uses=?, expires_at=?, active=?
+		SET kind=?, value=?, scope=?, max_uses=?, expires_at=?, active=?
 		WHERE id=?`,
-		d.Kind, d.Value, d.MaxUses, expiresAt, boolToInt(d.Active), d.ID)
+		d.Kind, d.Value, scope, d.MaxUses, expiresAt, boolToInt(d.Active), d.ID)
 	return err
 }
 
