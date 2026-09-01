@@ -14,10 +14,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/OlexiyOdarchuk/go-monobank-sdk/bank"
-	"github.com/OlexiyOdarchuk/go-monobank-sdk/currency"
-	"github.com/OlexiyOdarchuk/go-monobank-sdk/money"
-	"github.com/OlexiyOdarchuk/go-monobank-sdk/webhook"
+	"github.com/OlexiyOdarchuk/go-monobank-sdk/v2/bank"
+	"github.com/OlexiyOdarchuk/go-monobank-sdk/v2/currency"
+	"github.com/OlexiyOdarchuk/go-monobank-sdk/v2/money"
+	"github.com/OlexiyOdarchuk/go-monobank-sdk/v2/webhook"
 
 	"github.com/OlexiyOdarchuk/monokasa/internal/pay"
 	"github.com/OlexiyOdarchuk/monokasa/internal/store"

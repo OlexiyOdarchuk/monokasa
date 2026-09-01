@@ -19,14 +19,14 @@ import (
 
 	"github.com/joho/godotenv"
 
-	monobank "github.com/OlexiyOdarchuk/go-monobank-sdk"
-	"github.com/OlexiyOdarchuk/go-monobank-sdk/acquiring"
-	"github.com/OlexiyOdarchuk/go-monobank-sdk/bank"
-	"github.com/OlexiyOdarchuk/go-monobank-sdk/currency"
-	"github.com/OlexiyOdarchuk/go-monobank-sdk/jar"
-	"github.com/OlexiyOdarchuk/go-monobank-sdk/money"
-	"github.com/OlexiyOdarchuk/go-monobank-sdk/personal"
-	"github.com/OlexiyOdarchuk/go-monobank-sdk/webhook"
+	monobank "github.com/OlexiyOdarchuk/go-monobank-sdk/v2"
+	"github.com/OlexiyOdarchuk/go-monobank-sdk/v2/acquiring"
+	"github.com/OlexiyOdarchuk/go-monobank-sdk/v2/bank"
+	"github.com/OlexiyOdarchuk/go-monobank-sdk/v2/currency"
+	"github.com/OlexiyOdarchuk/go-monobank-sdk/v2/jar"
+	"github.com/OlexiyOdarchuk/go-monobank-sdk/v2/money"
+	"github.com/OlexiyOdarchuk/go-monobank-sdk/v2/personal"
+	"github.com/OlexiyOdarchuk/go-monobank-sdk/v2/webhook"
 
 	"github.com/OlexiyOdarchuk/monokasa/internal/admin"
 	"github.com/OlexiyOdarchuk/monokasa/internal/auth"

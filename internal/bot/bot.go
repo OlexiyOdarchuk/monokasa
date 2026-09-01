@@ -28,7 +28,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/OlexiyOdarchuk/go-monobank-sdk/money"
+	"github.com/OlexiyOdarchuk/go-monobank-sdk/v2/money"
 	tele "gopkg.in/telebot.v3"
 
 	"github.com/OlexiyOdarchuk/monokasa/internal/realtime"

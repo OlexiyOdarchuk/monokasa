@@ -20,11 +20,11 @@ import (
 	"crypto/ecdsa"
 	"sync"
 
-	"github.com/OlexiyOdarchuk/go-monobank-sdk/acquiring"
-	"github.com/OlexiyOdarchuk/go-monobank-sdk/bank"
-	"github.com/OlexiyOdarchuk/go-monobank-sdk/currency"
-	"github.com/OlexiyOdarchuk/go-monobank-sdk/money"
-	"github.com/OlexiyOdarchuk/go-monobank-sdk/webhook"
+	"github.com/OlexiyOdarchuk/go-monobank-sdk/v2/acquiring"
+	"github.com/OlexiyOdarchuk/go-monobank-sdk/v2/bank"
+	"github.com/OlexiyOdarchuk/go-monobank-sdk/v2/currency"
+	"github.com/OlexiyOdarchuk/go-monobank-sdk/v2/money"
+	"github.com/OlexiyOdarchuk/go-monobank-sdk/v2/webhook"
 
 	"github.com/OlexiyOdarchuk/monokasa/internal/metrics"
 	"github.com/OlexiyOdarchuk/monokasa/internal/realtime"

@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/OlexiyOdarchuk/go-monobank-sdk/currency"
-	"github.com/OlexiyOdarchuk/go-monobank-sdk/money"
+	"github.com/OlexiyOdarchuk/go-monobank-sdk/v2/currency"
+	"github.com/OlexiyOdarchuk/go-monobank-sdk/v2/money"
 )
 
 func TestNormalizeName(t *testing.T) {
